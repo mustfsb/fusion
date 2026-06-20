@@ -95,7 +95,7 @@ docs/             Documentation
 ## Quick Start (macOS / Linux)
 
 ```bash
-git clone REPOSITORY_URL
+git clone https://github.com/mustfsb/fusion.git
 cd opencode-fusion-council
 npm ci
 npm run build

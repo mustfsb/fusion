@@ -18,7 +18,7 @@ Open **PowerShell** and run:
 # Choose a projects folder, for example:
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\Projects" | Set-Location
 
-git clone REPOSITORY_URL opencode-fusion-council
+git clone https://github.com/mustfsb/fusion.git opencode-fusion-council
 Set-Location opencode-fusion-council
 ```
 

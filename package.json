@@ -47,11 +47,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "REPOSITORY_URL"
+    "url": "https://github.com/mustfsb/fusion.git"
   },
   "bugs": {
-    "url": "REPOSITORY_URL/issues"
+    "url": "https://github.com/mustfsb/fusion/issues"
   },
-  "homepage": "REPOSITORY_URL#readme",
+  "homepage": "https://github.com/mustfsb/fusion#readme",
   "license": "MIT"
 }
