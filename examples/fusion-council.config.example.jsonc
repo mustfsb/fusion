@@ -1,0 +1,48 @@
+{
+  // Direct-provider fallback config for CLI use or modelSource: "direct".
+  // Inside OpenCode, modelSource: "auto" uses OpenCode's configured model router and does not require these mappings.
+  "defaults": {
+    "panelModels": [
+      "opencode-go/kimi-k2.7-code",
+      "opencode-go/qwen3.7-max",
+      "opencode-go/minimax-m3"
+    ],
+    "judgeModel": "openai/gpt-5.5",
+    "timeoutMs": 480000,
+    "maxPanelConcurrency": 3
+  },
+  "models": {
+    "opencode-go/kimi-k2.7-code": {
+      "provider": "openai-compatible",
+      "model": "kimi-k2.7",
+      "baseUrl": "https://your-openai-compatible-gateway.example/v1",
+      "apiKeyEnv": "OPENCODE_GO_API_KEY",
+      "temperature": 0.2,
+      "maxTokens": 4096
+    },
+    "opencode-go/qwen3.7-max": {
+      "provider": "openai-compatible",
+      "model": "qwen3.7-max",
+      "baseUrl": "https://your-openai-compatible-gateway.example/v1",
+      "apiKeyEnv": "OPENCODE_GO_API_KEY",
+      "temperature": 0.2,
+      "maxTokens": 4096
+    },
+    "opencode-go/minimax-m3": {
+      "provider": "openai-compatible",
+      "model": "minimax-m3",
+      "baseUrl": "https://your-openai-compatible-gateway.example/v1",
+      "apiKeyEnv": "OPENCODE_GO_API_KEY",
+      "temperature": 0.2,
+      "maxTokens": 4096
+    },
+    "openai/gpt-5.5": {
+      "provider": "openai-compatible",
+      "model": "gpt-5.5",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "temperature": 0.1,
+      "maxTokens": 6000
+    }
+  }
+}
