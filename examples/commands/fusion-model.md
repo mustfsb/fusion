@@ -1,5 +1,5 @@
 ---
-description: Configure Fusion Council model selection — show, set, or reset panel models and judge model globally
+description: Configure Fusion Council model selection and sync native subagents — show, set, or reset panel/judge models globally
 ---
 Call the `fusion_model_config` tool based on the argument provided.
 
@@ -25,6 +25,8 @@ Examples:
 /fusion-model openai/gpt-5.4/medium, openai/gpt-5.4/medium, openai/gpt-5.4/medium, openai/gpt-5.4/xhigh
 ```
 
-Report the tool result without modification.
+When you `set` or `reset`, the tool also regenerates the native OpenCode subagent agent files (`fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`, `fusion-judge`) into `~/.config/opencode/agent/` so `/fusion-build` and `/fusion-no-build` dispatch those exact models as native Task subagents. Judge reasoning effort is preserved as the agent `variant` when supported.
+
+Report the tool result without modification. If the result says to restart OpenCode, tell the user to restart so the new agent definitions take effect (OpenCode loads agent files once at startup).
 
 Model IDs are not registry-validated; confirm with `/models` if a model fails at runtime.

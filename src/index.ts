@@ -1,6 +1,7 @@
 export { loadFusionConfig } from "./config.js";
 export { runCouncil, formatCouncilResultMarkdown, formatLatestTraceSummary } from "./council/runCouncil.js";
-export { parseJudgeResponse } from "./council/judge.js";
+export { parseContractAuditResponse, parseJudgeResponse } from "./council/judge.js";
+export { extractContractGate, renderContractGate, summarizeContractGate } from "./council/contractGate.js";
 export { validateCandidateOutput, buildCandidateRepairPrompt, shouldAttemptCandidateRepair } from "./council/candidateValidation.js";
 export type { CandidateValidationStatus, CandidateValidationResult } from "./council/candidateValidation.js";
 export { collectContext } from "./context/collectContext.js";

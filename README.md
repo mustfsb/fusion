@@ -71,6 +71,21 @@ Best case inside OpenCode: Fusion Council calls configured models through OpenCo
 
 Fallback: if you run the CLI outside OpenCode, or choose `modelSource: "direct"`, provide direct provider mappings in `fusion-council.config.jsonc`.
 
+## Native Subagent Orchestration
+
+`/fusion-build` and `/fusion-no-build` default to the `native_subagents` execution mode. Instead of running panels and the judge through hidden SDK sessions, the fusion-orchestrator primary agent dispatches them as real OpenCode Task subagents:
+
+- `fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3` — independent panel subagents (one per configured panel model).
+- `fusion-judge` — the judge/synthesizer subagent (configured judge model).
+
+During a Fusion run, open the native child sessions created by `fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`, or `fusion-judge` to view their live tool use and reasoning progress. The parent `fusion-orchestrator` session shows the live todo state and receives each final result when the task completes.
+
+The `fusion_native` plugin tool (stages `prepare`, `collect`, `finalize`) handles the deterministic parts — shared panel prompt building, SHA-256 prompt hash, candidate validation tiers, quorum, judge prompt, judge parsing, final guidance, and trace artifacts — without ever calling a panel or judge model itself. All three panels receive the byte-identical shared panel prompt; the trace records `executionMode: "native_subagents"`, `sharedPanelPromptHash`, and a `panelSessions` list with the shared hash for every panel.
+
+The legacy `fusion_council` tool (hidden SDK panel runner) remains available for `/fusion-plan`, `/fusion-review`, `/fusion-decision`, `/fusion-prompt`, and `/fusion-architecture`, and as a debug fallback. `/fusion-build` and `/fusion-no-build` do not use it.
+
+OpenCode loads agent definitions once at startup and does not hot-reload them. After running `/fusion-model set ...` (which regenerates the agent files) or `npm run install:opencode-agents`, restart OpenCode so the new agent definitions take effect.
+
 ## Modes
 
 - `plan`: produce an implementation plan.
@@ -103,15 +118,21 @@ npm run build
 
 For Windows, see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md).
 
-## Install OpenCode Slash Commands
+## Install OpenCode Slash Commands and Agents
 
-The plugin provides slash-command templates in `examples/commands/`. Copy them into your OpenCode commands directory:
+The plugin provides slash-command templates in `examples/commands/` and native subagent agent definitions. Install both with one command:
+
+```bash
+npm run install:opencode-agents
+```
+
+This installs the supported commands into `~/.config/opencode/commands/` and writes the Fusion native agents (`fusion-orchestrator`, `fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`, `fusion-judge`) into `~/.config/opencode/agent/` on macOS/Linux or `%USERPROFILE%\.config\opencode\agent\` on Windows. The installer uses Node's `os.homedir()` and never touches unrelated user agent files. Restart OpenCode after installing or updating command/agent files.
+
+To install only the slash commands (without the native agents):
 
 ```bash
 npm run install:opencode-commands
 ```
-
-This installs the current supported commands into `~/.config/opencode/commands/` on macOS/Linux or `%USERPROFILE%\.config\opencode\commands\` on Windows. Restart OpenCode after installing or updating command files.
 
 You can also copy them manually:
 
@@ -147,7 +168,8 @@ Restart OpenCode after changing plugin, command, or config files.
 The plugin registers:
 
 ```txt
-fusion_council
+fusion_council      (legacy all-in-one council, hidden SDK panels — used by /fusion-plan, /fusion-review, etc.)
+fusion_native       (native-subagent orchestration: prepare/collect/finalize — used by /fusion-build, /fusion-no-build)
 fusion_trace
 fusion_model_config
 ```
@@ -167,9 +189,9 @@ Use them in the TUI:
 /fusion-model
 ```
 
-`/fusion-no-build` means advisory-council-assisted build, not "no implementation." Panels produce plans/checklists/risks/tests only (no candidate codebase), the judge synthesizes advisory guidance, and then the active OpenCode build agent implements the original task automatically.
+`/fusion-no-build` runs the full native council (panels + judge) and then STOPS with final guidance — it does not edit implementation files. Use it when you want the advisory plan and contract without automatic implementation.
 
-`/fusion-build` is candidate-code-council-assisted build: panels produce advisory analysis plus complete candidate implementation proposals, the judge compares candidate code outputs and produces a build contract, and then the active OpenCode build agent implements the final repo automatically.
+`/fusion-build` is candidate-code-council-assisted build: panels produce advisory analysis plus complete candidate implementation proposals, the judge compares candidate code outputs and produces a build contract, and then the `fusion-orchestrator` agent implements the final repo automatically.
 
 Use `/fusion-trace` to inspect the latest run's panel/judge statuses and artifact paths.
 
@@ -458,8 +480,10 @@ For Windows-specific setup and troubleshooting, see [docs/WINDOWS_SETUP.md](docs
 
 ## Limitations
 
-- The OpenCode-native runner creates OpenCode sessions for each panel/judge call; sessions are deleted by default after each call unless `keepPanelSessions: true`.
-- OpenCode does not expose a dedicated subagent API in the pinned plugin SDK; visible sessions plus trace artifacts are the supported observability path.
+- `/fusion-build` and `/fusion-no-build` run panels and the judge as native OpenCode Task subagents (`fusion-orchestrator` + `fusion-panel-1/2/3` + `fusion-judge`). The parent session shows the live todo list and each child session is inspectable in the OpenCode UI while it runs; a token-by-token merged live transcript inside the parent message is not provided.
+- OpenCode loads agent definitions once at startup. After `/fusion-model set ...` regenerates agent files, restart OpenCode so the new panel/judge models take effect.
+- The legacy `fusion_council` tool (used by `/fusion-plan`, `/fusion-review`, `/fusion-decision`, `/fusion-prompt`, `/fusion-architecture`) still runs panels through OpenCode SDK sessions and deletes them by default unless `keepPanelSessions: true`.
+- Judge reasoning effort is preserved as the agent `variant` field when supported by the installed OpenCode version; otherwise it is recorded in config/trace metadata only.
 - Provider pricing/cost estimation is not implemented yet.
 - Token counting is approximate via character limits, not provider tokenizers.
 - Direct HTTP adapters do not support streaming, provider tool use, cache controls, or advanced reasoning controls.

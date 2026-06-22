@@ -16,6 +16,7 @@ import type {
 } from "../types.js";
 import { errorMessage } from "../utils/errors.js";
 import { FusionCouncilError } from "../utils/errors.js";
+import { extractContractGate, summarizeContractGate } from "./contractGate.js";
 import { runJudge } from "./judge.js";
 import { runPanel } from "./panel.js";
 import {
@@ -43,6 +44,8 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
   const context = input.context ?? (options.noContext
     ? { summary: "Context collection disabled.", files: [], omitted: [] }
     : await collectContext({ cwd, files: input.files, includeDiff: input.includeDiff }));
+  const contractGate = extractContractGate(input.task);
+  const contractGateSummary = summarizeContractGate(contractGate);
 
   const promptVerbosity = input.promptVerbosity ?? (input.panelMode === "candidate_build" ? "compact" : undefined);
   const panelPrompts = buildPanelPrompts({
@@ -52,6 +55,7 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
     panelMode: input.panelMode,
     panelModels: panelModelSpecs.map((spec) => spec.modelId),
     promptVerbosity,
+    contractGate,
   });
 
   const panel = await runPanel({
@@ -83,6 +87,7 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
     judgeModelSpec,
     panel,
     quorum,
+    contractGate: contractGateSummary,
   });
 
   if (quorum.usable === 0) {
@@ -98,6 +103,7 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
       judgeModelSpec,
       panel,
       panelPrompts,
+      contractGate,
       trace: { ...baseTrace, errors: [`All panel models failed: ${details}`] },
     });
     throw new FusionCouncilError(`All panel models failed; judge was not run. ${details}${formatArtifactHint(baseTrace)}`);
@@ -118,6 +124,7 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
         judgeModelSpec,
         panel,
         panelPrompts,
+        contractGate,
         trace: { ...baseTrace, errors: [`Required panel models failed: ${details}`] },
       });
       throw new FusionCouncilError(`Required panel models failed; judge was not run. ${details}${formatArtifactHint(baseTrace)}`);
@@ -135,6 +142,7 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
       judgeModelSpec,
       panel,
       panelPrompts,
+      contractGate,
       trace: { ...baseTrace, errors: [`Insufficient panel quorum (${quorum.usable}/${quorum.required} usable): ${details}`] },
     });
     throw new FusionCouncilError(`Insufficient panel quorum (${quorum.usable}/${quorum.required} usable); judge was not run. ${details}${formatArtifactHint(baseTrace)}`);
@@ -143,11 +151,12 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
   const judgePrompt = buildJudgePromptText({
     task: input.task,
     mode: input.mode,
-    context,
-    panel,
-    panelMode: input.panelMode,
-    quorum,
-  });
+      context,
+      panel,
+      panelMode: input.panelMode,
+      quorum,
+      contractGate,
+    });
 
   try {
     const judgeStarted = Date.now();
@@ -194,6 +203,7 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
       judgeOutput: result.judgeRawOutput,
       finalGuidance,
       councilResult: result,
+      contractGate,
       trace,
     });
     return {
@@ -219,6 +229,7 @@ export async function runCouncil(input: CouncilRunInput, options: CouncilRunOpti
       panel,
       panelPrompts,
       judgePrompt,
+      contractGate,
       trace,
     });
     throw new FusionCouncilError(`Judge model '${judgeModelSpec.modelId}' failed after panel completion. ${message}. ${formatTraceForError(trace)}`);
@@ -362,6 +373,7 @@ function buildTrace(input: {
   judgeModelSpec: FusionModelSpec;
   panel: CouncilResult["panel"];
   quorum?: FusionTraceQuorum;
+  contractGate: ReturnType<typeof summarizeContractGate>;
 }): FusionRunTrace {
   return {
     runId: input.runId,
@@ -403,6 +415,10 @@ function buildTrace(input: {
       rawModelSpec: input.judgeModelSpec.raw,
     },
     quorum: input.quorum,
+    contractGate: input.contractGate,
+    postBuildAudit: input.command === "fusion-build"
+      ? { enabled: true, status: "not_run", fixCyclesUsed: 0, findings: [] }
+      : undefined,
   };
 }
 
@@ -415,6 +431,11 @@ function formatFusionTrace(result: CouncilResult): string[] {
     "## Fusion Run Trace",
     `**Run ID:** ${result.trace.runId}`,
     result.trace.artifactDir ? `**Artifact path:** ${result.trace.artifactDir}` : undefined,
+    result.trace.executionMode ? `**Execution mode:** ${result.trace.executionMode}` : undefined,
+    result.trace.sharedPanelPromptHash ? `**Shared panel prompt hash:** ${result.trace.sharedPanelPromptHash}` : undefined,
+    result.trace.sharedPanelPromptPath ? `**Shared panel prompt:** ${result.trace.sharedPanelPromptPath}` : undefined,
+    result.trace.contractGate ? `**Contract Gate:** ${result.trace.contractGate.literalRequirementsDetected} literal requirements detected` : undefined,
+    result.trace.postBuildAudit ? `**Post-build audit:** ${result.trace.postBuildAudit.status} (fixCyclesUsed=${result.trace.postBuildAudit.fixCyclesUsed})` : undefined,
     quorumLine,
     "",
     "## Fusion Model Trace",
@@ -437,6 +458,7 @@ function formatCandidateBuildMarkdown(result: CouncilResult): string {
   const quorumWarning = result.trace?.quorum?.degraded
     ? ["## Council Quorum Status", `- Usable panels: ${result.trace.quorum.usable}/${result.trace.quorum.total}`, `- Failed panels: ${result.trace.quorum.failedPanels.map((entry) => entry.modelId).join(", ") || "none"}`, "- Confidence: reduced — verify with tests before trusting synthesis", ""]
     : [];
+  const hiddenSemanticProbes = result.requiredHiddenSemanticProbes?.length ? result.requiredHiddenSemanticProbes : result.requiredTests;
   return [
     "# Fusion Council Result",
     "",
@@ -456,8 +478,26 @@ function formatCandidateBuildMarkdown(result: CouncilResult): string {
     "## Judge Decision",
     result.finalRecommendation,
     "",
-    "## Requirement Checklist",
+    "## Contract Gate",
     formatList(result.requirementChecklist),
+    "",
+    "## Safe Compatibility Additions",
+    formatList(result.safeCompatibilityAdditions ?? []),
+    "",
+    "## Optional Niceties",
+    formatList(result.optionalNiceties ?? []),
+    "",
+    "## Public Surface Matrix",
+    formatList(result.publicSurfaceMatrix ?? []),
+    "",
+    "## Required External Consumer Probes",
+    formatList(result.requiredExternalConsumerProbes ?? []),
+    "",
+    "## Required Hidden Semantic Probes",
+    formatList(hiddenSemanticProbes),
+    "",
+    "## Package Entry Checklist",
+    formatList(result.packageEntryChecklist ?? []),
     "",
     "## Rejected Risky Ideas",
     formatList(result.rejectedRiskyIdeas),
@@ -476,6 +516,9 @@ function formatCandidateBuildMarkdown(result: CouncilResult): string {
     "",
     "## Known Traps",
     formatList(result.knownTraps ?? []),
+    "",
+    "## Implementation Priorities",
+    formatList(result.implementationPriorities ?? []),
     "",
     "## Implementation Plan",
     formatList(result.implementationPlan ?? []),
@@ -498,6 +541,10 @@ function formatAdvisoryMarkdown(result: CouncilResult): string {
   const quorumWarning = result.trace?.quorum?.degraded
     ? ["## Council Quorum Status", `- Usable panels: ${result.trace.quorum.usable}/${result.trace.quorum.total}`, `- Failed panels: ${result.trace.quorum.failedPanels.map((entry) => entry.modelId).join(", ") || "none"}`, "- Confidence: reduced — verify with tests", ""]
     : [];
+  const consumerProbes = result.requiredExternalConsumerProbes?.length
+    ? result.requiredExternalConsumerProbes
+    : result.buildReadyConsumerTestPlan ?? [];
+  const hiddenSemanticProbes = result.requiredHiddenSemanticProbes?.length ? result.requiredHiddenSemanticProbes : result.requiredTests;
   return [
     "# Fusion Council Result",
     "",
@@ -516,11 +563,35 @@ function formatAdvisoryMarkdown(result: CouncilResult): string {
     "## Judge Recommendation",
     result.finalRecommendation,
     "",
-    "## Requirement Checklist",
+    "## Build-Ready Contract Packet",
+    "This is planning output only. `/fusion-no-build` stops after synthesis.",
+    "",
+    "## Literal Public Surface",
     formatList(result.requirementChecklist),
+    "",
+    "## Safe Compatibility Additions",
+    formatList(result.safeCompatibilityAdditions ?? []),
+    "",
+    "## Optional Niceties",
+    formatList(result.optionalNiceties ?? []),
+    "",
+    "## Public Surface Matrix",
+    formatList(result.publicSurfaceMatrix ?? []),
+    "",
+    "## Build-Ready External Consumer Test Plan",
+    formatList(consumerProbes),
+    "",
+    "## Hidden Semantic Tests",
+    formatList(hiddenSemanticProbes),
+    "",
+    "## Package Entry Checklist",
+    formatList(result.packageEntryChecklist ?? []),
     "",
     "## Risks",
     formatList(result.risks),
+    "",
+    "## Implementation Order",
+    formatList(result.implementationPriorities ?? result.implementationPlan ?? []),
     "",
     "## Implementation Plan",
     formatList(result.implementationPlan ?? []),
@@ -537,13 +608,11 @@ function formatAdvisoryMarkdown(result: CouncilResult): string {
     "## Must-Not-Break Constraints",
     formatList(result.mustNotBreakConstraints),
     "",
-    "## Main Agent Implementation Instructions",
-    ...mainAgentImplementationInstructions(result.trace?.quorum?.degraded),
-    "- After judge succeeds, implement the original user task automatically.",
-    "- Use the original prompt as the source of truth.",
-    "- Use the advisory council output as the implementation contract.",
-    "- Include in final response which judge hidden-edge checks were implemented as tests.",
-    "- Do not wait for a manual second message.",
+    "## Final Self-Audit Checklist",
+    formatList(result.finalComplianceChecklist ?? []),
+    "",
+    "## Planning Stop Condition",
+    ...buildReadyPlanningInstructions(result.trace?.quorum?.degraded),
     "",
     "## Final Output",
     result.finalOutput,
@@ -556,15 +625,31 @@ function mainAgentImplementationInstructions(degraded?: boolean): string[] {
     : [];
   return [
     "- Implement the original user task, not the council output alone.",
-    "- Treat the original prompt as source of truth; use the Requirement Ledger and judge output as implementation contract.",
-    "- Preserve explicit public API, error, edge-case, determinism, and serialization contracts exactly.",
-    "- Before finishing, implement the judge's Required Hidden Tests or equivalent coverage.",
+    "- Treat the original prompt as source of truth; use the Contract Gate and judge output as implementation contract.",
+    "- Preserve explicit public API, error, edge-case, determinism, serialization, and public-state hygiene contracts exactly.",
+    "- Create or update consumer-facing tests that import from the package entry, not only internal source files.",
+    "- Before finishing, implement the judge's Required External Consumer Probes and Required Hidden Semantic Probes or equivalent coverage.",
+    "- Run the Post-build contract audit and fix one audit cycle by default if it returns FIX_REQUIRED.",
     "- Do not accept visible-test-only success if hidden probes or the literal task would still fail.",
     ...degradedNote,
     "- If existing visible tests conflict with the explicit task contract, update the implementation and tests to match the original user task.",
     "- Verify contract-critical edge cases before final response.",
     "- Run npm run typecheck, npm test, and npm run build when the task requires them.",
-    "- Final response must include: Fusion run ID, trace artifact path, files created, test count, verification results, hidden-edge tests added, known limitations, and design trade-offs.",
+    "- Final response must include: Fusion run ID, trace artifact path, files created, test count, verification results, consumer-facing tests added, post-build audit result, known limitations, and design trade-offs.",
+  ];
+}
+
+function buildReadyPlanningInstructions(degraded?: boolean): string[] {
+  const degradedNote = degraded
+    ? ["- Council ran in degraded/quorum mode with fewer than all panels — verify the packet carefully during the later build run."]
+    : [];
+  return [
+    "- `/fusion-no-build` stops after planning. Do not implement from this response inside the planning run.",
+    "- Use the original prompt as source of truth and this packet as the build-ready contract for a later `/fusion-build` run.",
+    "- Preserve explicit exports, typed errors, option/property names, normalization rules, and public-state hygiene exactly during implementation.",
+    "- Create consumer-facing tests from the package entry and run hidden semantic probes during the later build run.",
+    "- Do not accept visible-test-only success during the later build run if the consumer probes or hidden semantic probes would still fail.",
+    ...degradedNote,
   ];
 }
 
@@ -638,6 +723,7 @@ async function maybeWriteSuccessTrace(input: {
   judgePrompt: string;
   judgeOutput?: string;
   finalGuidance: string;
+  contractGate: import("../types.js").ContractGate;
   councilResult?: CouncilResult;
   trace: FusionRunTrace;
 }) {
@@ -655,6 +741,7 @@ async function maybeWriteSuccessTrace(input: {
     judgeModel: input.judgeModelSpec.modelId,
     panelResponses: input.panel,
     panelPrompts: input.panelPrompts,
+    contractGate: input.contractGate,
     judgePrompt: input.judgePrompt,
     judgeOutput: input.judgeOutput,
     finalGuidance: input.finalGuidance,
@@ -675,6 +762,7 @@ async function maybeWriteFailedTrace(input: {
   panel: CouncilResult["panel"];
   panelPrompts: string[];
   judgePrompt?: string;
+  contractGate: import("../types.js").ContractGate;
   trace: FusionRunTrace;
 }) {
   if (!input.traceOptions.saveRunArtifacts) return;
@@ -691,6 +779,7 @@ async function maybeWriteFailedTrace(input: {
     judgeModel: input.judgeModelSpec.modelId,
     panelResponses: input.panel,
     panelPrompts: input.panelPrompts,
+    contractGate: input.contractGate,
     judgePrompt: input.judgePrompt,
     trace: input.trace,
   });

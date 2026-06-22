@@ -1,8 +1,8 @@
-import type { ContextBundle, CouncilMode, CouncilResult, FusionCouncilConfig, FusionModelSpec, FusionTraceQuorum, ModelRunner, PanelMode, PanelResponse } from "../types.js";
+import type { ContextBundle, ContractAuditResult, CouncilMode, CouncilResult, FusionCouncilConfig, FusionModelSpec, FusionTraceQuorum, ModelRunner, PanelMode, PanelResponse } from "../types.js";
 import { getReasoningEffortApplication } from "../modelSpec.js";
 import { extractJsonObject } from "../utils/json.js";
 import { buildJudgePrompt } from "./prompts.js";
-import { judgeResultSchema } from "./schema.js";
+import { contractAuditResultSchema, judgeResultSchema } from "./schema.js";
 import { panelSessionTitle } from "../trace/runTrace.js";
 
 export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<CouncilResult, "panel"> {
@@ -19,6 +19,14 @@ export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<Cou
       missingConsiderations: parsed.missingConsiderations,
       finalRecommendation: parsed.finalRecommendation,
       requirementChecklist: parsed.requirementChecklist,
+      safeCompatibilityAdditions: parsed.safeCompatibilityAdditions,
+      optionalNiceties: parsed.optionalNiceties,
+      publicSurfaceMatrix: parsed.publicSurfaceMatrix,
+      requiredExternalConsumerProbes: parsed.requiredExternalConsumerProbes,
+      requiredHiddenSemanticProbes: parsed.requiredHiddenSemanticProbes,
+      implementationPriorities: parsed.implementationPriorities,
+      packageEntryChecklist: parsed.packageEntryChecklist,
+      buildReadyConsumerTestPlan: parsed.buildReadyConsumerTestPlan,
       rejectedRiskyIdeas: parsed.rejectedRiskyIdeas,
       finalBuildGuidance: parsed.finalBuildGuidance,
       mustNotBreakConstraints: parsed.mustNotBreakConstraints,
@@ -43,6 +51,14 @@ export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<Cou
       missingConsiderations: ["Judge response could not be parsed as strict JSON."],
       finalRecommendation: "Review the raw judge output manually.",
       requirementChecklist: [],
+      safeCompatibilityAdditions: [],
+      optionalNiceties: [],
+      publicSurfaceMatrix: [],
+      requiredExternalConsumerProbes: [],
+      requiredHiddenSemanticProbes: [],
+      implementationPriorities: [],
+      packageEntryChecklist: [],
+      buildReadyConsumerTestPlan: [],
       rejectedRiskyIdeas: [],
       finalBuildGuidance: "Review the raw judge output manually before implementing the original task.",
       mustNotBreakConstraints: ["Do not implement unverified judge output without checking the original user task."],
@@ -53,6 +69,31 @@ export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<Cou
       recommendedBuildPrompt: "",
       knownTraps: [],
       finalComplianceChecklist: [],
+      finalOutput: rawText,
+    };
+  }
+}
+
+export function parseContractAuditResponse(rawText: string): ContractAuditResult {
+  try {
+    const parsed = contractAuditResultSchema.parse(extractJsonObject(rawText));
+    return {
+      status: parsed.status,
+      summary: parsed.summary,
+      findings: parsed.findings,
+      finalOutput: parsed.finalOutput,
+    };
+  } catch {
+    return {
+      status: "FIX_REQUIRED",
+      summary: "Audit returned non-JSON output.",
+      findings: [
+        {
+          requirement: "Return strict JSON with PASS or FIX_REQUIRED.",
+          observed: "Audit output could not be parsed as strict JSON.",
+          requiredFix: "Rerun the post-build audit with the required JSON contract and do not claim compliance from unparsed output.",
+        },
+      ],
       finalOutput: rawText,
     };
   }

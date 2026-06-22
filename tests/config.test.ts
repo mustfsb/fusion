@@ -17,6 +17,8 @@ describe("default model setup", () => {
     expect(config.defaults.panelModels).toEqual(DEFAULT_PANEL_MODELS);
     expect(config.defaults.judgeModel).toBe(DEFAULT_JUDGE_MODEL);
     expect(config.defaults.timeoutMs).toBe(600_000);
+    expect(config.defaults.postBuildContractAudit).toBe(true);
+    expect(config.defaults.maxPostBuildAuditFixCycles).toBe(1);
   });
 });
 

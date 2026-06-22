@@ -20,6 +20,8 @@ export function getDefaultFusionConfig(): FusionCouncilConfig {
       judgeModel: DEFAULT_JUDGE_MODEL,
       timeoutMs: 600_000,
       maxPanelConcurrency: 3,
+      postBuildContractAudit: true,
+      maxPostBuildAuditFixCycles: 1,
     },
     models: {},
   };
@@ -40,6 +42,8 @@ const configSchema = z.object({
     judgeModel: z.string().min(1),
     timeoutMs: z.number().int().positive().default(600_000),
     maxPanelConcurrency: z.number().int().positive().default(4),
+    postBuildContractAudit: z.boolean().default(true),
+    maxPostBuildAuditFixCycles: z.number().int().nonnegative().default(1),
   }).partial().default({}),
   models: z.record(modelSchema).default({}),
 });
@@ -64,6 +68,8 @@ export async function loadFusionConfig(configPath?: string, cwd = process.cwd())
       judgeModel: result.data.defaults.judgeModel ?? defaults.judgeModel,
       timeoutMs: result.data.defaults.timeoutMs ?? defaults.timeoutMs,
       maxPanelConcurrency: result.data.defaults.maxPanelConcurrency ?? defaults.maxPanelConcurrency,
+      postBuildContractAudit: result.data.defaults.postBuildContractAudit ?? defaults.postBuildContractAudit,
+      maxPostBuildAuditFixCycles: result.data.defaults.maxPostBuildAuditFixCycles ?? defaults.maxPostBuildAuditFixCycles,
     },
     models: result.data.models,
   };

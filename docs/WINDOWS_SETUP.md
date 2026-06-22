@@ -44,15 +44,17 @@ npm run build
 
 The TypeScript compiler writes output to `dist\`. This directory is generated and is not committed to Git.
 
-## Install Fusion slash commands into OpenCode
+## Install Fusion slash commands and native agents into OpenCode
 
-The plugin ships with OpenCode slash-command templates in `examples\commands\`. The included installer copies them into your user-wide OpenCode commands directory.
+The plugin ships with OpenCode slash-command templates in `examples\commands\` and native subagent agent definitions. The recommended installer copies the commands and writes the Fusion native agents (`fusion-orchestrator`, `fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`, `fusion-judge`) into your user-wide OpenCode directories.
 
 ```powershell
-npm run install:opencode-commands
+npm run install:opencode-agents
 ```
 
-Under the hood this copies the following files into `%USERPROFILE%\.config\opencode\commands\`:
+Under the hood this copies the command files into `%USERPROFILE%\.config\opencode\commands\` and writes the agent files into `%USERPROFILE%\.config\opencode\agent\`. It uses Node's `os.homedir()`, so the same script works on Windows, macOS, and Linux, and it never overwrites unrelated user agent files.
+
+Commands installed:
 
 - `fusion-build.md`
 - `fusion-no-build.md`
@@ -63,17 +65,28 @@ Under the hood this copies the following files into `%USERPROFILE%\.config\openc
 - `fusion-review.md`
 - `fusion-trace.md`
 
+Native agents installed:
+
+- `fusion-orchestrator.md` (primary agent that owns the parent session and todo list)
+- `fusion-panel-1.md`, `fusion-panel-2.md`, `fusion-panel-3.md` (panel subagents using the saved/default panel models)
+- `fusion-judge.md` (judge subagent using the saved/default judge model)
+
+To install only the slash commands (without the native agents), use `npm run install:opencode-commands` instead.
+
 To verify the destination:
 
 ```powershell
 Get-ChildItem "$env:USERPROFILE\.config\opencode\commands\fusion-*.md"
+Get-ChildItem "$env:USERPROFILE\.config\opencode\agent\fusion-*.md"
 ```
 
 If you previously had unsupported or stale command files such as `fusion-status.md`, delete them manually so OpenCode does not show outdated commands.
 
+Restart OpenCode after installing agents or commands — OpenCode loads agent definitions once at startup and does not hot-reload them.
+
 ## Register the plugin in OpenCode
 
-Fusion Council registers three tools: `fusion_council`, `fusion_trace`, and `fusion_model_config`. The slash commands above invoke those tools. You still need to tell OpenCode to load the plugin itself.
+Fusion Council registers four tools: `fusion_council` (legacy all-in-one council), `fusion_native` (native-subagent orchestration used by `/fusion-build` and `/fusion-no-build`), `fusion_trace`, and `fusion_model_config`. The slash commands above invoke those tools. You still need to tell OpenCode to load the plugin itself.
 
 Create or edit your OpenCode config file. The file location depends on where you keep your workspace config; a common location is `%USERPROFILE%\.config\opencode\opencode.config.jsonc`.
 
@@ -133,7 +146,7 @@ Reset to defaults:
 /fusion-model reset
 ```
 
-Model settings are saved to `%USERPROFILE%\.config\opencode\fusion-council-models.json`.
+Model settings are saved to `%USERPROFILE%\.config\opencode\fusion-council-models.json`. Running `/fusion-model set ...` also regenerates the native agent files (`fusion-panel-1/2/3`, `fusion-judge`) in `%USERPROFILE%\.config\opencode\agent\` with the saved models, so `/fusion-build` and `/fusion-no-build` dispatch those exact models as native Task subagents. Restart OpenCode afterward so the new agent definitions take effect.
 
 ### `/fusion-trace`
 

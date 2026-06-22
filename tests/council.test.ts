@@ -13,6 +13,8 @@ const config: FusionCouncilConfig = {
       judgeModel: "judge",
       timeoutMs: 1000,
       maxPanelConcurrency: 2,
+      postBuildContractAudit: true,
+      maxPostBuildAuditFixCycles: 1,
   },
   models: {
     good: { provider: "openai-compatible", model: "good-model", apiKeyEnv: "GOOD_KEY" },
@@ -280,6 +282,8 @@ describe("runCouncil", () => {
         judgeModel: "openai/gpt-5.5",
         timeoutMs: 1000,
         maxPanelConcurrency: 1,
+        postBuildContractAudit: true,
+        maxPostBuildAuditFixCycles: 1,
       },
       models: {},
     };
@@ -556,16 +560,16 @@ describe("formatCouncilResultMarkdown", () => {
 
     expect(markdown).toContain("## Panel Advisory Summary");
     expect(markdown).toContain("## Judge Recommendation");
-    expect(markdown).toContain("## Requirement Checklist");
+    expect(markdown).toContain("## Build-Ready Contract Packet");
+    expect(markdown).toContain("## Literal Public Surface");
+    expect(markdown).toContain("## Build-Ready External Consumer Test Plan");
     expect(markdown).toContain("## Risks");
     expect(markdown).toContain("## Implementation Plan");
     expect(markdown).toContain("## Test Plan");
     expect(markdown).toContain("## Recommended Build Prompt");
-    expect(markdown).toContain("## Main Agent Implementation Instructions");
-    expect(markdown).toContain("implement the original user task automatically");
-    expect(markdown).toContain("implementation contract");
-    expect(markdown).toContain("hidden-edge checks were implemented as tests");
-    expect(markdown).toContain("Requirement Ledger");
+    expect(markdown).toContain("## Planning Stop Condition");
+    expect(markdown).toContain("/fusion-no-build` stops after planning");
+    expect(markdown).toContain("Build-Ready Contract Packet");
     expect(markdown).toContain("Do not accept visible-test-only success");
     expect(markdown).toContain("**Run ID:** fusion-test");
   });
@@ -574,19 +578,19 @@ describe("formatCouncilResultMarkdown", () => {
 describe("panel modes in prompts", () => {
   const context = { summary: "No context.", files: [], omitted: [] };
 
-  test("candidate_build panel prompt requires Requirement Ledger, hidden probes, and strict contract preservation", () => {
+  test("candidate_build panel prompt requires Contract Gate, public surface matrix, and strict contract preservation", () => {
     const prompt = buildPanelPrompt({ task: specTrapTask, mode: "build_prompt", context, panelMode: "candidate_build" });
 
     expect(prompt).toContain("CANDIDATE BUILD mode");
-    expect(prompt).toContain("Requirement Ledger");
-    expect(prompt).toContain("Contract-Critical Behaviors");
-    expect(prompt).toContain("Hidden Probe Test Plan");
-    expect(prompt).toContain("Edge-Case Semantics");
-    expect(prompt).toContain("Failure Modes To Avoid");
-    expect(prompt).toContain("Public API / Error Contract Checklist");
-    expect(prompt).toContain("Implementation Proposal");
-    expect(prompt).toContain("Self-Review Against Original Task");
+    expect(prompt).toContain("Derived Contract Gate");
+    expect(prompt).toContain("## 1. Contract Gate");
+    expect(prompt).toContain("## 2. Public Surface Matrix");
+    expect(prompt).toContain("## 3. External Consumer Probe Plan");
+    expect(prompt).toContain("## 4. Hidden Semantic Probe Plan");
+    expect(prompt).toContain("## 5. Implementation Guidance");
+    expect(prompt).toContain("## 6. Self-Audit Risks");
     expect(prompt).toContain("Preserve explicit API shapes, error contracts");
+    expect(prompt).toContain("Do not assume an instance method satisfies a task that explicitly requests a package-root export");
     expect(prompt).toContain("If the task literally says 'must throw X'");
     expect(prompt).toContain("Visible-test-only success is a failure");
     expect(prompt).toContain("must throw `LimitExceededError`");
@@ -600,16 +604,17 @@ describe("panel modes in prompts", () => {
     expect(prompt).toContain("Do NOT create or edit any files");
   });
 
-  test("advisory panel prompt requires semantic bug traps and hidden probe checklist", () => {
+  test("advisory panel prompt requires Contract Gate, semantic traps, and consumer probes", () => {
     const prompt = buildPanelPrompt({ task: "Build add(a,b)", mode: "plan", context, panelMode: "advisory" });
 
     expect(prompt).toContain("ADVISORY mode");
-    expect(prompt).toContain("Requirement Ledger");
-    expect(prompt).toContain("Contract-Critical Behaviors");
-    expect(prompt).toContain("Implementation strategy");
-    expect(prompt).toContain("Semantic bug traps");
-    expect(prompt).toContain("Hidden probe checklist");
-    expect(prompt).toContain("Must-not-break constraints");
+    expect(prompt).toContain("Derived Contract Gate");
+    expect(prompt).toContain("## 1. Contract Gate");
+    expect(prompt).toContain("## 2. Public Surface Matrix");
+    expect(prompt).toContain("## 3. External Consumer Probe Plan");
+    expect(prompt).toContain("## 4. Hidden Semantic Probe Plan");
+    expect(prompt).toContain("## 5. Implementation Guidance");
+    expect(prompt).toContain("## 6. Self-Audit Risks");
     expect(prompt).toContain("package.json main/types vs dist output");
     expect(prompt).toContain("typed domain errors vs raw Error leaks");
     expect(prompt).toContain("Visible-test-only success is a failure");
@@ -653,7 +658,7 @@ describe("panel modes in prompts", () => {
     expect(prompt).toContain("Council quorum status");
     expect(prompt).toContain("panel-b");
     expect(prompt).toContain("Council Quorum Status");
-    expect(prompt).toContain("required hidden test");
+    expect(prompt).toContain("Required Hidden Semantic Probes");
   });
 
   test("candidate_build panel prompt is compact by default and includes output budget", () => {
@@ -661,8 +666,8 @@ describe("panel modes in prompts", () => {
     const detailed = buildPanelPrompt({ task: specTrapTask, mode: "build_prompt", context, panelMode: "candidate_build", promptVerbosity: "detailed" });
 
     expect(compact).toContain("Be concise. Prefer bullet points.");
-    expect(compact).toContain("Requirement Ledger");
-    expect(compact).toContain("Hidden Probe Test Plan");
+    expect(compact).toContain("Contract Gate");
+    expect(compact).toContain("Hidden Semantic Probe Plan");
     expect(compact).toContain("Visible-test-only success is a failure");
     expect(compact.length).toBeLessThan(detailed.length);
     expect((compact.match(/package\.json main\/types/g) ?? []).length).toBeLessThanOrEqual(2);
@@ -678,21 +683,23 @@ describe("panel modes in prompts", () => {
     });
 
     expect(prompt).toContain("CANDIDATE BUILD mode");
-    expect(prompt).toContain("Requirement Ledger");
+    expect(prompt).toContain("Contract Gate");
     expect(prompt).toContain("Spec Compliance Verdict");
+    expect(prompt).toContain("Public Surface Matrix");
     expect(prompt).toContain("Candidate Summary Table");
-    expect(prompt).toContain("Candidate Bug Audit");
-    expect(prompt).toContain("Best Ideas To Use");
-    expect(prompt).toContain("Ideas To Reject");
+    expect(prompt).toContain("Required External Consumer Probes");
+    expect(prompt).toContain("Required Hidden Semantic Probes");
+    expect(prompt).toContain("Implementation Priorities");
+    expect(prompt).toContain("Rejected or Risky Panel Ideas");
     expect(prompt).toContain("Final Build Contract");
-    expect(prompt).toContain("Main-Agent Test Obligations");
+    expect(prompt).toContain("Package Entry Checklist");
     expect(prompt).toContain("Rank candidates by requirement compliance first");
     expect(prompt).toContain("If visible tests pass but hidden probes fail, treat the candidate as failing");
     expect(prompt).toContain("must throw `LimitExceededError`");
     expect(prompt).not.toContain("ADVISORY mode");
   });
 
-  test("advisory judge prompt requires final implementation contract and semantic checklists", () => {
+  test("advisory judge prompt requires build-ready contract packet and consumer probes", () => {
     const prompt = buildJudgePrompt({
       task: "Build add(a,b)",
       mode: "plan",
@@ -703,17 +710,14 @@ describe("panel modes in prompts", () => {
 
     expect(prompt).toContain("ADVISORY mode");
     expect(prompt).toContain("Do NOT implement");
-    expect(prompt).toContain("Requirement Ledger");
-    expect(prompt).toContain("Consensus plan");
-    expect(prompt).toContain("Disagreements between panels");
-    expect(prompt).toContain("Exact API checklist");
-    expect(prompt).toContain("Exact semantic checklist");
-    expect(prompt).toContain("Hidden edge probe checklist");
-    expect(prompt).toContain("Typed error checklist");
-    expect(prompt).toContain("Immutability/safety checklist");
-    expect(prompt).toContain("Determinism checklist");
-    expect(prompt).toContain("Final implementation contract");
-    expect(prompt).toContain("required hidden test");
+    expect(prompt).toContain("Build-Ready Contract Packet");
+    expect(prompt).toContain("Literal Public Surface");
+    expect(prompt).toContain("Public Surface Matrix");
+    expect(prompt).toContain("Required consumer probes");
+    expect(prompt).toContain("Compatibility recommendations");
+    expect(prompt).toContain("Hidden semantic tests");
+    expect(prompt).toContain("Package entry checklist");
+    expect(prompt).toContain("Final self-audit checklist");
     expect(prompt).not.toContain("CANDIDATE BUILD mode");
   });
 
@@ -730,7 +734,7 @@ describe("panel modes in prompts", () => {
     expect(prompt).not.toContain("ADVISORY mode");
   });
 
-  test("fusion-no-build markdown instructs automatic implementation and hidden-edge test obligations", () => {
+  test("fusion-no-build markdown stays planning-only and emits a build-ready packet", () => {
     const markdown = formatCouncilResultMarkdown({
       mode: "plan",
       panelMode: "advisory",
@@ -752,15 +756,14 @@ describe("panel modes in prompts", () => {
       trace: { runId: "fusion-test", timestamp: "2026-06-16T12:00:00.000Z", mode: "plan", panelMode: "advisory", modelSource: "opencode", requestedModelSource: "opencode", actualModelSource: "opencode", fallbackUsed: false, panelModelsRequested: [{ modelId: "a" }], judgeModelRequested: { modelId: "judge" }, panel: [], judge: { modelId: "judge", success: true } },
     } as any);
 
-    expect(markdown).toContain("implement the original user task automatically");
-    expect(markdown).toContain("implementation contract");
-    expect(markdown).toContain("hidden-edge checks were implemented as tests");
-    expect(markdown).toContain("hidden-edge tests added");
-    expect(markdown).toContain("Requirement Ledger");
+    expect(markdown).toContain("Build-Ready Contract Packet");
+    expect(markdown).toContain("/fusion-no-build` stops after planning");
+    expect(markdown).toContain("Build-Ready External Consumer Test Plan");
+    expect(markdown).toContain("Package Entry Checklist");
     expect(markdown).toContain("Do not accept visible-test-only success");
   });
 
-  test("fusion-build markdown instructs automatic implementation and hidden-edge test obligations", () => {
+  test("fusion-build markdown instructs contract-first implementation and audit obligations", () => {
     const markdown = formatCouncilResultMarkdown({
       mode: "build_prompt",
       panelMode: "candidate_build",
@@ -782,9 +785,10 @@ describe("panel modes in prompts", () => {
       trace: { runId: "fusion-test", timestamp: "2026-06-16T12:00:00.000Z", mode: "build_prompt", panelMode: "candidate_build", modelSource: "opencode", requestedModelSource: "opencode", actualModelSource: "opencode", fallbackUsed: false, panelModelsRequested: [{ modelId: "a" }], judgeModelRequested: { modelId: "judge" }, panel: [], judge: { modelId: "judge", success: true } },
     } as any);
 
-    expect(markdown).toContain("hidden-edge tests added");
-    expect(markdown).toContain("implementation contract");
-    expect(markdown).toContain("Requirement Ledger");
+    expect(markdown).toContain("Required External Consumer Probes");
+    expect(markdown).toContain("Required Hidden Semantic Probes");
+    expect(markdown).toContain("Post-build contract audit");
+    expect(markdown).toContain("Contract Gate");
     expect(markdown).toContain("Do not accept visible-test-only success");
   });
 });

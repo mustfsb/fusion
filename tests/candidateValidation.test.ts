@@ -51,7 +51,7 @@ describe("validateCandidateOutput", () => {
     expect(result.valid).toBe(true);
     expect(result.signals.selfReviewAgainstOriginalTask).toBe(false);
     expect(result.signals.hiddenProbeTestPlan).toBe(true);
-    expect(result.warnings).toContain("Self-Review Against Original Task");
+    expect(result.warnings).toContain("Self-Audit Risks");
   });
 
   test("accepts equivalent Requirement Ledger heading", () => {
@@ -67,6 +67,21 @@ describe("validateCandidateOutput", () => {
     const result = validateCandidateOutput(candidate);
 
     expect(result.signals.hiddenProbeTestPlan).toBe(true);
+    expect(result.status).not.toBe("failed");
+  });
+
+  test("accepts the new Contract Gate and Public Surface Matrix headings", () => {
+    const candidate = completeCandidate
+      .replace("## 1. Requirement Ledger", "## 1. Contract Gate")
+      .replace("## 3. Hidden Probe Test Plan", "## 3. External Consumer Probe Plan")
+      .replace("## 6. Public API / Error Contract Checklist", "## 2. Public Surface Matrix")
+      .replace("## 8. Self-Review Against Original Task", "## 6. Self-Audit Risks");
+    const result = validateCandidateOutput(candidate);
+
+    expect(result.signals.requirementLedger).toBe(true);
+    expect(result.signals.hiddenProbeTestPlan).toBe(true);
+    expect(result.signals.errorApiContractChecklist).toBe(true);
+    expect(result.signals.selfReviewAgainstOriginalTask).toBe(true);
     expect(result.status).not.toBe("failed");
   });
 
@@ -104,10 +119,10 @@ describe("validateCandidateOutput", () => {
   test("repair prompt asks for complete candidate implementation + self-review + probes", () => {
     const prompt = buildCandidateRepairPrompt({ task: "Build add(a,b)", previousOutput: repairableIncompleteCandidate });
     expect(prompt).toContain("close but not fully usable");
-    expect(prompt).toContain("Requirement Ledger");
-    expect(prompt).toContain("Hidden Probe Test Plan");
-    expect(prompt).toContain("Public API / Error Contract Checklist");
-    expect(prompt).toContain("Self-Review Against Original Task");
+    expect(prompt).toContain("Contract Gate");
+    expect(prompt).toContain("External Consumer Probe Plan");
+    expect(prompt).toContain("Public Surface Matrix");
+    expect(prompt).toContain("Self-Audit Risks");
   });
 
   test("does not attempt repair for empty/generic output", () => {
@@ -129,6 +144,8 @@ describe("candidate_build panel validation in runCouncil", () => {
       judgeModel: "judge",
       timeoutMs: 1000,
       maxPanelConcurrency: 1,
+      postBuildContractAudit: true,
+      maxPostBuildAuditFixCycles: 1,
     },
     models: {},
   };
@@ -305,9 +322,9 @@ describe("trace artifacts", () => {
       expect(traceJson.panelOutputCompletenessScore).toBeGreaterThan(0);
       expect(traceJson.artifactFiles).toBeInstanceOf(Array);
       expect(traceJson.finalGuidanceContainsHiddenTests).toBe(true);
-      expect(finalGuidance).toContain("Requirement Ledger");
+      expect(finalGuidance).toContain("Contract Gate");
       expect(finalGuidance).toContain("Rejected Risky Ideas");
-      expect(finalGuidance).toContain("Required Hidden Tests");
+      expect(finalGuidance).toContain("Required Hidden Semantic Probes");
       expect(finalGuidance).toContain("Main-Agent Execution Requirements");
       expect(finalGuidance).toContain("Self-Audit Checklist");
 
@@ -425,9 +442,10 @@ describe("trace artifacts", () => {
   });
 
   test("detectGuidanceSections and enrichTraceMetadata work with heuristic detection", () => {
-    const guidance = "## Final build contract\n## Required hidden tests\n- probe\n## Package/build checklist\n- main/types";
+    const guidance = "## Final build contract\n## Contract Gate\n- export add\n## Required Hidden Semantic Probes\n- probe\n## Package/build checklist\n- main/types";
     const sections = detectGuidanceSections(guidance);
-    expect(sections.hiddenTests).toBe(true);
+    expect(sections.contractGate).toBe(true);
+    expect(sections.hiddenSemanticProbes).toBe(true);
     expect(sections.packageChecklist).toBe(true);
     expect(sections.finalBuildContract).toBe(true);
 
@@ -490,7 +508,7 @@ describe("trace artifacts", () => {
     });
 
     expect(enhanced).toContain("Rejected Risky Ideas");
-    expect(enhanced).toContain("Required Hidden Tests");
+    expect(enhanced).toContain("Required Hidden Semantic Probes");
     expect(enhanced).toContain("Main-Agent Execution Requirements");
     expect(enhanced).toContain("Self-Audit Checklist");
     expect(enhanced).toContain("Council Quorum Warning");

@@ -14,9 +14,55 @@ export type CouncilDecision = "implement" | "do_not_implement" | "needs_more_inf
 
 export type ModelSource = "auto" | "opencode" | "direct";
 
+export type ExecutionMode = "native_subagents" | "direct_sdk";
+
 export type ModelErrorType = "timeout" | "empty_response" | "provider_error" | "rate_limit" | "model_not_found" | "validation" | "unknown";
 
 export type CandidateValidationStatus = "passed" | "usable_with_warnings" | "failed";
+
+export type ContractGate = {
+  literalPublicSurface: string[];
+  behavioralBoundaries: string[];
+  consumerCompatibility: string[];
+  externalConsumerProbes: string[];
+  packageRootExports: string[];
+  requiredInstanceMethods: string[];
+  requiredTypesAndErrors: string[];
+  requiredOptionAndFieldNames: string[];
+  returnAndThrowContracts: string[];
+};
+
+export type ContractGateTraceSummary = {
+  literalRequirementsDetected: number;
+  publicExportsRequired: string[];
+  consumerProbesRequired: string[];
+  compatibilityRecommendations: string[];
+};
+
+export type PostBuildAuditFinding = {
+  requirement: string;
+  observed: string;
+  requiredFix: string;
+};
+
+export type PostBuildAuditStatus = "pass" | "fix_required" | "not_run";
+
+export type ContractAuditDecision = "PASS" | "FIX_REQUIRED";
+
+export type ContractAuditResult = {
+  status: ContractAuditDecision;
+  summary: string;
+  findings: PostBuildAuditFinding[];
+  finalOutput: string;
+};
+
+export type PostBuildAuditTrace = {
+  enabled: boolean;
+  sessionId?: string;
+  status: PostBuildAuditStatus;
+  fixCyclesUsed: number;
+  findings: PostBuildAuditFinding[];
+};
 
 export type ModelConfig = {
   provider: ProviderKind;
@@ -33,6 +79,8 @@ export type FusionCouncilConfig = {
     judgeModel: string;
     timeoutMs: number;
     maxPanelConcurrency: number;
+    postBuildContractAudit: boolean;
+    maxPostBuildAuditFixCycles: number;
   };
   models: Record<string, ModelConfig>;
 };
@@ -109,6 +157,18 @@ export type FusionTraceQuorum = {
   failedPanels: FusionTraceQuorumFailedPanel[];
 };
 
+export type NativePanelSession = {
+  panelIndex: number;
+  agentName: string;
+  modelId: string;
+  promptHash: string;
+  nativeTask: true;
+  sessionId?: string;
+  taskId?: string;
+  success?: boolean;
+  validationStatus?: CandidateValidationStatus;
+};
+
 export type FusionTrace = {
   requestedModelSource: ModelSource;
   actualModelSource: ModelRunner["source"];
@@ -137,10 +197,15 @@ export type FusionRunTrace = FusionTrace & {
   mode: CouncilMode;
   panelMode?: PanelMode;
   modelSource: ModelSource;
+  executionMode?: ExecutionMode;
+  sharedPanelPromptPath?: string;
+  sharedPanelPromptHash?: string;
+  panelSessions?: NativePanelSession[];
   artifactDir?: string;
   artifactPaths?: {
     trace: string;
     originalPrompt: string;
+    contractGate?: string;
     panel1Prompt?: string;
     panel1Output?: string;
     panel2Prompt?: string;
@@ -150,7 +215,10 @@ export type FusionRunTrace = FusionTrace & {
     judgePrompt?: string;
     judgeOutput?: string;
     finalGuidance?: string;
+    postBuildAuditPrompt?: string;
+    postBuildAuditOutput?: string;
   };
+  contractGate?: ContractGateTraceSummary;
   candidateValidation?: {
     allPassed: boolean;
     perPanel: Array<{
@@ -172,6 +240,7 @@ export type FusionRunTrace = FusionTrace & {
   finalGuidanceContainsPackageChecklist?: boolean;
   finalGuidanceContainsImmutabilityChecklist?: boolean;
   finalGuidanceContainsTypedErrorChecklist?: boolean;
+  postBuildAudit?: PostBuildAuditTrace;
   artifactFiles?: string[];
   errors?: string[];
 };
@@ -203,6 +272,14 @@ export type CouncilResult = {
   missingConsiderations: string[];
   finalRecommendation: string;
   requirementChecklist: string[];
+  safeCompatibilityAdditions?: string[];
+  optionalNiceties?: string[];
+  publicSurfaceMatrix?: string[];
+  requiredExternalConsumerProbes?: string[];
+  requiredHiddenSemanticProbes?: string[];
+  implementationPriorities?: string[];
+  packageEntryChecklist?: string[];
+  buildReadyConsumerTestPlan?: string[];
   rejectedRiskyIdeas: string[];
   finalBuildGuidance: string;
   mustNotBreakConstraints: string[];
@@ -272,4 +349,141 @@ export type CouncilRunOptions = {
   opencodeRunner?: ModelRunner;
   modelClientFactory?: (modelId: string, model: ModelConfig) => ModelClient;
   trace?: FusionTraceOptions;
+};
+
+export type NativePanelAgentPlan = {
+  panelIndex: number;
+  agentName: string;
+  modelId: string;
+  reasoningEffort?: ReasoningEffort;
+  promptHash: string;
+  nativeTask: true;
+};
+
+export type NativeJudgeAgentPlan = {
+  agentName: string;
+  modelId: string;
+  reasoningEffort?: ReasoningEffort;
+};
+
+export type NativePanelResult = {
+  agentName: string;
+  modelId: string;
+  content?: string;
+  error?: string;
+  errorType?: ModelErrorType;
+  taskId?: string;
+  sessionId?: string;
+};
+
+export type NativePrepareInput = {
+  task: string;
+  mode: CouncilMode;
+  panelMode?: PanelMode;
+  files?: string[];
+  includeDiff?: boolean;
+  promptVerbosity?: PromptVerbosity;
+  command?: string;
+  panelModels?: string[];
+  judgeModel?: string;
+  modelSource?: ModelSource;
+  requireAllPanels?: boolean;
+  minSuccessfulPanels?: number;
+  allowDegradedJudge?: boolean;
+  trace?: FusionTraceOptions;
+};
+
+export type NativeTodoItem = {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "failed";
+  priority: "high" | "medium" | "low";
+};
+
+export type NativePrepareResult = {
+  executionMode: "native_subagents";
+  runId: string;
+  artifactDir: string;
+  sharedPanelPrompt: string;
+  sharedPanelPromptHash: string;
+  sharedPanelPromptPath: string;
+  panelAgents: NativePanelAgentPlan[];
+  judgeAgent: NativeJudgeAgentPlan;
+  todoPlan: NativeTodoItem[];
+  mode: CouncilMode;
+  panelMode?: PanelMode;
+  task: string;
+};
+
+export type NativeAuditPrepareResult = {
+  runId: string;
+  enabled: boolean;
+  reason: string;
+  artifactDir: string;
+  auditAgent: NativeJudgeAgentPlan;
+  auditPrompt: string;
+  fixCyclesUsed: number;
+  maxFixCycles: number;
+};
+
+export type NativeCollectResult = {
+  runId: string;
+  shouldProceed: boolean;
+  reason: string;
+  quorum: FusionTraceQuorum;
+  judgePrompt: string;
+  judgeAgent: NativeJudgeAgentPlan;
+  panelStatus: Array<{
+    agentName: string;
+    modelId: string;
+    success: boolean;
+    validationStatus?: CandidateValidationStatus;
+    error?: string;
+    errorType?: ModelErrorType;
+  }>;
+  degraded: boolean;
+  todoUpdates: NativeTodoItem[];
+};
+
+export type NativeFinalizeInput = {
+  runId: string;
+  judgeOutput?: string;
+  judgeError?: string;
+  judgeTaskId?: string;
+  judgeSessionId?: string;
+};
+
+export type NativeFinalizeResult = {
+  runId: string;
+  executionMode: "native_subagents";
+  success: boolean;
+  error?: string;
+  artifactDir: string;
+  artifactPaths?: FusionRunTrace["artifactPaths"];
+  councilResult: CouncilResult;
+  finalGuidance: string;
+  trace: FusionRunTrace;
+  traceSummary: string;
+};
+
+export type NativeAuditFinalizeInput = {
+  runId: string;
+  auditOutput?: string;
+  auditError?: string;
+  auditTaskId?: string;
+  auditSessionId?: string;
+};
+
+export type NativeAuditFinalizeResult = {
+  runId: string;
+  success: boolean;
+  artifactDir: string;
+  trace: FusionRunTrace;
+  traceSummary: string;
+  status: ContractAuditDecision;
+  findings: PostBuildAuditFinding[];
+  fixCyclesUsed: number;
+  maxFixCycles: number;
+  autoFixAllowed: boolean;
+  finalOutput: string;
+  error?: string;
 };

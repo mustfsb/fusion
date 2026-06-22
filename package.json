@@ -27,7 +27,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "dev": "tsx src/cli.ts",
-    "install:opencode-commands": "node scripts/install-opencode-commands.mjs"
+    "install:opencode-commands": "node scripts/install-opencode-commands.mjs",
+    "install:opencode-agents": "node scripts/install-opencode-agents.mjs"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.17.4",

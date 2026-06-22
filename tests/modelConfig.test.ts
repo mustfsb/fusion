@@ -290,6 +290,8 @@ describe("runner effort propagation", () => {
       judgeModel: "judge",
       timeoutMs: 1000,
       maxPanelConcurrency: 1,
+      postBuildContractAudit: true,
+      maxPostBuildAuditFixCycles: 1,
     },
     models: {},
   };
@@ -423,7 +425,7 @@ describe("model trace output", () => {
 
   test("trace.json includes configured effort on panel and judge models", async () => {
     const config: FusionCouncilConfig = {
-      defaults: { panelModels: ["panel-a"], judgeModel: "judge", timeoutMs: 1000, maxPanelConcurrency: 1 },
+      defaults: { panelModels: ["panel-a"], judgeModel: "judge", timeoutMs: 1000, maxPanelConcurrency: 1, postBuildContractAudit: true, maxPostBuildAuditFixCycles: 1 },
       models: {},
     };
     const modelRunner: ModelRunner = {

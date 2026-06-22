@@ -1,8 +1,9 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import type { CouncilMode, CouncilResult, FusionRunTrace, PanelMode, PanelResponse } from "../types.js";
+import type { ContractGate, CouncilMode, CouncilResult, FusionRunTrace, PanelMode, PanelResponse } from "../types.js";
 import { validateCandidateOutput } from "../council/candidateValidation.js";
+import { renderContractGate } from "../council/contractGate.js";
 import { sanitizeText } from "../context/sanitize.js";
 import { buildJudgePrompt, buildPanelPrompt } from "../council/prompts.js";
 import { formatModelSpecTraceLine } from "../modelSpec.js";
@@ -31,36 +32,55 @@ export function resolveTraceRoot(cwd: string, traceDir?: string): string {
 
 export function detectGuidanceSections(text: string): {
   requirementLedger: boolean;
+  contractGate: boolean;
+  publicSurfaceMatrix: boolean;
+  externalConsumerProbes: boolean;
+  hiddenSemanticProbes: boolean;
   hiddenTests: boolean;
   packageChecklist: boolean;
+  packageEntryChecklist: boolean;
   immutabilityChecklist: boolean;
   typedErrorChecklist: boolean;
   rejectedRiskyIdeas: boolean;
   mainAgentExecutionRequirements: boolean;
   selfAuditChecklist: boolean;
   finalBuildContract: boolean;
+  buildReadyContractPacket: boolean;
 } {
   const lower = text.toLowerCase();
   return {
     requirementLedger: /requirement ledger|non-negotiable acceptance tests/i.test(text),
+    contractGate: /contract gate/i.test(text),
+    publicSurfaceMatrix: /public surface matrix/i.test(text),
+    externalConsumerProbes: /required external consumer probes|external consumer probe plan|build-ready external consumer test plan|required consumer probes/i.test(text),
+    hiddenSemanticProbes: /required hidden semantic probes|hidden semantic probe plan|hidden semantic tests/i.test(text),
     hiddenTests: /required hidden tests?|hidden (?:edge )?probe|hidden tests? to write/i.test(text),
     packageChecklist: /package\/build checklist|packaging\/build checklist|package\.json.*main|verification checklist/i.test(lower),
+    packageEntryChecklist: /package entry checklist/i.test(lower),
     immutabilityChecklist: /immutability|mutable internal|live internal|public reads return clones/i.test(lower),
     typedErrorChecklist: /typed error|typed-error|domain error|raw error.*leak/i.test(lower),
     rejectedRiskyIdeas: /ideas? to reject|rejected risky|risky\/speculative ideas rejected/i.test(lower),
-    mainAgentExecutionRequirements: /main-agent execution requirements|main agent execution requirements/i.test(lower),
+    mainAgentExecutionRequirements: /main-agent execution requirements|main agent execution requirements|build-ready use notes/i.test(lower),
     selfAuditChecklist: /self-audit|pre-final self-audit/i.test(lower),
     finalBuildContract: /final build contract|final implementation contract/i.test(lower),
+    buildReadyContractPacket: /build-ready contract packet/i.test(lower),
   };
 }
 
 export function detectJudgeOutputSections(text: string): string[] {
   const patterns: Array<[string, RegExp]> = [
     ["candidate summary table", /candidate summary table/i],
+    ["spec compliance verdict", /spec compliance verdict/i],
+    ["contract gate", /contract gate/i],
+    ["public surface matrix", /public surface matrix/i],
+    ["required external consumer probes", /required external consumer probes|required consumer probes/i],
+    ["required hidden semantic probes", /required hidden semantic probes|hidden semantic tests/i],
+    ["implementation priorities", /implementation priorities|implementation order/i],
+    ["package entry checklist", /package entry checklist/i],
+    ["build-ready contract packet", /build-ready contract packet/i],
     ["candidate bug audit", /candidate bug audit/i],
     ["best ideas to use", /best ideas to use/i],
     ["ideas to reject", /ideas to reject/i],
-    ["spec compliance verdict", /spec compliance verdict/i],
     ["final build contract", /final build contract/i],
     ["spec-literal interpretation", /spec-literal interpretation/i],
     ["required hidden tests", /required hidden tests?|main-agent test obligations/i],
@@ -81,14 +101,49 @@ export function buildEnhancedFinalGuidance(result: CouncilResult, baseGuidance: 
   const sections = detectGuidanceSections(baseGuidance);
   const extras: string[] = [];
   const quorum = trace?.quorum ?? result.trace?.quorum;
+  const externalConsumerProbes = result.requiredExternalConsumerProbes?.length
+    ? result.requiredExternalConsumerProbes
+    : result.buildReadyConsumerTestPlan ?? [];
+  const hiddenSemanticProbes = result.requiredHiddenSemanticProbes?.length
+    ? result.requiredHiddenSemanticProbes
+    : result.requiredTests;
+  const executionSectionTitle = result.panelMode === "advisory" ? "## Build-Ready Use Notes" : "## Main-Agent Execution Requirements";
 
-  if (result.requirementChecklist.length && !sections.requirementLedger) {
+  if (result.panelMode === "advisory" && !sections.buildReadyContractPacket) {
+    extras.push("## Build-Ready Contract Packet", "- Use this packet as the build contract for a later `/fusion-build` run.");
+  }
+  if ((result.requirementChecklist.length || result.safeCompatibilityAdditions?.length || result.optionalNiceties?.length) && !sections.contractGate) {
+    extras.push(
+      "## Contract Gate",
+      ...(result.requirementChecklist.length ? ["### Mandatory Literal Requirements", ...result.requirementChecklist.map((item) => `- ${item}`)] : ["### Mandatory Literal Requirements", "- None listed."]),
+      ...(result.safeCompatibilityAdditions?.length ? ["### Safe Compatibility Additions", ...result.safeCompatibilityAdditions.map((item) => `- ${item}`)] : []),
+      ...(result.optionalNiceties?.length ? ["### Optional Niceties", ...result.optionalNiceties.map((item) => `- ${item}`)] : []),
+    );
+  } else if (result.requirementChecklist.length && !sections.requirementLedger && !sections.contractGate) {
     extras.push("## Requirement Ledger", ...result.requirementChecklist.map((item) => `- ${item}`));
+  }
+  if (result.publicSurfaceMatrix?.length && !sections.publicSurfaceMatrix) {
+    extras.push("## Public Surface Matrix", ...result.publicSurfaceMatrix.map((item) => `- ${item}`));
+  }
+  if (externalConsumerProbes.length && !sections.externalConsumerProbes) {
+    extras.push(
+      result.panelMode === "advisory" ? "## Build-Ready External Consumer Test Plan" : "## Required External Consumer Probes",
+      ...externalConsumerProbes.map((item) => `- ${item}`),
+    );
+  }
+  if (hiddenSemanticProbes.length && !sections.hiddenSemanticProbes && !sections.hiddenTests) {
+    extras.push(
+      result.panelMode === "advisory" ? "## Hidden Semantic Tests" : "## Required Hidden Semantic Probes",
+      ...hiddenSemanticProbes.map((item) => `- ${item}`),
+    );
+  }
+  if (result.packageEntryChecklist?.length && !sections.packageEntryChecklist) {
+    extras.push("## Package Entry Checklist", ...result.packageEntryChecklist.map((item) => `- ${item}`));
   }
   if (result.rejectedRiskyIdeas.length && !sections.rejectedRiskyIdeas) {
     extras.push("## Rejected Risky Ideas", ...result.rejectedRiskyIdeas.map((item) => `- ${item}`));
   }
-  if (result.requiredTests.length && !sections.hiddenTests) {
+  if (result.requiredTests.length && !sections.hiddenTests && sections.hiddenSemanticProbes) {
     extras.push("## Required Hidden Tests", ...result.requiredTests.map((item) => `- ${item}`));
   }
   if (result.finalComplianceChecklist?.length && !sections.packageChecklist) {
@@ -100,13 +155,17 @@ export function buildEnhancedFinalGuidance(result: CouncilResult, baseGuidance: 
 
   if (!sections.mainAgentExecutionRequirements) {
     extras.push(
-      "## Main-Agent Execution Requirements",
-      "- Implement according to the Requirement Ledger and the original user task. If they conflict, the original user task wins.",
-      "- Preserve explicit public API, error, edge-case, and serialization contracts exactly.",
-      "- Before finishing, implement the judge's Required Hidden Tests or equivalent coverage.",
-      "- Verify boundary, determinism, restore/parse continuation, rollback, immutability, and public-shape edge cases relevant to the task before final answer.",
+      executionSectionTitle,
+      "- Treat the original user task as authoritative; if it conflicts with the packet, the original task wins.",
+      "- Preserve explicit public API, error, edge-case, normalization, and serialization contracts exactly.",
+      "- Verify package-root exports and published-entry consumer imports before claiming compliance.",
       "- Do not accept visible-test-only success if hidden probes or the literal task would still fail.",
-      "- Run npm run typecheck, npm test, and npm run build when the task requires them.",
+      ...(result.panelMode === "advisory"
+        ? ["- `/fusion-no-build` stops here. Use this packet for a later build; do not implement from this output inside the planning run."]
+        : [
+          "- Before finishing, implement the required external-consumer probes and hidden semantic probes or equivalent coverage.",
+          "- Run npm run typecheck, npm test, and npm run build when the task requires them.",
+        ]),
     );
   }
 
@@ -122,17 +181,25 @@ export function buildEnhancedFinalGuidance(result: CouncilResult, baseGuidance: 
   if (!sections.selfAuditChecklist) {
     extras.push(
       "## Self-Audit Checklist",
-      "- All required public API symbols are exported.",
+      "- All required package-root exports and typed errors are exported from the published entry.",
+      "- Instance methods were not substituted for literal package-root export requirements.",
       "- package.json main and types resolve to actual built files.",
+      "- Whitespace-only values are rejected when the task requires non-empty strings.",
       "- Typed errors are used where required.",
-      "- Hidden tests from judge guidance are implemented where practical.",
-      "- npm run typecheck, npm test, and npm run build are run if requested.",
+      "- Public getters, snapshots, audits, and diffs do not leak tokens, secrets, or mutable internal state unless explicitly required.",
+      ...(result.panelMode === "advisory"
+        ? ["- Package-entry consumer probes are ready to implement during the later build run."]
+        : ["- Hidden tests and consumer-facing probes from judge guidance are implemented where practical.", "- npm run typecheck, npm test, and npm run build are run if requested."]),
     );
   }
 
   const needsExtras = !sections.finalBuildContract
-    || !sections.requirementLedger
-    || !sections.hiddenTests
+    || !sections.contractGate
+    || !sections.publicSurfaceMatrix
+    || !sections.externalConsumerProbes
+    || !sections.packageEntryChecklist
+    || (!sections.contractGate && !sections.requirementLedger)
+    || (!sections.hiddenTests && !sections.hiddenSemanticProbes)
     || !sections.packageChecklist
     || !sections.rejectedRiskyIdeas
     || !sections.mainAgentExecutionRequirements
@@ -140,9 +207,11 @@ export function buildEnhancedFinalGuidance(result: CouncilResult, baseGuidance: 
 
   if (!needsExtras && extras.length <= 1) return baseGuidance;
 
-  const header = sections.finalBuildContract
+  const header = sections.finalBuildContract || sections.buildReadyContractPacket
     ? ""
-    : `## Final Build Contract\n${result.finalBuildGuidance || result.finalRecommendation || baseGuidance}`;
+    : result.panelMode === "advisory"
+      ? `## Build-Ready Contract Packet\n${result.finalBuildGuidance || result.finalRecommendation || baseGuidance}`
+      : `## Final Build Contract\n${result.finalBuildGuidance || result.finalRecommendation || baseGuidance}`;
   return [baseGuidance, header, ...extras].filter(Boolean).join("\n\n");
 }
 
@@ -190,8 +259,8 @@ export function enrichTraceMetadata(input: {
       ? Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length)
       : undefined,
     judgeOutputSectionsDetected: judgeSections,
-    finalGuidanceContainsHiddenTests: guidanceSections.hiddenTests || judgeSections.includes("required hidden tests"),
-    finalGuidanceContainsPackageChecklist: guidanceSections.packageChecklist,
+    finalGuidanceContainsHiddenTests: guidanceSections.hiddenTests || guidanceSections.hiddenSemanticProbes || judgeSections.includes("required hidden tests") || judgeSections.includes("required hidden semantic probes"),
+    finalGuidanceContainsPackageChecklist: guidanceSections.packageChecklist || guidanceSections.packageEntryChecklist,
     finalGuidanceContainsImmutabilityChecklist: guidanceSections.immutabilityChecklist || judgeSections.includes("immutability checklist"),
     finalGuidanceContainsTypedErrorChecklist: guidanceSections.typedErrorChecklist || judgeSections.includes("typed error checklist"),
     artifactFiles,
@@ -206,6 +275,7 @@ export type RunArtifactInput = {
   mode: CouncilMode;
   panelMode?: PanelMode;
   command?: string;
+  contractGate?: ContractGate;
   context: ContextBundle;
   panelModels: string[];
   judgeModel: string;
@@ -213,6 +283,8 @@ export type RunArtifactInput = {
   panelPrompts: string[];
   judgePrompt?: string;
   judgeOutput?: string;
+  postBuildAuditPrompt?: string;
+  postBuildAuditOutput?: string;
   finalGuidance?: string;
   councilResult?: CouncilResult;
   trace: FusionRunTrace;
@@ -231,6 +303,11 @@ export async function writeRunArtifacts(input: RunArtifactInput): Promise<{ arti
 
   await writeFile(paths.originalPrompt, sanitizeText(input.task), "utf8");
 
+  if (input.contractGate) {
+    paths.contractGate = path.join(artifactDir, "contract-gate.md");
+    await writeFile(paths.contractGate, sanitizeText(renderContractGate(input.contractGate)), "utf8");
+  }
+
   for (let index = 0; index < input.panelResponses.length; index += 1) {
     const panelNumber = index + 1;
     const promptPath = path.join(artifactDir, `panel-${panelNumber}-prompt.md`);
@@ -248,6 +325,14 @@ export async function writeRunArtifacts(input: RunArtifactInput): Promise<{ arti
   if (input.judgeOutput) {
     paths.judgeOutput = path.join(artifactDir, "judge-output.md");
     await writeFile(paths.judgeOutput, sanitizeText(input.judgeOutput), "utf8");
+  }
+  if (input.postBuildAuditPrompt) {
+    paths.postBuildAuditPrompt = path.join(artifactDir, "post-build-audit-prompt.md");
+    await writeFile(paths.postBuildAuditPrompt, sanitizeText(input.postBuildAuditPrompt), "utf8");
+  }
+  if (input.postBuildAuditOutput) {
+    paths.postBuildAuditOutput = path.join(artifactDir, "post-build-audit-output.md");
+    await writeFile(paths.postBuildAuditOutput, sanitizeText(input.postBuildAuditOutput), "utf8");
   }
 
   const baseGuidance = input.finalGuidance ?? "";
@@ -310,16 +395,31 @@ export function formatLatestTraceSummary(trace: FusionRunTrace): string {
     trace.panelMode ? `**Panel mode:** ${trace.panelMode}` : undefined,
     `**Artifact directory:** ${trace.artifactDir ?? "unknown"}`,
     `**Model source:** ${trace.modelSource}`,
+    trace.executionMode ? `**Execution mode:** ${trace.executionMode}` : undefined,
+    trace.sharedPanelPromptHash ? `**Shared panel prompt hash:** ${trace.sharedPanelPromptHash}` : undefined,
+    trace.sharedPanelPromptPath ? `**Shared panel prompt path:** ${trace.sharedPanelPromptPath}` : undefined,
     `**Fallback used:** ${trace.fallbackUsed ? "yes" : "no"}`,
     trace.candidateValidation ? `**Candidate validation:** ${trace.candidateValidation.allPassed ? "all passed" : "failures present"}` : undefined,
     trace.quorum ? `**Quorum:** ${trace.quorum.usable}/${trace.quorum.total} usable (required ${trace.quorum.required})${trace.quorum.degraded ? " — degraded" : ""}` : undefined,
     trace.repairAttempted !== undefined ? `**Repair attempted:** ${trace.repairAttempted ? "yes" : "no"}` : undefined,
     trace.repairSucceeded !== undefined ? `**Repair succeeded:** ${trace.repairSucceeded ? "yes" : "no"}` : undefined,
     trace.panelOutputCompletenessScore !== undefined ? `**Panel completeness score:** ${trace.panelOutputCompletenessScore}` : undefined,
+    trace.contractGate ? `**Contract Gate:** ${trace.contractGate.literalRequirementsDetected} literal requirements; exports=${trace.contractGate.publicExportsRequired.join(", ") || "none"}` : undefined,
+    trace.postBuildAudit ? `**Post-build audit:** ${trace.postBuildAudit.status} (fixCyclesUsed=${trace.postBuildAudit.fixCyclesUsed})` : undefined,
     "",
+    ...(trace.contractGate
+      ? [
+        "## Contract Gate Summary",
+        `- Required package-root exports: ${trace.contractGate.publicExportsRequired.join(", ") || "none"}`,
+        `- Required consumer probes: ${trace.contractGate.consumerProbesRequired.join("; ") || "none"}`,
+        `- Compatibility recommendations: ${trace.contractGate.compatibilityRecommendations.join("; ") || "none"}`,
+        "",
+      ]
+      : []),
     "## Requested Models",
     ...trace.panelModelsRequested.map((spec, index) => `- ${formatModelSpecTraceLine(spec, `Panel ${index + 1}`, spec.reasoningEffort ? "unsupported" : "not_configured")}`),
     `- ${formatModelSpecTraceLine(trace.judgeModelRequested, "Judge", trace.judgeModelRequested.reasoningEffort ? "unsupported" : "not_configured")}`,
+    ...(trace.panelSessions?.length ? formatNativePanelSessions(trace.panelSessions) : []),
     "",
     "## Panel Status",
     ...trace.panel.map((entry) => [
@@ -337,16 +437,45 @@ export function formatLatestTraceSummary(trace: FusionRunTrace): string {
     "## Judge Status",
     `- ${trace.judge.modelId}: ${trace.judge.success ? "succeeded" : "failed"}${trace.judge.elapsedMs !== undefined ? ` elapsedMs=${trace.judge.elapsedMs}` : ""}${trace.judge.reasoningEffort ? ` effort=${trace.judge.reasoningEffort}` : ""}${trace.judge.reasoningEffortApplied === "unsupported" ? " appliedEffort=unsupported" : ""}${trace.judge.error ? ` - ${trace.judge.error}` : ""}`,
     trace.judgeOutputSectionsDetected?.length ? `\n**Judge sections detected:** ${trace.judgeOutputSectionsDetected.join(", ")}` : undefined,
+    ...(trace.postBuildAudit
+      ? [
+        "",
+        "## Post-Build Audit",
+        `- enabled=${trace.postBuildAudit.enabled ? "yes" : "no"}`,
+        `- status=${trace.postBuildAudit.status}`,
+        `- fixCyclesUsed=${trace.postBuildAudit.fixCyclesUsed}`,
+        trace.postBuildAudit.sessionId ? `- sessionId=${trace.postBuildAudit.sessionId}` : undefined,
+        ...trace.postBuildAudit.findings.map((finding) => `- ${finding.requirement} -> ${finding.observed} -> ${finding.requiredFix}`),
+      ].filter((line): line is string => line !== undefined)
+      : []),
     "",
     "## Raw Artifacts",
     trace.artifactPaths?.originalPrompt ? `- Original prompt: ${trace.artifactPaths.originalPrompt}` : undefined,
+    trace.artifactPaths?.contractGate ? `- Contract Gate: ${trace.artifactPaths.contractGate}` : undefined,
+    trace.sharedPanelPromptPath ? `- Shared panel prompt: ${trace.sharedPanelPromptPath}` : undefined,
     trace.artifactPaths?.panel1Output ? `- Panel 1 output: ${trace.artifactPaths.panel1Output}` : undefined,
     trace.artifactPaths?.panel2Output ? `- Panel 2 output: ${trace.artifactPaths.panel2Output}` : undefined,
     trace.artifactPaths?.panel3Output ? `- Panel 3 output: ${trace.artifactPaths.panel3Output}` : undefined,
     trace.artifactPaths?.judgeOutput ? `- Judge output: ${trace.artifactPaths.judgeOutput}` : undefined,
+    trace.artifactPaths?.postBuildAuditPrompt ? `- Post-build audit prompt: ${trace.artifactPaths.postBuildAuditPrompt}` : undefined,
+    trace.artifactPaths?.postBuildAuditOutput ? `- Post-build audit output: ${trace.artifactPaths.postBuildAuditOutput}` : undefined,
     trace.artifactPaths?.finalGuidance ? `- Final guidance: ${trace.artifactPaths.finalGuidance}` : undefined,
     trace.artifactPaths?.trace ? `- trace.json: ${trace.artifactPaths.trace}` : undefined,
   ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function formatNativePanelSessions(sessions: NonNullable<FusionRunTrace["panelSessions"]>): string[] {
+  return [
+    "",
+    "## Native Panel Sessions",
+    ...sessions.map((session) => [
+      `- Panel ${session.panelIndex}: agent=${session.agentName}; model=${session.modelId}; nativeTask=${session.nativeTask ? "yes" : "no"}; promptHash=${session.promptHash}`,
+      session.sessionId ? `  sessionId=${session.sessionId}` : undefined,
+      session.taskId ? `  taskId=${session.taskId}` : undefined,
+      session.success !== undefined ? `  success=${session.success ? "yes" : "no"}` : undefined,
+      session.validationStatus ? `  validation=${session.validationStatus}` : undefined,
+    ].filter((line): line is string => line !== undefined).join("")),
+  ];
 }
 
 export function buildPanelPrompts(input: {
@@ -356,6 +485,7 @@ export function buildPanelPrompts(input: {
   panelMode?: PanelMode;
   panelModels: string[];
   promptVerbosity?: import("../types.js").PromptVerbosity;
+  contractGate?: ContractGate;
 }): string[] {
   const prompt = buildPanelPrompt({
     task: input.task,
@@ -363,6 +493,7 @@ export function buildPanelPrompts(input: {
     context: input.context,
     panelMode: input.panelMode,
     promptVerbosity: input.promptVerbosity,
+    contractGate: input.contractGate,
   });
   return input.panelModels.map(() => prompt);
 }
@@ -374,6 +505,7 @@ export function buildJudgePromptText(input: {
   panel: PanelResponse[];
   panelMode?: PanelMode;
   quorum?: import("../types.js").FusionTraceQuorum;
+  contractGate?: ContractGate;
 }): string {
   return buildJudgePrompt(input);
 }

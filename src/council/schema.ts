@@ -14,6 +14,14 @@ export const judgeResultSchema = z.object({
   missingConsiderations: z.array(z.string()).default([]),
   finalRecommendation: z.string().default(""),
   requirementChecklist: z.array(z.string()).default([]),
+  safeCompatibilityAdditions: z.array(z.string()).default([]),
+  optionalNiceties: z.array(z.string()).default([]),
+  publicSurfaceMatrix: z.array(z.string()).default([]),
+  requiredExternalConsumerProbes: z.array(z.string()).default([]),
+  requiredHiddenSemanticProbes: z.array(z.string()).default([]),
+  implementationPriorities: z.array(z.string()).default([]),
+  packageEntryChecklist: z.array(z.string()).default([]),
+  buildReadyConsumerTestPlan: z.array(z.string()).default([]),
   rejectedRiskyIdeas: z.array(z.string()).default([]),
   finalBuildGuidance: z.string().default(""),
   mustNotBreakConstraints: z.array(z.string()).default([]),
@@ -29,5 +37,16 @@ export const judgeResultSchema = z.object({
   recommendedBuildPrompt: z.string().default(""),
   knownTraps: z.array(z.string()).default([]),
   finalComplianceChecklist: z.array(z.string()).default([]),
+  finalOutput: z.string().default(""),
+});
+
+export const contractAuditResultSchema = z.object({
+  status: z.enum(["PASS", "FIX_REQUIRED"]).default("FIX_REQUIRED"),
+  summary: z.string().default(""),
+  findings: z.array(z.object({
+    requirement: z.string().default(""),
+    observed: z.string().default(""),
+    requiredFix: z.string().default(""),
+  })).default([]),
   finalOutput: z.string().default(""),
 });
