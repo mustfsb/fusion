@@ -1,72 +1,298 @@
 ---
-description: Candidate-build Fusion Council via native OpenCode subagents — 3 panel subagents + judge subagent, then implement
+description: Parallel main build + isolated panel candidate builds, then judge patch contract, targeted patching, and final audit
 agent: fusion-orchestrator
 ---
-You are running `/fusion-build` as the fusion-orchestrator. Panels and the judge MUST run as real OpenCode native Task subagents (`fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`, `fusion-judge`). Do NOT use the legacy all-in-one Fusion council tool for this command. Do NOT use any hidden SDK panel runner. Use the `fusion_native` tool only for deterministic prepare/collect/finalize logic.
+You are running `/fusion-build` as the `fusion-orchestrator`.
 
-Pass the exact user task text through without rewriting, summarizing, improving, or expanding it: $ARGUMENTS
+Panels and the judge MUST run as visible native OpenCode Task subagents (3 panel subagents plus judge):
 
-Execute this exact sequence:
+- `fusion-panel-1`
+- `fusion-panel-2`
+- `fusion-panel-3`
+- `fusion-judge`
 
-1. Call `fusion_native` with stage `prepare`:
+Do NOT use the legacy all-in-one `fusion_council` tool for this command.
+Do NOT use hidden SDK runners, direct provider calls, or background model HTTP calls.
+Use `fusion_native` for deterministic orchestration state only.
+
+Pass the exact user task text through without rewriting: `$ARGUMENTS`
+
+The default and only `/fusion-build` workflow is `speculative_parallel_build`.
+Never add `/fusion-spec-build`.
+
+## Step 1: Fast Prepare
+
+Call `fusion_native` with stage `prepare`:
+
 ```json
 {
   "stage": "prepare",
   "task": "$ARGUMENTS",
   "mode": "build_prompt",
   "panelMode": "candidate_build",
+  "buildStrategy": "speculative_parallel_build",
   "promptVerbosity": "compact",
   "command": "fusion-build",
   "requireAllPanels": false,
   "minSuccessfulPanels": 2,
-  "allowDegradedJudge": true
+  "allowDegradedJudge": true,
+  "parallelExecutionSupported": true
 }
 ```
-Do NOT pass `panelModels` or `judgeModel` — `fusion_native` resolves them from saved `/fusion-model` config or built-in defaults.
 
-2. Read the prepare result. It returns `runId`, `sharedPanelPrompt`, `sharedPanelPromptHash`, `panelAgents` (three entries with `agentName` + `modelId`), `judgeAgent`, and `todoPlan`.
+Do NOT pass `panelModels` or `judgeModel` unless the user explicitly overrode them.
 
-3. Call `todowrite` with the `todoPlan` array from the prepare result. You own the todo list.
+Prepare must return quickly with:
 
-4. Dispatch the three panel subagents IN PARALLEL in a single assistant turn — issue three `task` tool calls together, not one after another:
-   - `task` with `subagent_type: "fusion-panel-1"`, `prompt: <sharedPanelPrompt>`, `description: "Fusion Panel 1"`
-   - `task` with `subagent_type: "fusion-panel-2"`, `prompt: <sharedPanelPrompt>`, `description: "Fusion Panel 2"`
-   - `task` with `subagent_type: "fusion-panel-3"`, `prompt: <sharedPanelPrompt>`, `description: "Fusion Panel 3"`
+- `runId`
+- `traceArtifactDir`
+- `runStatePath`
+- `canonicalTaskPath`
+- `canonicalTaskHash`
+- `panelAgents`
+- `panelExecutionPlan`
+- `judgeAgent`
+- `todoPlan`
+- `speculative.pathResolution`
 
-   Send the EXACT same `sharedPanelPrompt` text to all three. Do not rewrite it. The shared prompt hash proves they received identical payloads.
+In `/fusion-build`, prepare is intentionally minimal. It must not wait for:
 
-5. Immediately after dispatching, call `todowrite` to mark the three Panel analysis todos `in_progress`.
+- candidate workspace copying
+- panel readiness
+- panel output
+- judge setup
 
-6. The user can open the native child sessions for `fusion-panel-1`, `fusion-panel-2`, and `fusion-panel-3` in the OpenCode UI to watch them work live. Let the three Task calls return.
+Immediately call `todowrite` with the returned `todoPlan`.
 
-7. Collect the three panel Task results. For each, capture `agentName`, `modelId`, the returned text as `content` (or `error`/`errorType` if it failed), and any `task_id`/session id if available.
+## Step 2: Start the Main Baseline Immediately
 
-8. Call `fusion_native` with stage `collect`:
+Immediately after successful minimal prepare, before any panel staging or dispatch:
+
+1. Record the main baseline start through the real lifecycle route:
+
 ```json
 {
-  "stage": "collect",
-  "runId": "<runId from prepare>",
-  "panelResults": [
-    { "agentName": "fusion-panel-1", "modelId": "<panel 1 model>", "content": "<panel 1 text>" },
-    { "agentName": "fusion-panel-2", "modelId": "<panel 2 model>", "content": "<panel 2 text>" },
-    { "agentName": "fusion-panel-3", "modelId": "<panel 3 model>", "content": "<panel 3 text>" }
+  "stage": "advance",
+  "runId": "<runId>",
+  "mainBaselineStartedAt": "<ISO timestamp>"
+}
+```
+
+2. Begin implementation in the real source workspace right away.
+
+Do NOT wait for:
+
+- candidate workspace copying
+- shared panel prompt materialization
+- Panel 1 dispatch
+- Panel 1 activity
+- Panel 2/3 cascade logic
+- any heavy panel-only preparation
+
+When advance returns `nextAction.type = "wait"` with `delayMs: 0` after this recording call, that means main baseline start was persisted and panel staging is deferred to the next advance tick. Proceed with real workspace implementation and call advance again for panel scheduling.
+
+Implement the user task normally in the real workspace:
+
+- inspect files
+- edit code
+- add or update tests
+- run verification
+
+Until the baseline is terminal, do NOT read:
+
+- panel reports
+- panel candidate code
+- panel patches
+- judge conclusions
+- merge patch contract
+
+## Step 3: Deterministic Advance Loop for Panel Scheduling
+
+While the main baseline continues, `fusion_native advance` is the runtime driver for panel work. It owns:
+
+- isolated candidate workspaces per panel slot
+- shared task materialization
+- staggered panel dispatch decisions
+- credible activity tracking
+- bounded fallback gates
+- same-slot retry
+- judge eligibility
+
+Call advance at deterministic checkpoints while main baseline work continues:
+
+```json
+{
+  "stage": "advance",
+  "runId": "<runId>"
+}
+```
+
+Never make main baseline startup depend on these panel actions.
+
+Read `nextAction`.
+
+### If `nextAction.type` is `start_panel`
+
+Dispatch exactly the returned panel:
+
+- `subagent_type`: `nextAction.agentName`
+- `prompt`: `nextAction.prompt`
+- `description`: `Fusion Panel <logical slot>`
+
+In speculative mode the returned prompt is panel-specific and already bound to that panel's candidate workspace. Do NOT substitute `panelTransportPrompt` here.
+
+Immediately call `fusion_native advance` again with the dispatch event:
+
+```json
+{
+  "stage": "advance",
+  "runId": "<runId>",
+  "panelDispatches": [
+    {
+      "logicalPanelIndex": 1,
+      "startReason": "cascade_activity",
+      "startedAt": "<ISO timestamp>",
+      "taskId": "<if available>",
+      "sessionId": "<if available>"
+    }
   ]
 }
 ```
-Pass `error` and `errorType` instead of `content` for any panel that failed.
 
-9. Read the collect result. It returns `shouldProceed`, `reason`, `quorum`, `judgePrompt`, `judgeAgent`, `panelStatus`, `degraded`, and `todoUpdates`. Call `todowrite` with `todoUpdates`.
+### If `nextAction.type` is `wait`
 
-10. If `shouldProceed` is false, stop. Do not call the judge. Do not implement. Report the reason, quorum, and failed panel diagnostics. Mark the Judge synthesis todo `failed`.
+Obey the returned scheduler deadline. Do not invent your own timer.
 
-11. If `shouldProceed` is true, dispatch the judge as a native Task subagent:
-    - `task` with `subagent_type: "fusion-judge"`, `prompt: <judgePrompt>`, `description: "Fusion Judge"`
+- Use `nextAction.delayMs`
+- Sleep only for that returned delay
+- Call `fusion_native advance` again when it expires
 
-    Mark the Judge synthesis todo `in_progress`. The user can open the native `fusion-judge` child session in the OpenCode UI while it runs.
+The bounded silent-panel fallback gate currently defaults to about 45 seconds from the previous panel dispatch when no credible activity can be observed. This replaces hardcoded `sleep 60` orchestration.
 
-12. Collect the judge Task result text.
+When the previous panel shows no credible activity within that window, the next panel may launch with `startReason: "start_gate_timeout"`. A silent or stuck Panel 2 must not block Panel 3 forever.
 
-13. Call `fusion_native` with stage `finalize`:
+This is the live staggered cascade.
+
+### If `nextAction.type` is `call_collect`
+
+The main baseline is terminal and usable panel quorum is ready. Move to collect immediately. Do not wait for a failed or silent third panel.
+
+### If `nextAction.type` is `done`
+
+Stop and report the reason honestly.
+
+## Step 4: Feed Back Real Activity Only
+
+While panels run, keep an accumulated `panelResults` array from real Task completions.
+
+Only send `panelObservations` when they are real. Valid credible activity includes:
+
+- non-empty assistant output
+- non-empty reasoning output
+- tool call start
+- tool call completion
+- tool result
+- candidate workspace source or test file mutation
+- candidate-local report or notes write
+- terminal result
+
+Do not count:
+
+- polling
+- scheduler ticks
+- task creation alone
+- placeholder messages
+- fake progress
+- empty output
+
+If the runtime exposes no real child-session activity, that is fine. Keep calling `advance` on its returned wait deadlines and on real panel completions. Do not fabricate telemetry.
+
+If `advance` returns `start_panel` with `startReason: "retry"`, redispatch the SAME logical slot. Never create `fusion-panel-4`.
+
+Do not automatically cancel panels unless Fusion runtime capability reporting explicitly says cancellation/abort is supported. Current default behavior is conservative.
+
+## Step 5: Record the Terminal Main Baseline
+
+When the main baseline reaches a terminal state, call `record_main_baseline`:
+
+```json
+{
+  "stage": "record_main_baseline",
+  "runId": "<runId>",
+  "mainBaseline": {
+    "startedAt": "<ISO>",
+    "completedAt": "<ISO>",
+    "status": "passed",
+    "workspacePath": "<real workspace absolute path>",
+    "changedFiles": ["<relative path>"],
+    "verification": {
+      "typecheck": "pass",
+      "test": "pass",
+      "build": "pass",
+      "commandsRun": ["npm run typecheck", "npm test", "npm run build"]
+    }
+  }
+}
+```
+
+Use `failed` or `blocked` when appropriate. Main baseline failure is still terminal and must not deadlock the orchestration.
+
+## Step 6: Collect and Judge
+
+When `advance` returns `call_collect`, call:
+
+```json
+{
+  "stage": "collect",
+  "runId": "<runId>",
+  "panelResults": [
+    { "agentName": "fusion-panel-1", "modelId": "<panel 1 model>", "content": "<panel 1 text>" },
+    { "agentName": "fusion-panel-2", "modelId": "<panel 2 model>", "error": "timed out", "errorType": "timeout" }
+  ]
+}
+```
+
+You may omit a missing late panel. `collect` will use the persisted run-state and current quorum rules. It returns:
+
+- `shouldProceed`
+- `reason`
+- `quorum`
+- `judgeTransportPrompt`
+- `judgeAgent`
+- `panelAttempts`
+- `todoUpdates`
+- `speculative`
+
+`collect` also records actual overlap between the main baseline and panel attempts when both intervals are known.
+
+Call `todowrite` with `todoUpdates`.
+
+If `shouldProceed` is false, stop and report the reason honestly.
+
+If `shouldProceed` is true:
+
+1. Dispatch visible `fusion-judge` with `judgeTransportPrompt`
+2. Immediately record the judge dispatch:
+
+```json
+{
+  "stage": "advance",
+  "runId": "<runId>",
+  "judgeDispatched": {
+    "startedAt": "<ISO timestamp>",
+    "taskId": "<if available>",
+    "sessionId": "<if available>"
+  }
+}
+```
+
+3. Wait for the real judge result
+4. Call `finalize`
+
+## Step 7: Apply the Merge Patch Contract
+
+Call `finalize`:
+
 ```json
 {
   "stage": "finalize",
@@ -75,61 +301,48 @@ Pass `error` and `errorType` instead of `content` for any panel that failed.
   "judgeSessionId": "<judge child session id if available>"
 }
 ```
-Pass `judgeError` instead of `judgeOutput` if the judge Task failed.
 
-14. Read the finalize result. It returns `executionMode: "native_subagents"`, `success`, `councilResult`, `finalGuidance`, `trace`, `traceSummary`, and `artifactDir`. Call `todowrite` to mark the Judge synthesis todo `completed` (or `failed`), and mark `Implement approved plan` `in_progress`.
+Read the Merge Patch Contract. Apply only approved targeted patches:
 
-15. Implement the original user task in the current repository using `finalGuidance` as the build contract. The original user task is the sole source of truth.
-    - Treat the Contract Gate and final build contract as contract-first guidance, not optional advice.
-    - Preserve explicit exports, typed errors, option/property names, edge-case behavior, normalization, determinism, serialization, and public-state hygiene exactly.
-    - Do not assume an instance method satisfies a literal `Export ...` requirement.
-    - If the task requires non-empty strings, reject whitespace-only strings too unless the task explicitly says otherwise.
-    - If the task exposes public APIs or error classes, add tests that import from the package entry, not only internal source files.
-    - If any explicit API/error/edge-case contract conflicts with existing visible tests, update the implementation and tests to match the original user task, not the weaker visible tests.
-    - Do not accept visible-test-only success if hidden probes or the literal task would still fail.
+- Apply all `BLOCKER`
+- Apply all `MUST_FIX`
+- Apply `SAFE_ADDITION` only when explicitly low-risk and non-breaking
+- Never apply `REJECTED`
 
-16. Create or update contract-focused consumer tests using the project's existing test framework. Mark `Create or update contract-focused consumer tests` `in_progress`, then `completed` when done.
-    - At minimum, cover the judge's Package Entry Checklist, Public Surface Matrix, Required External Consumer Probes, and Required Hidden Semantic Probes.
-    - Test package-root exports, exported error classes, consumer-facing option/property names, whitespace normalization, typed errors, and public-state hygiene when relevant.
+Do not copy an entire candidate workspace into the real project.
 
-17. Call `fusion_native` with stage `audit_prepare`:
-```json
-{
-  "stage": "audit_prepare",
-  "runId": "<runId>"
-}
-```
-Read the result.
-    - If `enabled` is false, report the reason honestly and continue to final verification without claiming the audit ran.
-    - If `enabled` is true, it returns `auditPrompt`, `auditAgent`, `fixCyclesUsed`, and `maxFixCycles`.
+## Step 8: Audit and Final Verification
 
-18. If audit is enabled, dispatch `fusion-judge` again as a native Task subagent for the post-build contract audit:
-    - `task` with `subagent_type: "fusion-judge"`, `prompt: <auditPrompt>`, `description: "Fusion Contract Audit"`
+After targeted patching:
 
-    Mark `Post-build contract audit` `in_progress`. The user can open this additional native `fusion-judge` child session in the OpenCode UI.
+1. Run real project verification:
+   - `npm run typecheck`
+   - `npm test`
+   - `npm run build`
+2. Call `audit_prepare`
+3. Run post-build contract audit by dispatching visible `fusion-judge` for the post-build audit
+4. Call `audit_finalize` with `appliedPatchItems`
+5. Preserve the existing one-fix-cycle behavior
 
-19. Collect the audit Task result text.
+The post-build audit, Correctness Coverage Gate, Council Comparison Dossier, Contract Gate, and Merge Patch Contract behavior must remain intact.
 
-20. Call `fusion_native` with stage `audit_finalize`:
-```json
-{
-  "stage": "audit_finalize",
-  "runId": "<runId>",
-  "auditOutput": "<audit result text>",
-  "auditSessionId": "<audit child session id if available>"
-}
-```
-Pass `auditError` instead of `auditOutput` if the audit Task failed.
+## Final Response Requirements
 
-21. Read the audit finalize result. It returns `status` (`PASS` or `FIX_REQUIRED`), `findings`, `fixCyclesUsed`, `maxFixCycles`, `autoFixAllowed`, `trace`, and `traceSummary`.
-    - If `status` is `PASS`, mark `Post-build contract audit` `completed` and `Resolve contract audit findings` `completed`.
-    - If `status` is `FIX_REQUIRED` and `autoFixAllowed` is true, mark `Resolve contract audit findings` `in_progress`, fix the exact findings, rerun the contract-focused tests you changed, then run one more `audit_prepare` + audit Task + `audit_finalize` cycle.
-    - If `status` is `FIX_REQUIRED` after the allowed cycle, or the audit Task itself failed, stop claiming full compliance. Mark the audit/fix todo(s) honestly and surface the remaining mismatches.
+Final response must include:
 
-22. Run final verification: `npm run typecheck`, `npm test`, and `npm run build` (or the verification commands the user task names). Mark `Final verification` `completed` or `failed`.
+- Fusion run ID
+- execution mode `native_subagents`
+- build strategy `speculative_parallel_build`
+- artifact path
+- shared panel prompt hash
+- panel agent names and model IDs
+- panel success and validation status
+- panel attempt summary
+- main baseline status
+- quorum
+- Merge Patch Contract decision
+- applied patch items
+- post-build audit status
+- verification results
 
-23. Final response must include: Fusion run ID, execution mode `native_subagents`, trace artifact path, shared panel prompt hash, panel agent names + model IDs + panel success/validation status, judge agent + model + success, quorum status (note degraded mode if applicable), post-build audit status and findings summary, files created, test count, verification results, consumer-facing tests added, known limitations, and design trade-offs.
-
-24. Tell the user where to inspect raw panel/judge/audit outputs under the artifact path or via `/fusion-trace`, and that the native child sessions for `fusion-panel-1/2/3` and both `fusion-judge` runs are inspectable in the OpenCode UI while the run is in progress.
-
-If `fusion_native` is unavailable or `prepare` fails, stop and report the error. Do not fall back to a hidden SDK panel runner.
+Tell the user they can inspect `fusion-panel-1/2/3` and `fusion-judge` child sessions in the OpenCode UI, and they can inspect raw artifacts via `/fusion-trace`.

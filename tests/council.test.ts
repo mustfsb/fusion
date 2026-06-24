@@ -585,11 +585,14 @@ describe("panel modes in prompts", () => {
     expect(prompt).toContain("Derived Contract Gate");
     expect(prompt).toContain("## 1. Contract Gate");
     expect(prompt).toContain("## 2. Public Surface Matrix");
-    expect(prompt).toContain("## 3. External Consumer Probe Plan");
-    expect(prompt).toContain("## 4. Hidden Semantic Probe Plan");
-    expect(prompt).toContain("## 5. Implementation Guidance");
-    expect(prompt).toContain("## 6. Self-Audit Risks");
-    expect(prompt).toContain("Preserve explicit API shapes, error contracts");
+    expect(prompt).toContain("## 3. Common Requirements and Non-Negotiables");
+    expect(prompt).toContain("## 4. Key Decision Points");
+    expect(prompt).toContain("## 5. Hidden Semantic Probe Plan");
+    expect(prompt).toContain("## 6. Safe Compatibility Ideas");
+    expect(prompt).toContain("## 7. Scope Risks / Avoid");
+    expect(prompt).toContain("## 8. Implementation Guidance");
+    expect(prompt).toContain("## 9. Self-Audit Risks");
+    expect(prompt).toContain("Do not weaken explicit exports, error types, options, field names, return behavior, or visibility requirements");
     expect(prompt).toContain("Do not assume an instance method satisfies a task that explicitly requests a package-root export");
     expect(prompt).toContain("If the task literally says 'must throw X'");
     expect(prompt).toContain("Visible-test-only success is a failure");
@@ -611,12 +614,13 @@ describe("panel modes in prompts", () => {
     expect(prompt).toContain("Derived Contract Gate");
     expect(prompt).toContain("## 1. Contract Gate");
     expect(prompt).toContain("## 2. Public Surface Matrix");
-    expect(prompt).toContain("## 3. External Consumer Probe Plan");
-    expect(prompt).toContain("## 4. Hidden Semantic Probe Plan");
-    expect(prompt).toContain("## 5. Implementation Guidance");
-    expect(prompt).toContain("## 6. Self-Audit Risks");
-    expect(prompt).toContain("package.json main/types vs dist output");
-    expect(prompt).toContain("typed domain errors vs raw Error leaks");
+    expect(prompt).toContain("## 3. Common Requirements and Non-Negotiables");
+    expect(prompt).toContain("## 4. Key Decision Points");
+    expect(prompt).toContain("## 5. Hidden Semantic Probe Plan");
+    expect(prompt).toContain("## 6. Safe Compatibility Ideas");
+    expect(prompt).toContain("## 7. Scope Risks / Avoid");
+    expect(prompt).toContain("## 8. Implementation Guidance");
+    expect(prompt).toContain("## 9. Self-Audit Risks");
     expect(prompt).toContain("Visible-test-only success is a failure");
     expect(prompt).toContain("Do NOT produce a full codebase proposal");
     expect(prompt).not.toContain("CANDIDATE BUILD mode");
@@ -684,22 +688,30 @@ describe("panel modes in prompts", () => {
 
     expect(prompt).toContain("CANDIDATE BUILD mode");
     expect(prompt).toContain("Contract Gate");
+    expect(prompt).toContain("Common Ground");
+    expect(prompt).toContain("Key Differences");
+    expect(prompt).toContain("Unique Additions");
+    expect(prompt).toContain("Partial Coverage and Blind Spots");
+    expect(prompt).toContain("Requirement Decision Matrix");
     expect(prompt).toContain("Spec Compliance Verdict");
     expect(prompt).toContain("Public Surface Matrix");
     expect(prompt).toContain("Candidate Summary Table");
     expect(prompt).toContain("Required External Consumer Probes");
     expect(prompt).toContain("Required Hidden Semantic Probes");
     expect(prompt).toContain("Implementation Priorities");
-    expect(prompt).toContain("Rejected or Risky Panel Ideas");
+    expect(prompt).toContain("Rejected or Deferred Ideas");
     expect(prompt).toContain("Final Build Contract");
     expect(prompt).toContain("Package Entry Checklist");
+    expect(prompt).toContain("Conflict-resolution hierarchy");
+    expect(prompt).toContain("Anti-drift rules");
     expect(prompt).toContain("Rank candidates by requirement compliance first");
     expect(prompt).toContain("If visible tests pass but hidden probes fail, treat the candidate as failing");
     expect(prompt).toContain("must throw `LimitExceededError`");
+    expect(prompt).toContain("requirementDecisionMatrix");
     expect(prompt).not.toContain("ADVISORY mode");
   });
 
-  test("advisory judge prompt requires build-ready contract packet and consumer probes", () => {
+  test("advisory judge prompt requires build-ready council packet and consumer probes", () => {
     const prompt = buildJudgePrompt({
       task: "Build add(a,b)",
       mode: "plan",
@@ -710,14 +722,21 @@ describe("panel modes in prompts", () => {
 
     expect(prompt).toContain("ADVISORY mode");
     expect(prompt).toContain("Do NOT implement");
-    expect(prompt).toContain("Build-Ready Contract Packet");
+    expect(prompt).toContain("Executive Decision Summary");
+    expect(prompt).toContain("Contract Gate");
+    expect(prompt).toContain("Common Ground");
+    expect(prompt).toContain("Key Differences");
+    expect(prompt).toContain("Unique Additions");
+    expect(prompt).toContain("Partial Coverage and Blind Spots");
+    expect(prompt).toContain("Requirement Decision Matrix");
     expect(prompt).toContain("Literal Public Surface");
     expect(prompt).toContain("Public Surface Matrix");
-    expect(prompt).toContain("Required consumer probes");
-    expect(prompt).toContain("Compatibility recommendations");
-    expect(prompt).toContain("Hidden semantic tests");
-    expect(prompt).toContain("Package entry checklist");
-    expect(prompt).toContain("Final self-audit checklist");
+    expect(prompt).toContain("External Consumer Test Plan");
+    expect(prompt).toContain("Hidden Semantic Test Plan");
+    expect(prompt).toContain("Implementation Order");
+    expect(prompt).toContain("Scope Boundaries");
+    expect(prompt).toContain("Package Entry Checklist");
+    expect(prompt).toContain("Final Self-Audit Checklist");
     expect(prompt).not.toContain("CANDIDATE BUILD mode");
   });
 

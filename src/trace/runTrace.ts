@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import type { ContractGate, CouncilMode, CouncilResult, FusionRunTrace, PanelMode, PanelResponse } from "../types.js";
+import type { ContractGate, CouncilComparison, CouncilMode, CouncilResult, FusionRunTrace, PanelMode, PanelResponse, RequirementDecisionMatrix } from "../types.js";
 import { validateCandidateOutput } from "../council/candidateValidation.js";
 import { renderContractGate } from "../council/contractGate.js";
 import { sanitizeText } from "../context/sanitize.js";
@@ -24,6 +24,20 @@ export function createRunId(now = new Date()): string {
   ].join("");
   const suffix = randomBytes(3).toString("hex");
   return `fusion-${stamp}-${suffix}`;
+}
+
+export function createRecoveredRunId(now = new Date()): string {
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+    "-",
+    String(now.getHours()).padStart(2, "0"),
+    String(now.getMinutes()).padStart(2, "0"),
+    String(now.getSeconds()).padStart(2, "0"),
+  ].join("");
+  const suffix = randomBytes(3).toString("hex");
+  return `fusion-${stamp}-recovered-${suffix}`;
 }
 
 export function resolveTraceRoot(cwd: string, traceDir?: string): string {
@@ -72,15 +86,23 @@ export function detectJudgeOutputSections(text: string): string[] {
     ["candidate summary table", /candidate summary table/i],
     ["spec compliance verdict", /spec compliance verdict/i],
     ["contract gate", /contract gate/i],
+    ["common ground", /common ground/i],
+    ["key differences", /key differences/i],
+    ["unique additions", /unique additions/i],
+    ["partial coverage and blind spots", /partial coverage and blind spots/i],
+    ["requirement decision matrix", /requirement decision matrix/i],
+    ["executive decision summary", /executive decision summary/i],
+    ["scope boundaries", /scope boundaries/i],
     ["public surface matrix", /public surface matrix/i],
-    ["required external consumer probes", /required external consumer probes|required consumer probes/i],
-    ["required hidden semantic probes", /required hidden semantic probes|hidden semantic tests/i],
+    ["required external consumer probes", /required external consumer probes|required consumer probes|external consumer test plan/i],
+    ["required hidden semantic probes", /required hidden semantic probes|hidden semantic tests|hidden semantic test plan/i],
     ["implementation priorities", /implementation priorities|implementation order/i],
     ["package entry checklist", /package entry checklist/i],
     ["build-ready contract packet", /build-ready contract packet/i],
     ["candidate bug audit", /candidate bug audit/i],
     ["best ideas to use", /best ideas to use/i],
     ["ideas to reject", /ideas to reject/i],
+    ["rejected or deferred ideas", /rejected or deferred ideas/i],
     ["final build contract", /final build contract/i],
     ["spec-literal interpretation", /spec-literal interpretation/i],
     ["required hidden tests", /required hidden tests?|main-agent test obligations/i],
@@ -108,6 +130,8 @@ export function buildEnhancedFinalGuidance(result: CouncilResult, baseGuidance: 
     ? result.requiredHiddenSemanticProbes
     : result.requiredTests;
   const executionSectionTitle = result.panelMode === "advisory" ? "## Build-Ready Use Notes" : "## Main-Agent Execution Requirements";
+  const comparison = result.councilComparison ?? trace?.councilComparison;
+  const decisionMatrix = result.requirementDecisionMatrix;
 
   if (result.panelMode === "advisory" && !sections.buildReadyContractPacket) {
     extras.push("## Build-Ready Contract Packet", "- Use this packet as the build contract for a later `/fusion-build` run.");
@@ -121,6 +145,35 @@ export function buildEnhancedFinalGuidance(result: CouncilResult, baseGuidance: 
     );
   } else if (result.requirementChecklist.length && !sections.requirementLedger && !sections.contractGate) {
     extras.push("## Requirement Ledger", ...result.requirementChecklist.map((item) => `- ${item}`));
+  }
+  if (comparison && comparison.commonGround.length > 0 && !/common ground/i.test(baseGuidance)) {
+    extras.push(
+      "## Common Ground",
+      ...comparison.commonGround.slice(0, 8).map((entry) => `- ${entry.topic} (panels ${entry.supportedBy.join(", ")}; confidence=${entry.confidence})`),
+    );
+  }
+  if (comparison && comparison.keyDifferences.length > 0 && !/key differences/i.test(baseGuidance)) {
+    extras.push(
+      "## Key Differences",
+      ...comparison.keyDifferences.slice(0, 8).map((entry) => `- ${entry.topic} → ${entry.requiredDecision}`),
+    );
+  }
+  if (comparison && comparison.uniqueAdditions.length > 0 && !/unique additions/i.test(baseGuidance)) {
+    extras.push(
+      "## Unique Additions",
+      ...comparison.uniqueAdditions.slice(0, 8).map((entry) => `- ${entry.idea} (panel ${entry.proposedBy}; ${entry.classification}; ${entry.recommendation})`),
+    );
+  }
+  if (comparison && (comparison.partialCoverage.length > 0 || comparison.blindSpots.length > 0) && !/partial coverage|blind spots/i.test(baseGuidance)) {
+    extras.push("## Partial Coverage and Blind Spots");
+    for (const entry of comparison.partialCoverage.slice(0, 6)) extras.push(`- Partial: ${entry.requirement} → ${entry.requiredFollowUp}`);
+    for (const entry of comparison.blindSpots.slice(0, 6)) extras.push(`- Blind spot: ${entry.risk} → ${entry.requiredTestOrAudit}`);
+  }
+  if (decisionMatrix && decisionMatrix.entries.length > 0 && !/requirement decision matrix/i.test(baseGuidance)) {
+    extras.push(
+      "## Requirement Decision Matrix",
+      ...decisionMatrix.entries.slice(0, 12).map((entry) => `- ${entry.requirement} → ${entry.chosenBehavior} (${entry.classification}; test=${entry.requiredTest || "none"})`),
+    );
   }
   if (result.publicSurfaceMatrix?.length && !sections.publicSurfaceMatrix) {
     extras.push("## Public Surface Matrix", ...result.publicSurfaceMatrix.map((item) => `- ${item}`));
@@ -203,7 +256,9 @@ export function buildEnhancedFinalGuidance(result: CouncilResult, baseGuidance: 
     || !sections.packageChecklist
     || !sections.rejectedRiskyIdeas
     || !sections.mainAgentExecutionRequirements
-    || !sections.selfAuditChecklist;
+    || !sections.selfAuditChecklist
+    || (comparison && (comparison.commonGround.length > 0 || comparison.keyDifferences.length > 0))
+    || (decisionMatrix && decisionMatrix.entries.length > 0);
 
   if (!needsExtras && extras.length <= 1) return baseGuidance;
 
@@ -263,6 +318,9 @@ export function enrichTraceMetadata(input: {
     finalGuidanceContainsPackageChecklist: guidanceSections.packageChecklist || guidanceSections.packageEntryChecklist,
     finalGuidanceContainsImmutabilityChecklist: guidanceSections.immutabilityChecklist || judgeSections.includes("immutability checklist"),
     finalGuidanceContainsTypedErrorChecklist: guidanceSections.typedErrorChecklist || judgeSections.includes("typed error checklist"),
+    councilComparison: input.trace.councilComparison,
+    requirementDecisionMatrixSummary: input.trace.requirementDecisionMatrixSummary,
+    correctnessCoverageGate: input.trace.correctnessCoverageGate,
     artifactFiles,
   };
 }
@@ -287,6 +345,9 @@ export type RunArtifactInput = {
   postBuildAuditOutput?: string;
   finalGuidance?: string;
   councilResult?: CouncilResult;
+  councilComparisonMarkdown?: string;
+  requirementDecisionMatrix?: RequirementDecisionMatrix;
+  correctnessCoverageGateMarkdown?: string;
   trace: FusionRunTrace;
 };
 
@@ -334,6 +395,18 @@ export async function writeRunArtifacts(input: RunArtifactInput): Promise<{ arti
     paths.postBuildAuditOutput = path.join(artifactDir, "post-build-audit-output.md");
     await writeFile(paths.postBuildAuditOutput, sanitizeText(input.postBuildAuditOutput), "utf8");
   }
+  if (input.councilComparisonMarkdown) {
+    paths.councilComparison = path.join(artifactDir, "council-comparison.md");
+    await writeFile(paths.councilComparison, sanitizeText(input.councilComparisonMarkdown), "utf8");
+  }
+  if (input.requirementDecisionMatrix) {
+    paths.requirementDecisionMatrix = path.join(artifactDir, "requirement-decision-matrix.md");
+    await writeFile(paths.requirementDecisionMatrix, sanitizeText(renderRequirementDecisionMatrixMarkdown(input.requirementDecisionMatrix)), "utf8");
+  }
+  if (input.correctnessCoverageGateMarkdown) {
+    paths.correctnessCoverageGate = path.join(artifactDir, "correctness-coverage-gate.md");
+    await writeFile(paths.correctnessCoverageGate, sanitizeText(input.correctnessCoverageGateMarkdown), "utf8");
+  }
 
   const baseGuidance = input.finalGuidance ?? "";
   const enhancedGuidance = input.councilResult
@@ -371,13 +444,37 @@ export async function writeRunArtifacts(input: RunArtifactInput): Promise<{ arti
   return { artifactDir, paths };
 }
 
+function renderRequirementDecisionMatrixMarkdown(matrix: RequirementDecisionMatrix): string {
+  const lines: string[] = ["# Requirement Decision Matrix", ""];
+  lines.push(`- Mandatory literal requirements: ${matrix.mandatoryCount}`);
+  lines.push(`- Safe compatibility additions: ${matrix.safeCompatibilityCount}`);
+  lines.push(`- Optional enhancements: ${matrix.optionalCount}`);
+  lines.push(`- Rejected scope expansions: ${matrix.rejectedCount}`);
+  lines.push("");
+  lines.push("## Entries");
+  for (const entry of matrix.entries) {
+    lines.push(`### ${entry.requirement}`);
+    lines.push(`- Chosen behavior: ${entry.chosenBehavior}`);
+    lines.push(`- Why correct: ${entry.whyCorrect}`);
+    lines.push(`- Evidence source: ${entry.evidenceSource}`);
+    lines.push(`- Required test: ${entry.requiredTest}`);
+    lines.push(`- Risk if omitted: ${entry.riskIfOmitted}`);
+    lines.push(`- Classification: ${entry.classification}`);
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd() + "\n";
+}
+
 export async function loadLatestRunTrace(cwd: string, traceDir?: string): Promise<FusionRunTrace | null> {
   const pointerPath = path.join(resolveTraceRoot(cwd, traceDir), LATEST_TRACE_POINTER);
   try {
     const pointer = JSON.parse(await readFile(pointerPath, "utf8")) as { artifactDir?: string; runId?: string };
+    if (!pointer.artifactDir && !pointer.runId) {
+      return null;
+    }
     const tracePath = pointer.artifactDir
       ? path.join(pointer.artifactDir, "trace.json")
-      : path.join(resolveTraceRoot(cwd, traceDir), pointer.runId ?? "", "trace.json");
+      : path.join(resolveTraceRoot(cwd, traceDir), pointer.runId!, "trace.json");
     const trace = JSON.parse(await readFile(tracePath, "utf8")) as FusionRunTrace;
     return trace;
   } catch {
@@ -386,6 +483,7 @@ export async function loadLatestRunTrace(cwd: string, traceDir?: string): Promis
 }
 
 export function formatLatestTraceSummary(trace: FusionRunTrace): string {
+  const speculativeSection = trace.speculative ? renderSpeculativeTraceSection(trace.speculative) : [];
   return [
     "# Fusion Latest Run Trace",
     "",
@@ -393,11 +491,21 @@ export function formatLatestTraceSummary(trace: FusionRunTrace): string {
     `**Timestamp:** ${trace.timestamp}`,
     trace.command ? `**Command:** ${trace.command}` : undefined,
     trace.panelMode ? `**Panel mode:** ${trace.panelMode}` : undefined,
+    trace.speculative ? `**Build strategy:** ${trace.speculative.mode}` : undefined,
     `**Artifact directory:** ${trace.artifactDir ?? "unknown"}`,
     `**Model source:** ${trace.modelSource}`,
     trace.executionMode ? `**Execution mode:** ${trace.executionMode}` : undefined,
     trace.sharedPanelPromptHash ? `**Shared panel prompt hash:** ${trace.sharedPanelPromptHash}` : undefined,
     trace.sharedPanelPromptPath ? `**Shared panel prompt path:** ${trace.sharedPanelPromptPath}` : undefined,
+    trace.panelPromptTransport ? `**Panel prompt transport:** ${trace.panelPromptTransport.mode} (canonical ${trace.panelPromptTransport.canonicalLineCount} lines, inline ${trace.panelPromptTransport.inlineLineCount} lines)` : undefined,
+    trace.panelPromptTransport?.fullArtifactPath ? `**Panel full artifact:** ${trace.panelPromptTransport.fullArtifactPath}` : undefined,
+    trace.panelPromptTransport?.briefArtifactPath ? `**Panel brief artifact:** ${trace.panelPromptTransport.briefArtifactPath}` : undefined,
+    trace.judgePromptTransport ? `**Judge prompt transport:** ${trace.judgePromptTransport.mode} (canonical ${trace.judgePromptTransport.canonicalLineCount} lines, inline ${trace.judgePromptTransport.inlineLineCount} lines)` : undefined,
+    trace.auditPromptTransport ? `**Audit prompt transport:** ${trace.auditPromptTransport.mode} (canonical ${trace.auditPromptTransport.canonicalLineCount} lines, inline ${trace.auditPromptTransport.inlineLineCount} lines)` : undefined,
+    trace.panelExecutionPlan ? `**Panel cascade:** staggered=${trace.panelExecutionPlan.staggered ? "yes" : "no"}; startGate=${trace.panelExecutionPlan.startGateTimeoutMs}ms; inactivity=${trace.panelExecutionPlan.inactivityTimeoutMs}ms; maxAttempts=${trace.panelExecutionPlan.maxAttemptsPerPanel}` : undefined,
+    trace.panelLivenessCapability ? `**Panel liveness telemetry:** streamActivity=${trace.panelLivenessCapability.streamActivityExposed ? "exposed" : "not exposed"}; tokenLevel=${trace.panelLivenessCapability.tokenLevelLiveness ? "yes" : "no"}` : undefined,
+    trace.runtimeCapabilities ? `**Runtime capabilities:** visibleDispatch=${trace.runtimeCapabilities.visibleTaskDispatchVerified ? "verified" : "unverified"}; childStream=${trace.runtimeCapabilities.childSessionStreamEvents ? "yes" : "no"}; childTools=${trace.runtimeCapabilities.childToolLifecycleEvents ? "yes" : "no"}; cancellationAbort=${trace.runtimeCapabilities.cancellationAbortSupported ? "yes" : "no"}` : undefined,
+    trace.panelAttempts?.length ? `**Panel attempts recorded:** ${trace.panelAttempts.length} (grouped by logical slot 1-3; retries stay under fusion-panel-1/2/3)` : undefined,
     `**Fallback used:** ${trace.fallbackUsed ? "yes" : "no"}`,
     trace.candidateValidation ? `**Candidate validation:** ${trace.candidateValidation.allPassed ? "all passed" : "failures present"}` : undefined,
     trace.quorum ? `**Quorum:** ${trace.quorum.usable}/${trace.quorum.total} usable (required ${trace.quorum.required})${trace.quorum.degraded ? " — degraded" : ""}` : undefined,
@@ -406,6 +514,9 @@ export function formatLatestTraceSummary(trace: FusionRunTrace): string {
     trace.panelOutputCompletenessScore !== undefined ? `**Panel completeness score:** ${trace.panelOutputCompletenessScore}` : undefined,
     trace.contractGate ? `**Contract Gate:** ${trace.contractGate.literalRequirementsDetected} literal requirements; exports=${trace.contractGate.publicExportsRequired.join(", ") || "none"}` : undefined,
     trace.postBuildAudit ? `**Post-build audit:** ${trace.postBuildAudit.status} (fixCyclesUsed=${trace.postBuildAudit.fixCyclesUsed})` : undefined,
+    trace.councilComparison ? `**Council comparison:** ${trace.councilComparison.commonGround.length} common, ${trace.councilComparison.unresolvedDifferences} unresolved, ${trace.councilComparison.uniqueAdditions.length} unique (${trace.councilComparison.adoptedUniqueAdditions} adopted)${trace.councilComparison.degraded ? " — degraded" : ""}` : undefined,
+    trace.requirementDecisionMatrixSummary ? `**Requirement decision matrix:** ${trace.requirementDecisionMatrixSummary.mandatoryCount} mandatory, ${trace.requirementDecisionMatrixSummary.safeCompatibilityCount} safe-compat, ${trace.requirementDecisionMatrixSummary.optionalCount} optional, ${trace.requirementDecisionMatrixSummary.rejectedCount} rejected` : undefined,
+    trace.correctnessCoverageGate ? `**Correctness coverage gate:** ${trace.correctnessCoverageGate.status} (categories with fix_required=${trace.correctnessCoverageGate.categories.filter((c) => c.status === "fix_required").length})` : undefined,
     "",
     ...(trace.contractGate
       ? [
@@ -416,10 +527,35 @@ export function formatLatestTraceSummary(trace: FusionRunTrace): string {
         "",
       ]
       : []),
+    ...(trace.councilComparison
+      ? [
+        "## Council Comparison Summary",
+        `- Common ground: ${trace.councilComparison.commonGround.length}`,
+        `- Key differences: ${trace.councilComparison.keyDifferences.length}`,
+        `- Unique additions: ${trace.councilComparison.uniqueAdditions.length} (adopted=${trace.councilComparison.adoptedUniqueAdditions}, deferred/rejected=${trace.councilComparison.deferredOrRejectedUniqueAdditions})`,
+        `- Partial coverage: ${trace.councilComparison.partialCoverage.length}`,
+        `- Blind spots: ${trace.councilComparison.blindSpots.length}`,
+        trace.councilComparison.degraded ? `- Degraded: yes` : undefined,
+        "",
+      ].filter((line): line is string => line !== undefined)
+      : []),
+    ...(trace.correctnessCoverageGate
+      ? [
+        "## Correctness Coverage Gate",
+        `- Status: ${trace.correctnessCoverageGate.status}`,
+        trace.correctnessCoverageGate.degradedReason ? `- Degraded reason: ${trace.correctnessCoverageGate.degradedReason}` : undefined,
+        ...trace.correctnessCoverageGate.categories.map((category) => `- ${category.name}: ${category.status}`),
+        "",
+      ].filter((line): line is string => line !== undefined)
+      : []),
     "## Requested Models",
     ...trace.panelModelsRequested.map((spec, index) => `- ${formatModelSpecTraceLine(spec, `Panel ${index + 1}`, spec.reasoningEffort ? "unsupported" : "not_configured")}`),
     `- ${formatModelSpecTraceLine(trace.judgeModelRequested, "Judge", trace.judgeModelRequested.reasoningEffort ? "unsupported" : "not_configured")}`,
     ...(trace.panelSessions?.length ? formatNativePanelSessions(trace.panelSessions) : []),
+    ...(trace.panelExecutionPlan ? formatPanelExecutionPlan(trace.panelExecutionPlan) : []),
+    ...(trace.panelAttempts?.length ? formatPanelAttempts(trace.panelAttempts) : []),
+    ...(trace.panelLivenessCapability ? formatPanelLivenessCapability(trace.panelLivenessCapability) : []),
+    ...(trace.runtimeCapabilities ? formatRuntimeCapabilities(trace.runtimeCapabilities) : []),
     "",
     "## Panel Status",
     ...trace.panel.map((entry) => [
@@ -453,15 +589,128 @@ export function formatLatestTraceSummary(trace: FusionRunTrace): string {
     trace.artifactPaths?.originalPrompt ? `- Original prompt: ${trace.artifactPaths.originalPrompt}` : undefined,
     trace.artifactPaths?.contractGate ? `- Contract Gate: ${trace.artifactPaths.contractGate}` : undefined,
     trace.sharedPanelPromptPath ? `- Shared panel prompt: ${trace.sharedPanelPromptPath}` : undefined,
+    trace.panelPromptTransport?.fullArtifactPath ? `- Panel full prompt artifact: ${trace.panelPromptTransport.fullArtifactPath}` : undefined,
+    trace.panelPromptTransport?.briefArtifactPath ? `- Panel brief prompt artifact: ${trace.panelPromptTransport.briefArtifactPath}` : undefined,
+    trace.judgePromptTransport?.fullArtifactPath ? `- Judge full context artifact: ${trace.judgePromptTransport.fullArtifactPath}` : undefined,
+    trace.judgePromptTransport?.briefArtifactPath ? `- Judge brief context artifact: ${trace.judgePromptTransport.briefArtifactPath}` : undefined,
+    trace.auditPromptTransport?.fullArtifactPath ? `- Post-build audit full context artifact: ${trace.auditPromptTransport.fullArtifactPath}` : undefined,
+    trace.auditPromptTransport?.briefArtifactPath ? `- Post-build audit brief context artifact: ${trace.auditPromptTransport.briefArtifactPath}` : undefined,
+    trace.artifactPaths?.councilComparison ? `- Council comparison: ${trace.artifactPaths.councilComparison}` : undefined,
+    trace.artifactPaths?.requirementDecisionMatrix ? `- Requirement decision matrix: ${trace.artifactPaths.requirementDecisionMatrix}` : undefined,
     trace.artifactPaths?.panel1Output ? `- Panel 1 output: ${trace.artifactPaths.panel1Output}` : undefined,
     trace.artifactPaths?.panel2Output ? `- Panel 2 output: ${trace.artifactPaths.panel2Output}` : undefined,
     trace.artifactPaths?.panel3Output ? `- Panel 3 output: ${trace.artifactPaths.panel3Output}` : undefined,
     trace.artifactPaths?.judgeOutput ? `- Judge output: ${trace.artifactPaths.judgeOutput}` : undefined,
     trace.artifactPaths?.postBuildAuditPrompt ? `- Post-build audit prompt: ${trace.artifactPaths.postBuildAuditPrompt}` : undefined,
     trace.artifactPaths?.postBuildAuditOutput ? `- Post-build audit output: ${trace.artifactPaths.postBuildAuditOutput}` : undefined,
+    trace.artifactPaths?.correctnessCoverageGate ? `- Correctness coverage gate: ${trace.artifactPaths.correctnessCoverageGate}` : undefined,
     trace.artifactPaths?.finalGuidance ? `- Final guidance: ${trace.artifactPaths.finalGuidance}` : undefined,
+    trace.artifactPaths?.sourceBaselineManifest ? `- Source baseline manifest: ${trace.artifactPaths.sourceBaselineManifest}` : undefined,
+    trace.artifactPaths?.mainBaselineManifest ? `- Main baseline manifest: ${trace.artifactPaths.mainBaselineManifest}` : undefined,
+    trace.artifactPaths?.mainBaselinePatch ? `- Main baseline patch: ${trace.artifactPaths.mainBaselinePatch}` : undefined,
+    trace.artifactPaths?.mergePatchContractFull ? `- Merge Patch Contract (full): ${trace.artifactPaths.mergePatchContractFull}` : undefined,
+    trace.artifactPaths?.mergePatchContractBrief ? `- Merge Patch Contract (brief): ${trace.artifactPaths.mergePatchContractBrief}` : undefined,
     trace.artifactPaths?.trace ? `- trace.json: ${trace.artifactPaths.trace}` : undefined,
+    ...speculativeSection,
   ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+/**
+ * Render the canonical path-resolution block. Always reports the resolver
+ * version so `/fusion-trace` makes the active candidate-workspace strategy
+ * unambiguous (external staging, never `<source>/.../speculative`).
+ */
+function renderSpeculativePathResolutionLines(
+  speculative: NonNullable<FusionRunTrace["speculative"]>,
+): string[] {
+  const resolution = speculative.pathResolution;
+  const lines: string[] = [];
+  lines.push(`Speculative path resolver: ${resolution?.resolverVersion ?? "external_staging_v1"}`);
+  lines.push(`Source artifact directory: ${resolution?.sourceArtifactDir ?? speculative.sourceArtifactDir}`);
+  lines.push(`External candidate staging directory: ${resolution?.externalCandidateStagingDir ?? speculative.externalCandidateStagingDir}`);
+  const panelPaths = resolution?.panelWorkspacePaths ?? speculative.panelCandidates.map((c) => c.workspacePath);
+  panelPaths.forEach((workspacePath, index) => {
+    lines.push(`Panel ${index + 1} workspace: ${workspacePath}`);
+  });
+  if (resolution?.runtimeModulePath) {
+    lines.push(`Active module/build identity: ${resolution.runtimeModulePath}`);
+  }
+  lines.push("");
+  return lines;
+}
+
+function renderSpeculativeTraceSection(speculative: NonNullable<FusionRunTrace["speculative"]>): string[] {
+  const lines: string[] = ["", "## Speculative Parallel Build"];
+  lines.push(`- mode: ${speculative.mode}`);
+  lines.push(`- source workspace: ${speculative.sourceWorkspace}`);
+  lines.push(`- source artifact directory: ${speculative.sourceArtifactDir}`);
+  lines.push(`- external candidate staging directory: ${speculative.externalCandidateStagingDir}`);
+  lines.push(`- source baseline manifest: ${speculative.sourceBaselineManifestPath}`);
+  lines.push("");
+  lines.push(...renderSpeculativePathResolutionLines(speculative));
+  if (speculative.panelExecutionAssignments && speculative.panelExecutionAssignments.length > 0) {
+    for (const assignment of speculative.panelExecutionAssignments) {
+      lines.push(`Panel ${assignment.logicalPanelIndex} assignment:`);
+      lines.push(`- shared task: ${assignment.sharedTaskPath}`);
+      lines.push(`- execution context: ${assignment.executionContextPath}`);
+      lines.push(`- candidate workspace: ${assignment.assignedCandidateWorkspace}`);
+      lines.push(`- source workspace prohibited: ${assignment.prohibitedSourceWorkspace}`);
+      lines.push(`- panel report: ${assignment.panelOutputPath}`);
+      lines.push(`- unresolved placeholder check: ${assignment.unresolvedPlaceholderCheck}`);
+      lines.push(`- runtime CWD scoped: ${assignment.nativeCwdScoped}`);
+      lines.push(`- absolute-path mode: ${assignment.absolutePathModeRequired ? "required" : "not required"}`);
+    }
+    lines.push("");
+  }
+  lines.push("Parallelism:");
+  lines.push(`- supported: ${speculative.parallelExecutionSupported ? "yes" : "no"}`);
+  lines.push(`- overlap observed: ${speculative.overlapObserved ? "yes" : "no"}`);
+  lines.push(`- overlap duration: ${speculative.overlapDurationMs ?? "n/a"} ms`);
+  lines.push(`- capability limitation: ${speculative.parallelCapabilityLimitation ?? "none"}`);
+  lines.push("");
+  lines.push("Isolation:");
+  lines.push(`- nativeCwdScoped: ${speculative.isolationCapability.nativeCwdScoped ? "yes" : "no"}`);
+  lines.push(`- writeBoundaryScoped: ${speculative.isolationCapability.writeBoundaryScoped ? "yes" : "no"}`);
+  lines.push(`- hardLinkSafe: ${speculative.isolationCapability.hardLinkSafe ? "yes" : "no"}`);
+  lines.push(`- symlinkSafe: ${speculative.isolationCapability.symlinkSafe ? "yes" : "no"}`);
+  lines.push(`- verified: ${speculative.isolationCapability.verified ? "yes" : "no"}`);
+  if (speculative.isolationCapability.limitation) {
+    lines.push(`- limitation: ${speculative.isolationCapability.limitation}`);
+  }
+  lines.push("");
+  lines.push("Main baseline:");
+  lines.push(`- workspace: ${speculative.mainBaseline.workspacePath}`);
+  lines.push(`- started: ${speculative.mainBaseline.startedAt ?? "n/a"}`);
+  lines.push(`- completed: ${speculative.mainBaseline.completedAt ?? "n/a"}`);
+  const mv = speculative.mainBaseline.verification;
+  lines.push(`- verification: ${mv ? [mv.typecheck, mv.test, mv.build].filter(Boolean).join("/") : "n/a"}`);
+  lines.push(`- changed files: ${speculative.mainBaseline.changedFiles.length ? speculative.mainBaseline.changedFiles.join(", ") : "none"}`);
+  lines.push("");
+  lines.push("Panel candidates:");
+  for (const candidate of speculative.panelCandidates) {
+    lines.push(`- panel ${candidate.logicalPanelIndex}: model=${candidate.model}; workspace=${candidate.workspacePath}; status=${candidate.status}; report=${candidate.reportPath ?? "n/a"}`);
+  }
+  lines.push("");
+  lines.push("Judge:");
+  const usableCount = speculative.panelCandidates.filter((c) => c.status === "usable" || c.status === "partial").length;
+  lines.push(`- quorum: ${usableCount}/${speculative.panelCandidates.length} usable+partial`);
+  lines.push(`- judge eligible at: ${speculative.judgeEligibleAt ?? "n/a"}`);
+  lines.push(`- judge started at: ${speculative.judgeStartedAt ?? "n/a"}`);
+  lines.push(`- judge completed at: ${speculative.judgeCompletedAt ?? "n/a"}`);
+  lines.push(`- frozen panel indexes: ${speculative.frozenPanelIndexes?.length ? speculative.frozenPanelIndexes.join(", ") : "none"}`);
+  lines.push(`- late excluded panel indexes: ${speculative.lateExcludedPanelIndexes?.length ? speculative.lateExcludedPanelIndexes.join(", ") : "none"}`);
+  lines.push(`- merge patch contract: ${speculative.mergePatchContractPath ?? "n/a"}`);
+  lines.push(`- final decision: ${speculative.mergePatchDecision ?? "n/a"}`);
+  const appliedItems = speculative.appliedPatchItems ?? [];
+  lines.push(`- blockers applied: ${appliedItems.filter((i) => i.severity === "BLOCKER" && i.status === "applied").length}`);
+  lines.push(`- must-fix applied: ${appliedItems.filter((i) => i.severity === "MUST_FIX" && i.status === "applied").length}`);
+  lines.push(`- safe additions applied: ${appliedItems.filter((i) => i.severity === "SAFE_ADDITION" && i.status === "applied").length}`);
+  lines.push("");
+  lines.push("Patch phase:");
+  lines.push(`- applied: ${appliedItems.filter((i) => i.status === "applied").length}`);
+  lines.push(`- skipped: ${appliedItems.filter((i) => i.status === "skipped").length}`);
+  lines.push(`- failed: ${appliedItems.filter((i) => i.status === "failed").length}`);
+  return lines;
 }
 
 function formatNativePanelSessions(sessions: NonNullable<FusionRunTrace["panelSessions"]>): string[] {
@@ -476,6 +725,98 @@ function formatNativePanelSessions(sessions: NonNullable<FusionRunTrace["panelSe
       session.validationStatus ? `  validation=${session.validationStatus}` : undefined,
     ].filter((line): line is string => line !== undefined).join("")),
   ];
+}
+
+function formatPanelAttempts(attempts: NonNullable<FusionRunTrace["panelAttempts"]>): string[] {
+  const bySlot = new Map<number, typeof attempts>();
+  for (const attempt of attempts) {
+    const list = bySlot.get(attempt.logicalPanelIndex) ?? [];
+    list.push(attempt);
+    bySlot.set(attempt.logicalPanelIndex, list);
+  }
+  const lines: string[] = ["", "## Native Panel Attempts (staggered cascade + same-slot retry)"];
+  for (let index = 1; index <= 3; index += 1) {
+    const slotAttempts = bySlot.get(index);
+    if (!slotAttempts || slotAttempts.length === 0) {
+      lines.push(`- fusion-panel-${index}: not dispatched`);
+      continue;
+    }
+    for (const attempt of slotAttempts) {
+      const parts = [
+        `- fusion-panel-${index} attempt ${attempt.attempt}: ${attempt.status} (startReason=${attempt.startReason})`,
+        attempt.model ? `  model=${attempt.model}` : undefined,
+        attempt.nativeSessionId ? `  sessionId=${attempt.nativeSessionId}` : undefined,
+        attempt.workspacePreparedAt ? `  workspacePreparedAt=${attempt.workspacePreparedAt}` : undefined,
+        attempt.dispatchAt ? `  dispatchAt=${attempt.dispatchAt}` : undefined,
+        attempt.fallbackGateAt ? `  fallbackGateAt=${attempt.fallbackGateAt}` : undefined,
+        attempt.startedAt ? `  startedAt=${attempt.startedAt}` : undefined,
+        attempt.firstActivityAt ? `  firstActivityAt=${attempt.firstActivityAt}` : undefined,
+        attempt.firstActivitySource ? `  firstActivitySource=${attempt.firstActivitySource}` : undefined,
+        attempt.lastActivityAt ? `  lastActivityAt=${attempt.lastActivityAt}` : undefined,
+        attempt.lastActivitySource ? `  lastActivitySource=${attempt.lastActivitySource}` : undefined,
+        attempt.suspectedStalledAt ? `  suspectedStalledAt=${attempt.suspectedStalledAt}` : undefined,
+        attempt.cancellationRequestedAt ? `  cancellationRequestedAt=${attempt.cancellationRequestedAt}` : undefined,
+        attempt.cancelledAt ? `  cancelledAt=${attempt.cancelledAt}` : undefined,
+        attempt.retryScheduledAt ? `  retryScheduledAt=${attempt.retryScheduledAt}` : undefined,
+        attempt.retryStartedAt ? `  retryStartedAt=${attempt.retryStartedAt}` : undefined,
+        attempt.endedAt ? `  endedAt=${attempt.endedAt}` : undefined,
+        attempt.stallReason ? `  stallReason=${attempt.stallReason}` : undefined,
+        attempt.excludedAt ? `  excludedAt=${attempt.excludedAt}` : undefined,
+        attempt.excludedReason ? `  excludedReason=${attempt.excludedReason}` : undefined,
+      ].filter((line): line is string => line !== undefined);
+      lines.push(parts.join("\n"));
+    }
+  }
+  return lines;
+}
+
+function formatRuntimeCapabilities(capability: NonNullable<FusionRunTrace["runtimeCapabilities"]>): string[] {
+  return [
+    "",
+    "## Runtime Capabilities",
+    `- visibleTaskDispatchVerified=${capability.visibleTaskDispatchVerified ? "yes" : "no"}`,
+    `- childSessionStreamEvents=${capability.childSessionStreamEvents ? "yes" : "no"}`,
+    `- childReasoningDeltas=${capability.childReasoningDeltas ? "yes" : "no"}`,
+    `- childToolLifecycleEvents=${capability.childToolLifecycleEvents ? "yes" : "no"}`,
+    `- childSessionStatusInspection=${capability.childSessionStatusInspection ? "yes" : "no"}`,
+    `- cancellationAbortSupported=${capability.cancellationAbortSupported ? "yes" : "no"}`,
+    `- childTaskCwdOverride=${capability.childTaskCwdOverride ? "yes" : "no"}`,
+    `- childTaskWriteScopeEnforced=${capability.childTaskWriteScopeEnforced ? "yes" : "no"}`,
+    `- parentContinueWhileChildRuns=${capability.parentContinueWhileChildRuns ? "yes" : "no"}`,
+    `- safeRedispatchSupported=${capability.safeRedispatchSupported ? "yes" : "no"}`,
+    `- visibleJudgeSupported=${capability.visibleJudgeSupported ? "yes" : "no"}`,
+    `- tracePersistenceSupported=${capability.tracePersistenceSupported ? "yes" : "no"}`,
+  ];
+}
+
+function formatPanelLivenessCapability(capability: NonNullable<FusionRunTrace["panelLivenessCapability"]>): string[] {
+  return [
+    "",
+    "## Panel Liveness Capability",
+    `- streamActivityExposed=${capability.streamActivityExposed ? "yes" : "no"}`,
+    `- tokenLevelLiveness=${capability.tokenLevelLiveness ? "yes" : "no"}`,
+    `- startGateFallback=${capability.startGateFallback ? "yes" : "no"}`,
+    `- taskTimeoutSupported=${capability.taskTimeoutSupported ? "yes" : "no"}`,
+    `- pendingToolActivityInspectable=${capability.pendingToolActivityInspectable ? "yes" : "no"}`,
+    capability.streamActivityExposed && capability.tokenLevelLiveness
+      ? "- Watchdog: event-driven 90s inactivity timeout active."
+      : "- Watchdog: token-level liveness NOT available; relying on start-gate (60s) and task timeout only. This limitation is reported honestly in trace.",
+  ];
+}
+
+function formatPanelExecutionPlan(plan: NonNullable<FusionRunTrace["panelExecutionPlan"]>): string[] {
+  const lines: string[] = [
+    "",
+    "## Panel Execution Plan",
+    `- staggered=${plan.staggered ? "yes" : "no"}`,
+    `- startGateTimeoutMs=${plan.startGateTimeoutMs}`,
+    `- inactivityTimeoutMs=${plan.inactivityTimeoutMs}`,
+    `- maxAttemptsPerPanel=${plan.maxAttemptsPerPanel}`,
+  ];
+  for (const stage of plan.stages) {
+    lines.push(`- Panel ${stage.panelIndex}: agent=${stage.agentName}; model=${stage.modelId}; startsAfter=${stage.startsAfter}; startGateTimeoutMs=${stage.startGateTimeoutMs}`);
+  }
+  return lines;
 }
 
 export function buildPanelPrompts(input: {
@@ -506,6 +847,8 @@ export function buildJudgePromptText(input: {
   panelMode?: PanelMode;
   quorum?: import("../types.js").FusionTraceQuorum;
   contractGate?: ContractGate;
+  councilComparison?: CouncilComparison;
+  councilComparisonMarkdown?: string;
 }): string {
   return buildJudgePrompt(input);
 }

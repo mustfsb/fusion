@@ -80,7 +80,58 @@ Fallback: if you run the CLI outside OpenCode, or choose `modelSource: "direct"`
 
 During a Fusion run, open the native child sessions created by `fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`, or `fusion-judge` to view their live tool use and reasoning progress. The parent `fusion-orchestrator` session shows the live todo state and receives each final result when the task completes.
 
-The `fusion_native` plugin tool (stages `prepare`, `collect`, `finalize`) handles the deterministic parts — shared panel prompt building, SHA-256 prompt hash, candidate validation tiers, quorum, judge prompt, judge parsing, final guidance, and trace artifacts — without ever calling a panel or judge model itself. All three panels receive the byte-identical shared panel prompt; the trace records `executionMode: "native_subagents"`, `sharedPanelPromptHash`, and a `panelSessions` list with the shared hash for every panel.
+The `fusion_native` plugin tool (stages `prepare`, `advance`, `collect`, `finalize`, `audit_prepare`, `audit_finalize`) handles the deterministic parts — fast run creation, deferred panel staging, staggered dispatch decisions, SHA-256 prompt hash, candidate validation tiers, quorum, judge prompt, judge parsing, final guidance, and trace artifacts — without ever calling a panel or judge model itself. In `/fusion-build`, `prepare` now returns quickly and `advance` owns the live runtime state machine. The trace records `executionMode: "native_subagents"`, `sharedPanelPromptHash` when materialized, `panelSessions`, `panelAttempts`, and runtime capability flags.
+
+The prepare result returns the minimal run metadata immediately; `advance` then materializes candidate workspaces and returns deterministic `nextAction` decisions (`start_panel`, `wait`, `call_collect`, `done`) for the visible orchestrator.
+
+### Staggered panel cascade and liveness watchdog
+
+Native panel execution uses a staggered cascade with a start-gate fallback and a same-slot retry policy:
+
+- **Panel 1 starts first.**
+- **Panel 2 starts when Panel 1 produces its first observable output activity**, or after a **bounded fallback gate of about 45 seconds** when no credible activity is observable.
+- **Panel 3 starts the same way** after Panel 2.
+- The cascade retains staggered order — it never starts all remaining panels simultaneously.
+- A silent or stuck Panel 2 does not block Panel 3 forever; the scheduler can bypass it through the bounded fallback gate.
+- Each logical panel slot (`fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`) gets **one original attempt plus one replacement attempt** (`MAX_PANEL_ATTEMPTS = 2`). A retry uses the same configured model and the same canonical prompt/brief artifacts, and stays attached to the same logical panel index. The trace never creates `fusion-panel-4`.
+- If a panel Task returns an error or times out, mark the attempt `stalled` and retry once. If the replacement also stalls or fails, mark that logical slot `failed` and continue using existing quorum semantics. Do not fabricate a candidate response.
+
+**Liveness telemetry limitation (honest):** OpenCode's `task` tool from a primary agent may not expose child-session token streams, reasoning deltas, or tool lifecycle events to the caller. Fusion therefore layers detection truthfully: real child-session activity when available, then candidate workspace mutation or candidate-local output evidence, then bounded scheduler fallbacks. Polling alone never counts as activity. Automatic cancellation remains disabled unless runtime capability verification explicitly proves abort support; token-level liveness detection is not assumed. These limits are surfaced in trace fields such as `panelLivenessCapability`, `runtimeCapabilities`, and `streamActivityExposed`.
+
+### Prompt transport compression
+
+When a canonical shared panel prompt, judge context, or post-build audit context exceeds **50 physical lines**, Fusion switches to `brief_plus_file` transport mode instead of sending the entire prompt inline:
+
+- **≤ 50 lines (`inline_full`)**: the full inline prompt is sent as today; no mandatory file-reading instructions are added.
+- **> 50 lines (`brief_plus_file`)**: the complete canonical prompt is written to a full artifact file atomically before native Task dispatch; panels/judge/audit receive a compact inline navigation brief (≤ 50 lines, never padded artificially) that requires reading the full file first.
+
+Physical line counting normalizes CRLF/LF and trailing newlines:
+
+```ts
+lineCount = text.trimEnd() === ""
+  ? 0
+  : text.trimEnd().split(/\r\n|\r|\n/).length;
+```
+
+Artifact names under `.opencode/fusion-runs/<runId>/`:
+
+| Role | Full artifact | Brief artifact |
+|------|---------------|----------------|
+| Panel | `shared-panel-prompt.full.md` | `shared-panel-prompt.brief.md` |
+| Judge | `judge-context.full.md` | `judge-context.brief.md` |
+| Post-build audit | `post-build-audit-context.full.md` | `post-build-audit-context.brief.md` |
+
+The full artifact is always the source of truth and is written byte-for-byte identical to the canonical prompt. The inline brief is navigation only — it must not be treated as an exhaustive specification. It contains only: a role/mode reminder, the mandatory file-read protocol, the task title, a compact headings list, the expected output format, and a reminder that the full file overrides the brief. It does **not** include generated Contract Gate identifier dumps, auto-extracted identifier lists, large Public Surface Matrix content, raw panel outputs, or massive requirement lists.
+
+The mandatory file-read protocol requires the subagent to read the entire canonical file (continuing until EOF — reading only the first chunk is not sufficient) before reasoning, planning, or responding. If the subagent cannot read the full file, it must return exactly:
+
+```txt
+FUSION_FULL_PROMPT_UNAVAILABLE: <absolute-path>
+```
+
+Fusion records this as a validation failure (panels), judge failure, or degraded audit — never as a successful synthesis or audit.
+
+Trace metadata includes `panelPromptTransport`, `judgePromptTransport`, and `auditPromptTransport` with canonical/inline line counts, SHA-256 hashes, and artifact paths. The `sharedPanelPromptHash` always hashes the canonical full prompt — not the inline brief. A separate `inlineSha256` is recorded for the inline transport text.
 
 The legacy `fusion_council` tool (hidden SDK panel runner) remains available for `/fusion-plan`, `/fusion-review`, `/fusion-decision`, `/fusion-prompt`, and `/fusion-architecture`, and as a debug fallback. `/fusion-build` and `/fusion-no-build` do not use it.
 
@@ -169,7 +220,7 @@ The plugin registers:
 
 ```txt
 fusion_council      (legacy all-in-one council, hidden SDK panels — used by /fusion-plan, /fusion-review, etc.)
-fusion_native       (native-subagent orchestration: prepare/collect/finalize — used by /fusion-build, /fusion-no-build)
+fusion_native       (native-subagent orchestration: prepare/advance/collect/record_main_baseline/finalize/audit_* — used by /fusion-build, /fusion-no-build)
 fusion_trace
 fusion_model_config
 ```
@@ -189,9 +240,9 @@ Use them in the TUI:
 /fusion-model
 ```
 
-`/fusion-no-build` runs the full native council (panels + judge) and then STOPS with final guidance — it does not edit implementation files. Use it when you want the advisory plan and contract without automatic implementation.
+`/fusion-no-build` runs the full native council (panels + judge) and then STOPS with final guidance. It does not edit implementation files, create candidate workspaces, or allow panel writes. Use it when you want the advisory plan and contract without automatic implementation.
 
-`/fusion-build` is candidate-code-council-assisted build: panels produce advisory analysis plus complete candidate implementation proposals, the judge compares candidate code outputs and produces a build contract, and then the `fusion-orchestrator` agent implements the final repo automatically.
+`/fusion-build` is speculative parallel build: panels produce complete competing candidate builds in isolated workspaces while the main agent independently builds the real-workspace baseline. The judge then compares actual implementations and produces a Merge Patch Contract. The main agent applies only approved targeted patches rather than merging candidate code wholesale.
 
 Use `/fusion-trace` to inspect the latest run's panel/judge statuses and artifact paths.
 
@@ -229,27 +280,53 @@ Other commands:
 
 ## Fusion Workflows
 
-### `/fusion-no-build` — advisory-council-assisted build
+### `/fusion-no-build` — advisory-council-assisted planning only
 
 ```txt
 /fusion-no-build + original prompt
 → 3 panel models produce advisory plans only
 → judge synthesizes advisory guidance
-→ active OpenCode main agent automatically implements the original task
+→ STOP (no implementation, no candidate workspaces, no panel writes)
 ```
 
-Panel models provide requirement checklists, implementation plans, risks, edge cases, test strategy, architecture guidance, do-not-break constraints, and packaging/build checklists. They do not produce full candidate codebases.
+`/fusion-no-build` remains planning-only. Panel models provide requirement checklists, implementation plans, risks, edge cases, test strategy, architecture guidance, do-not-break constraints, and packaging/build checklists. They do not produce full candidate codebases and do not edit files.
 
-### `/fusion-build` — candidate-code-council-assisted build
+### `/fusion-build` — speculative parallel build
 
 ```txt
 /fusion-build + original prompt
-→ 3 panel models produce advisory analysis + complete candidate code output
-→ judge compares candidate implementations
-→ active OpenCode main agent implements final codebase
+→ Stage 0: isolated candidate workspaces
+→ visible native fusion-panel-1/2/3 build competing candidates in those workspaces
+→ main agent independently builds a real-workspace baseline before seeing panel output
+→ visible native fusion-judge compares actual implementations and verification evidence
+→ judge writes a Merge Patch Contract
+→ main agent applies only approved targeted patches
+→ final typecheck/test/build
+→ post-build audit + one fix cycle
 ```
 
-Panel outputs are validated before judging. Incomplete candidate outputs trigger one repair call; if repair still fails, Fusion fails closed.
+Internal mode name:
+
+```txt
+speculative_parallel_build
+```
+
+The old behavior where panels analyze first and the main agent only builds later is gone.
+
+Panels build in isolated candidate workspaces, not in the real user workspace. The main agent remains the only agent that writes to the real workspace.
+
+Fusion run artifacts may be stored in the project workspace.
+
+Speculative panel candidate workspaces are always created in an external Fusion cache/staging directory to prevent recursive source copying and to protect the real workspace. External candidate workspaces are retained after runs for debugging.
+
+`/fusion-build` is slower and more expensive than the old plan-first orchestration because it overlaps:
+
+- isolated panel candidate builds
+- an independent main baseline build
+- a judge comparison pass
+- a post-build audit pass
+
+Panel outputs are still validated before judging. Incomplete candidate outputs trigger the existing validation/quorum handling and the run fails closed when safe comparison cannot be established.
 
 ## Trace Artifacts
 
@@ -268,7 +345,39 @@ Each run directory includes:
 - `judge-output.md`
 - `final-guidance.md`
 
+For `/fusion-build` speculative runs, the run directory also includes artifacts such as:
+
+- `baseline-manifest.json`
+- `baseline-summary.md`
+- `panel-1-report.md` (and panels 2–3)
+- `panel-1.patch` (and panels 2–3)
+- `main-baseline-manifest.json`
+- `main-baseline.patch`
+- `merge-patch-contract.full.md`
+
+Writable panel candidate workspaces and per-panel manifests are stored outside the project in the Fusion cache/staging directory:
+
+- macOS: `~/Library/Caches/opencode-fusion-council/speculative-runs/<runId>/panel-*-workspace`
+- Windows: `%LOCALAPPDATA%/opencode-fusion-council/speculative-runs/<runId>/panel-*-workspace`
+- Linux: `$XDG_CACHE_HOME/opencode-fusion-council/speculative-runs/<runId>/panel-*-workspace` (or `~/.cache/...`)
+
+External candidate workspaces are retained after runs for debugging.
+
+The speculative trace also reports honest runtime fields such as `parallelExecutionSupported`, `overlapObserved`, `overlapDurationMs`, `parallelCapabilityLimitation`, `isolationCapability`, `mainBaseline`, `panelCandidates`, `mergePatchDecision`, and `appliedPatchItems`.
+
 The tool output and markdown result include run ID, artifact path, panel/judge statuses, fallback status, and candidate validation status for `/fusion-build`.
+
+### `/fusion-resume` — recover orphaned speculative runs
+
+Use `/fusion-resume` when a speculative `/fusion-build` was interrupted or left orphaned (for example, collect/finalize ran with an empty run ID). Recovery:
+
+- searches the current workspace only for one coherent orphaned attempt;
+- validates orphan artifacts before reuse and never silently guesses;
+- reuses a validated main baseline already present in the real workspace;
+- reruns only missing or invalid logical panel slots (`fusion-panel-1/2/3`);
+- creates a new valid recovered run ID under `.opencode/fusion-runs/<runId>/`.
+
+It does not revive an invalid empty run ID directly and does not rebuild the main baseline from scratch when reuse checks pass.
 
 Inspect the latest run with `/fusion-trace` or open the artifact directory directly.
 
@@ -481,6 +590,8 @@ For Windows-specific setup and troubleshooting, see [docs/WINDOWS_SETUP.md](docs
 ## Limitations
 
 - `/fusion-build` and `/fusion-no-build` run panels and the judge as native OpenCode Task subagents (`fusion-orchestrator` + `fusion-panel-1/2/3` + `fusion-judge`). The parent session shows the live todo list and each child session is inspectable in the OpenCode UI while it runs; a token-by-token merged live transcript inside the parent message is not provided.
+- OpenCode's native task runtime does not expose per-task CWD override or path-scoped write permissions to the caller. `/fusion-build` therefore reports isolation honestly: candidate workspaces are verified directory-level isolation (separate copies, no hard links, symlink safety), not runtime-enforced CWD/write boundaries.
+- If true non-blocking native overlap cannot be verified, `/fusion-build` reports `parallelExecutionSupported: false` and aborts before implementation. It does not silently run sequentially and does not claim overlap.
 - OpenCode loads agent definitions once at startup. After `/fusion-model set ...` regenerates agent files, restart OpenCode so the new panel/judge models take effect.
 - The legacy `fusion_council` tool (used by `/fusion-plan`, `/fusion-review`, `/fusion-decision`, `/fusion-prompt`, `/fusion-architecture`) still runs panels through OpenCode SDK sessions and deletes them by default unless `keepPanelSessions: true`.
 - Judge reasoning effort is preserved as the agent `variant` field when supported by the installed OpenCode version; otherwise it is recorded in config/trace metadata only.
@@ -493,4 +604,4 @@ For Windows-specific setup and troubleshooting, see [docs/WINDOWS_SETUP.md](docs
 
 - V1: planning/review/decision/prompt synthesis.
 - V2: patch suggestion with user approval.
-- V3: multi-worktree candidate implementation and test comparison.
+- V3: richer speculative candidate comparison, stronger runtime isolation primitives, and deeper implementation/test evidence synthesis.

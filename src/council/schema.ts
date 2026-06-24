@@ -4,6 +4,72 @@ export const councilModeSchema = z.enum(["plan", "review", "decision", "build_pr
 
 export const councilDecisionSchema = z.enum(["implement", "do_not_implement", "needs_more_info", "use_caution"]);
 
+const requirementDecisionMatrixEntrySchema = z.object({
+  requirement: z.string().default(""),
+  chosenBehavior: z.string().default(""),
+  whyCorrect: z.string().default(""),
+  evidenceSource: z.string().default(""),
+  requiredTest: z.string().default(""),
+  riskIfOmitted: z.string().default(""),
+  classification: z
+    .enum([
+      "mandatory_literal_requirement",
+      "safe_compatibility_addition",
+      "optional_enhancement",
+      "rejected_scope_expansion",
+    ])
+    .default("mandatory_literal_requirement"),
+});
+
+const councilComparisonSummarySchema = z.object({
+  commonGround: z
+    .array(
+      z.object({
+        topic: z.string().default(""),
+        supportedBy: z.array(z.number()).default([]),
+        confidence: z.enum(["high", "medium", "low"]).default("medium"),
+        rationale: z.string().default(""),
+      }),
+    )
+    .default([]),
+  keyDifferences: z
+    .array(
+      z.object({
+        topic: z.string().default(""),
+        resolutionRule: z.string().default(""),
+        requiredDecision: z.string().default(""),
+      }),
+    )
+    .default([]),
+  uniqueAdditions: z
+    .array(
+      z.object({
+        idea: z.string().default(""),
+        classification: z
+          .enum(["literal_requirement", "safe_compatibility", "optional_enhancement", "scope_risk"])
+          .default("optional_enhancement"),
+        recommendation: z.enum(["adopt", "defer", "reject"]).default("defer"),
+      }),
+    )
+    .default([]),
+  partialCoverage: z
+    .array(
+      z.object({
+        requirement: z.string().default(""),
+        requiredFollowUp: z.string().default(""),
+      }),
+    )
+    .default([]),
+  blindSpots: z
+    .array(
+      z.object({
+        risk: z.string().default(""),
+        requiredTestOrAudit: z.string().default(""),
+      }),
+    )
+    .default([]),
+});
+
 export const judgeResultSchema = z.object({
   decision: councilDecisionSchema.optional(),
   summary: z.string().default(""),
@@ -23,6 +89,8 @@ export const judgeResultSchema = z.object({
   packageEntryChecklist: z.array(z.string()).default([]),
   buildReadyConsumerTestPlan: z.array(z.string()).default([]),
   rejectedRiskyIdeas: z.array(z.string()).default([]),
+  requirementDecisionMatrix: z.array(requirementDecisionMatrixEntrySchema).default([]),
+  councilComparison: councilComparisonSummarySchema.optional(),
   finalBuildGuidance: z.string().default(""),
   mustNotBreakConstraints: z.array(z.string()).default([]),
   requiredTests: z.array(z.string()).default([]),
@@ -50,3 +118,6 @@ export const contractAuditResultSchema = z.object({
   })).default([]),
   finalOutput: z.string().default(""),
 });
+
+export const requirementDecisionMatrixEntrySchemaExport = requirementDecisionMatrixEntrySchema;
+export const councilComparisonSummarySchemaExport = councilComparisonSummarySchema;

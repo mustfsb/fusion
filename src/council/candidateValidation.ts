@@ -12,6 +12,11 @@ export type CandidateValidationSignals = {
   hiddenProbeTestPlan: boolean;
   errorApiContractChecklist: boolean;
   packageBuildChecklist: boolean;
+  commonRequirementsNonNegotiables: boolean;
+  keyDecisionPoints: boolean;
+  safeCompatibilityIdeas: boolean;
+  scopeRisksAvoid: boolean;
+  literalVsOptionalDistinction: boolean;
 };
 
 export type CandidateValidationResult = {
@@ -36,6 +41,11 @@ const SECTION_LABELS: Record<keyof CandidateValidationSignals, string> = {
   hiddenProbeTestPlan: "External Consumer Probe Plan / Hidden Semantic Probe Plan",
   errorApiContractChecklist: "Public Surface Matrix",
   packageBuildChecklist: "package/build or package-entry checklist",
+  commonRequirementsNonNegotiables: "Common Requirements and Non-Negotiables",
+  keyDecisionPoints: "Key Decision Points",
+  safeCompatibilityIdeas: "Safe Compatibility Ideas",
+  scopeRisksAvoid: "Scope Risks / Avoid",
+  literalVsOptionalDistinction: "literal vs optional distinction",
 };
 
 const CORE_SIGNAL_KEYS: Array<keyof CandidateValidationSignals> = [
@@ -56,6 +66,14 @@ const IMPLEMENTATION_SIGNAL_KEYS: Array<keyof CandidateValidationSignals> = [
 const USEFUL_SIGNAL_KEYS: Array<keyof CandidateValidationSignals> = [
   "selfReviewAgainstOriginalTask",
   "packageBuildChecklist",
+];
+
+const COMPARISON_SIGNAL_KEYS: Array<keyof CandidateValidationSignals> = [
+  "commonRequirementsNonNegotiables",
+  "keyDecisionPoints",
+  "safeCompatibilityIdeas",
+  "scopeRisksAvoid",
+  "literalVsOptionalDistinction",
 ];
 
 const MIN_SUBSTANTIVE_LENGTH = 800;
@@ -179,6 +197,37 @@ function detectSignals(text: string, lower: string): CandidateValidationSignals 
       /exclude tests from dist/,
       /verification checklist/,
     ]),
+    commonRequirementsNonNegotiables: hasSection(lower, [
+      /common\s*requirements?\s*and\s*non[- ]?negotiables?/,
+      /common\s*requirements?/,
+      /non[- ]?negotiables?/,
+      /non[- ]?negotiable\s*acceptance\s*tests?/,
+    ]),
+    keyDecisionPoints: hasSection(lower, [
+      /key\s*decision\s*points?/,
+      /key\s*decisions?/,
+      /decision\s*points?/,
+      /decisions?\s*where.*(?:differ|ambiguous)/,
+    ]),
+    safeCompatibilityIdeas: hasSection(lower, [
+      /safe\s*compatibility\s*ideas?/,
+      /safe\s*compatibility\s*additions?/,
+      /safe\s*aliases?/,
+      /compatibility\s*additions?/,
+    ]),
+    scopeRisksAvoid: hasSection(lower, [
+      /scope\s*risks?\s*\/\s*avoid/,
+      /scope\s*risks?/,
+      /avoid\s*[:\-]/,
+      /speculative\s*behavior\s*to\s*avoid/,
+    ]),
+    literalVsOptionalDistinction: hasSection(lower, [
+      /literal\s*requirements?\s*from\s*(?:the\s+)?(?:original\s+)?task/,
+      /literal\s*vs\s*optional/,
+      /mark\s*each\s*as\s*literal/,
+      /mandatory\s*literal\s*requirements?/,
+      /non[- ]?breaking\s*compatibility\s*additions?/,
+    ]),
   };
 }
 
@@ -195,9 +244,10 @@ function deriveStatus(signals: CandidateValidationSignals, text: string, lower: 
     .filter(([, present]) => !present)
     .map(([key]) => SECTION_LABELS[key]);
 
-  const warnings = USEFUL_SIGNAL_KEYS
-    .filter((key) => !signals[key])
-    .map((key) => SECTION_LABELS[key]);
+  const warnings = [
+    ...USEFUL_SIGNAL_KEYS.filter((key) => !signals[key]).map((key) => SECTION_LABELS[key]),
+    ...COMPARISON_SIGNAL_KEYS.filter((key) => !signals[key]).map((key) => SECTION_LABELS[key]),
+  ];
 
   const planOnly = hasSection(lower, [
     /high[- ]level plan only/,
@@ -278,12 +328,15 @@ export function buildCandidateRepairPrompt(input: { task: string; previousOutput
     validation.warnings.length ? ["Useful but missing:", ...validation.warnings.map((item) => `- ${item}`)].join("\n") : "",
     "",
     "Required sections (concise):",
-    "## 1. Contract Gate",
+    "## 1. Contract Gate (literal public surface + external consumer probes)",
     "## 2. Public Surface Matrix",
-    "## 3. External Consumer Probe Plan",
-    "## 4. Hidden Semantic Probe Plan",
-    "## 5. Implementation Guidance (file tree, key code blocks, verification commands)",
-    "## 6. Self-Audit Risks",
+    "## 3. Common Requirements and Non-Negotiables (literal vs compatibility)",
+    "## 4. Key Decision Points",
+    "## 5. Hidden Semantic Probe Plan",
+    "## 6. Safe Compatibility Ideas",
+    "## 7. Scope Risks / Avoid",
+    "## 8. Implementation Guidance (file tree, key code blocks, verification commands)",
+    "## 9. Self-Audit Risks",
     "",
     "Original user task:",
     input.task,

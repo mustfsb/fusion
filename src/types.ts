@@ -8,7 +8,32 @@ export type CouncilMode = "plan" | "review" | "decision" | "build_prompt" | "arc
 
 export type PanelMode = "advisory" | "candidate_build";
 
+/**
+ * Internal build strategy for `/fusion-build`.
+ *
+ * - `speculative_parallel_build`: panels build competing candidates in isolated
+ *   workspaces while the main agent independently builds a baseline in the real
+ *   workspace; a judge then produces a Merge Patch Contract; the main agent
+ *   applies only approved targeted patches. This is the default and only
+ *   strategy for `/fusion-build`.
+ *
+ * `/fusion-no-build` does not set a build strategy (it remains planning-only).
+ */
+export type BuildStrategy = "speculative_parallel_build";
+
 export type PromptVerbosity = "compact" | "standard" | "detailed";
+
+export type PromptTransportMode = "inline_full" | "brief_plus_file";
+
+export type PromptTransportMetadata = {
+  mode: PromptTransportMode;
+  canonicalLineCount: number;
+  inlineLineCount: number;
+  canonicalSha256: string;
+  inlineSha256: string;
+  fullArtifactPath?: string;
+  briefArtifactPath?: string;
+};
 
 export type CouncilDecision = "implement" | "do_not_implement" | "needs_more_info" | "use_caution";
 
@@ -62,6 +87,107 @@ export type PostBuildAuditTrace = {
   status: PostBuildAuditStatus;
   fixCyclesUsed: number;
   findings: PostBuildAuditFinding[];
+};
+
+export type CouncilComparisonConfidence = "high" | "medium" | "low";
+
+export type CouncilComparisonCommonGround = {
+  topic: string;
+  taskRequirement?: string;
+  supportedBy: number[];
+  confidence: CouncilComparisonConfidence;
+  rationale: string;
+};
+
+export type CouncilComparisonPanelPosition = {
+  panelIndex: number;
+  position: string;
+};
+
+export type CouncilComparisonKeyDifference = {
+  topic: string;
+  taskRequirement?: string;
+  panelPositions: CouncilComparisonPanelPosition[];
+  resolutionRule: string;
+  requiredDecision: string;
+};
+
+export type CouncilComparisonUniqueAdditionClassification =
+  | "literal_requirement"
+  | "safe_compatibility"
+  | "optional_enhancement"
+  | "scope_risk";
+
+export type CouncilComparisonUniqueAddition = {
+  idea: string;
+  proposedBy: number;
+  classification: CouncilComparisonUniqueAdditionClassification;
+  recommendation: "adopt" | "defer" | "reject";
+  reason: string;
+};
+
+export type CouncilComparisonPartialCoverage = {
+  requirement: string;
+  coveredBy: number[];
+  requiredFollowUp: string;
+};
+
+export type CouncilComparisonBlindSpot = {
+  risk: string;
+  requiredTestOrAudit: string;
+};
+
+export type CouncilComparison = {
+  commonGround: CouncilComparisonCommonGround[];
+  keyDifferences: CouncilComparisonKeyDifference[];
+  uniqueAdditions: CouncilComparisonUniqueAddition[];
+  partialCoverage: CouncilComparisonPartialCoverage[];
+  blindSpots: CouncilComparisonBlindSpot[];
+  unresolvedDifferences: number;
+  adoptedUniqueAdditions: number;
+  deferredOrRejectedUniqueAdditions: number;
+  degraded: boolean;
+  notes: string[];
+};
+
+export type RequirementDecisionMatrixEntry = {
+  requirement: string;
+  chosenBehavior: string;
+  whyCorrect: string;
+  evidenceSource: string;
+  requiredTest: string;
+  riskIfOmitted: string;
+  classification:
+    | "mandatory_literal_requirement"
+    | "safe_compatibility_addition"
+    | "optional_enhancement"
+    | "rejected_scope_expansion";
+};
+
+export type RequirementDecisionMatrix = {
+  entries: RequirementDecisionMatrixEntry[];
+  mandatoryCount: number;
+  safeCompatibilityCount: number;
+  optionalCount: number;
+  rejectedCount: number;
+};
+
+export type CorrectnessCoverageCategoryStatus = "pass" | "fix_required" | "not_applicable";
+
+export type CorrectnessCoverageCategory = {
+  name: string;
+  status: CorrectnessCoverageCategoryStatus;
+  findings: string[];
+};
+
+export type CorrectnessCoverageGateStatus = "pass" | "fix_required" | "degraded" | "not_run";
+
+export type CorrectnessCoverageGate = {
+  status: CorrectnessCoverageGateStatus;
+  categories: CorrectnessCoverageCategory[];
+  degradedReason?: string;
+  fixCyclesUsed: number;
+  maxFixCycles: number;
 };
 
 export type ModelConfig = {
@@ -169,6 +295,106 @@ export type NativePanelSession = {
   validationStatus?: CandidateValidationStatus;
 };
 
+export type PanelAttemptStatus =
+  | "queued"
+  | "waiting_for_previous_output"
+  | "waiting_for_activity"
+  | "running"
+  | "healthy"
+  | "suspected_stalled"
+  | "stalled"
+  | "cancelled"
+  | "retrying"
+  | "succeeded"
+  | "partial"
+  | "failed";
+
+export type PanelStartReason = "cascade_activity" | "start_gate_timeout" | "retry";
+
+export type PanelStallReason =
+  | "inactivity_timeout"
+  | "task_timeout"
+  | "task_error"
+  | "cancelled_by_orchestrator";
+
+export type PanelCredibleActivitySource =
+  | "assistant_output"
+  | "reasoning_output"
+  | "tool_call_start"
+  | "tool_call_complete"
+  | "tool_result"
+  | "session_status"
+  | "candidate_file_mutation"
+  | "candidate_output_write"
+  | "terminal_result";
+
+export type PanelLivenessCapability = {
+  streamActivityExposed: boolean;
+  tokenLevelLiveness: boolean;
+  startGateFallback: boolean;
+  taskTimeoutSupported: boolean;
+  pendingToolActivityInspectable: boolean;
+};
+
+export type PanelAttemptTrace = {
+  logicalPanelIndex: number;
+  attempt: number;
+  nativeSessionId?: string;
+  model: string;
+  startedAt: string;
+  workspacePreparedAt?: string;
+  dispatchAt?: string;
+  fallbackGateAt?: string;
+  firstActivityAt?: string;
+  firstActivitySource?: PanelCredibleActivitySource;
+  lastActivityAt?: string;
+  lastActivitySource?: PanelCredibleActivitySource;
+  suspectedStalledAt?: string;
+  cancellationRequestedAt?: string;
+  cancelledAt?: string;
+  retryScheduledAt?: string;
+  retryStartedAt?: string;
+  endedAt?: string;
+  status: PanelAttemptStatus;
+  startReason: PanelStartReason;
+  stallReason?: PanelStallReason;
+  excludedAt?: string;
+  excludedReason?: string;
+};
+
+export type RuntimeCapabilityFlags = {
+  visibleTaskDispatchVerified: boolean;
+  childSessionStreamEvents: boolean;
+  childReasoningDeltas: boolean;
+  childToolLifecycleEvents: boolean;
+  childSessionStatusInspection: boolean;
+  cancellationAbortSupported: boolean;
+  childTaskCwdOverride: boolean;
+  childTaskWriteScopeEnforced: boolean;
+  parentContinueWhileChildRuns: boolean;
+  safeRedispatchSupported: boolean;
+  visibleJudgeSupported: boolean;
+  tracePersistenceSupported: boolean;
+};
+
+export type PanelExecutionStage = {
+  panelIndex: number;
+  agentName: string;
+  modelId: string;
+  startsAfter: "immediately" | "previous_first_activity" | "previous_start_gate_timeout";
+  startGateTimeoutMs: number;
+};
+
+export type PanelExecutionPlan = {
+  panelCount: number;
+  startGateTimeoutMs: number;
+  inactivityTimeoutMs: number;
+  maxAttemptsPerPanel: number;
+  staggered: boolean;
+  capability: PanelLivenessCapability;
+  stages: PanelExecutionStage[];
+};
+
 export type FusionTrace = {
   requestedModelSource: ModelSource;
   actualModelSource: ModelRunner["source"];
@@ -200,12 +426,20 @@ export type FusionRunTrace = FusionTrace & {
   executionMode?: ExecutionMode;
   sharedPanelPromptPath?: string;
   sharedPanelPromptHash?: string;
+  panelPromptTransport?: PromptTransportMetadata;
+  judgePromptTransport?: PromptTransportMetadata;
+  auditPromptTransport?: PromptTransportMetadata;
   panelSessions?: NativePanelSession[];
+  panelAttempts?: PanelAttemptTrace[];
+  panelLivenessCapability?: PanelLivenessCapability;
+  runtimeCapabilities?: RuntimeCapabilityFlags;
+  panelExecutionPlan?: PanelExecutionPlan;
   artifactDir?: string;
   artifactPaths?: {
     trace: string;
     originalPrompt: string;
     contractGate?: string;
+    sharedPanelPrompt?: string;
     panel1Prompt?: string;
     panel1Output?: string;
     panel2Prompt?: string;
@@ -215,10 +449,28 @@ export type FusionRunTrace = FusionTrace & {
     judgePrompt?: string;
     judgeOutput?: string;
     finalGuidance?: string;
+    councilComparison?: string;
+    requirementDecisionMatrix?: string;
     postBuildAuditPrompt?: string;
     postBuildAuditOutput?: string;
+    correctnessCoverageGate?: string;
+    sourceBaselineManifest?: string;
+    sourceBaselineSummary?: string;
+    mainBaselineManifest?: string;
+    mainBaselinePatch?: string;
+    mergePatchContractFull?: string;
+    mergePatchContractBrief?: string;
   };
   contractGate?: ContractGateTraceSummary;
+  councilComparison?: CouncilComparison;
+  requirementDecisionMatrixSummary?: {
+    entries: RequirementDecisionMatrixEntry[];
+    mandatoryCount: number;
+    safeCompatibilityCount: number;
+    optionalCount: number;
+    rejectedCount: number;
+  };
+  correctnessCoverageGate?: CorrectnessCoverageGate;
   candidateValidation?: {
     allPassed: boolean;
     perPanel: Array<{
@@ -241,6 +493,7 @@ export type FusionRunTrace = FusionTrace & {
   finalGuidanceContainsImmutabilityChecklist?: boolean;
   finalGuidanceContainsTypedErrorChecklist?: boolean;
   postBuildAudit?: PostBuildAuditTrace;
+  speculative?: SpeculativeParallelBuildTrace;
   artifactFiles?: string[];
   errors?: string[];
 };
@@ -263,6 +516,7 @@ export type PanelAssessment = {
 export type CouncilResult = {
   mode: CouncilMode;
   panelMode?: PanelMode;
+  buildStrategy?: BuildStrategy;
   decision?: CouncilDecision;
   summary: string;
   consensus: string[];
@@ -290,6 +544,9 @@ export type CouncilResult = {
   recommendedBuildPrompt?: string;
   knownTraps?: string[];
   finalComplianceChecklist?: string[];
+  councilComparison?: CouncilComparison;
+  requirementDecisionMatrix?: RequirementDecisionMatrix;
+  correctnessCoverageGate?: CorrectnessCoverageGate;
   finalOutput: string;
   panel: PanelResponse[];
   trace?: FusionRunTrace;
@@ -358,6 +615,50 @@ export type NativePanelAgentPlan = {
   reasoningEffort?: ReasoningEffort;
   promptHash: string;
   nativeTask: true;
+  /**
+   * Speculative-mode dynamic execution binding. Each panel receives its OWN
+   * resolved execution-context file and inline dispatch prompt. The shared task
+   * file is byte-identical across panels; the per-panel binding carries the
+   * resolved candidate workspace, prohibited source workspace, and output paths.
+   * Undefined for advisory / non-speculative runs.
+   */
+  executionContextPath?: string;
+  executionContextHash?: string;
+  candidateWorkspacePath?: string;
+  sourceWorkspacePath?: string;
+  panelReportPath?: string;
+  panelNotesPath?: string;
+  sharedTaskPath?: string;
+  /**
+   * Short (<=50 line) per-panel inline prompt the orchestrator sends as the
+   * panel Task `prompt`. It requires the panel to read the execution-context
+   * file first, then the shared canonical task until EOF. Distinct per panel.
+   */
+  inlineDispatchPrompt?: string;
+};
+
+/**
+ * Per-panel execution assignment trace for speculative_parallel_build runs.
+ * Proves each panel was bound to its OWN fully resolved candidate workspace and
+ * that no unresolved placeholder reached the dispatch. `nativeCwdScoped` is
+ * always false (OpenCode does not path-scope per-task CWD/write permissions);
+ * panels operate in absolute-path mode instead.
+ */
+export type PanelExecutionAssignmentTrace = {
+  logicalPanelIndex: number;
+  sharedTaskPath: string;
+  executionContextPath: string;
+  assignedCandidateWorkspace: string;
+  prohibitedSourceWorkspace: string;
+  panelOutputPath: string;
+  sharedTaskHash: string;
+  executionContextHash: string;
+  unresolvedPlaceholderCheck: "passed" | "failed";
+  nativeCwdScoped: false;
+  absolutePathModeRequired: boolean;
+  /** Runtime identity marker so stale plugin/agent templates are detectable. */
+  resolverVersion: "external_staging_v1";
+  runtimeModulePath?: string;
 };
 
 export type NativeJudgeAgentPlan = {
@@ -376,10 +677,37 @@ export type NativePanelResult = {
   sessionId?: string;
 };
 
+export type NativePanelDispatchEvent = {
+  logicalPanelIndex: number;
+  startReason: PanelStartReason;
+  startedAt?: string;
+  taskId?: string;
+  sessionId?: string;
+};
+
+export type NativePanelObservation = {
+  logicalPanelIndex: number;
+  source: PanelCredibleActivitySource;
+  observedAt?: string;
+};
+
+export type NativeJudgeDispatchEvent = {
+  startedAt?: string;
+  taskId?: string;
+  sessionId?: string;
+};
+
 export type NativePrepareInput = {
   task: string;
   mode: CouncilMode;
   panelMode?: PanelMode;
+  buildStrategy?: BuildStrategy;
+  /**
+   * Optional explicit run id. When omitted a timestamped id is generated.
+   * Provided primarily for deterministic integration tests of the real
+   * `fusion_native.prepare` entrypoint.
+   */
+  runId?: string;
   files?: string[];
   includeDiff?: boolean;
   promptVerbosity?: PromptVerbosity;
@@ -390,6 +718,7 @@ export type NativePrepareInput = {
   requireAllPanels?: boolean;
   minSuccessfulPanels?: number;
   allowDegradedJudge?: boolean;
+  parallelExecutionSupported?: boolean;
   trace?: FusionTraceOptions;
 };
 
@@ -403,15 +732,95 @@ export type NativePrepareResult = {
   executionMode: "native_subagents";
   runId: string;
   artifactDir: string;
-  sharedPanelPrompt: string;
-  sharedPanelPromptHash: string;
-  sharedPanelPromptPath: string;
+  /** Canonical trace artifact directory (<traceRoot>/<runId>). Same as artifactDir. */
+  traceArtifactDir: string;
+  /** Absolute path to run-state.json for this run. */
+  runStatePath: string;
+  sharedPanelPrompt?: string;
+  sharedPanelPromptHash?: string;
+  sharedPanelPromptPath?: string;
+  panelTransportPrompt?: string;
+  panelPromptTransport?: PromptTransportMetadata;
   panelAgents: NativePanelAgentPlan[];
+  panelExecutionPlan: PanelExecutionPlan;
   judgeAgent: NativeJudgeAgentPlan;
   todoPlan: NativeTodoItem[];
   mode: CouncilMode;
   panelMode?: PanelMode;
+  buildStrategy?: BuildStrategy;
   task: string;
+  canonicalTaskPath?: string;
+  canonicalTaskHash?: string;
+  speculative?: SpeculativePrepareResult;
+  /**
+   * Identity of the actually loaded module/build that produced this result.
+   * Lets `/fusion-build` and `/fusion-trace` prove OpenCode is running the
+   * current implementation rather than a stale plugin copy.
+   */
+  runtimeIdentity: RuntimeIdentity;
+};
+
+/**
+ * Canonical speculative path-resolution record. Produced only by the external
+ * staging resolver (`buildSpeculativeWorkspacePaths` +
+ * `buildSpeculativePathResolutionTrace`). No runtime path may derive candidate
+ * workspaces from `sourceArtifactDir/speculative` or `runDir/speculative`.
+ */
+export type SpeculativePathResolutionTrace = {
+  sourceWorkspace: string;
+  sourceArtifactDir: string;
+  externalCandidateStagingDir: string;
+  panelWorkspacePaths: string[];
+  resolverVersion: "external_staging_v1";
+  runtimeModulePath?: string;
+};
+
+/**
+ * Runtime build/module identity marker. Surfaced in prepare results and the
+ * speculative trace to verify which loaded artifact is executing.
+ */
+export type RuntimeIdentity = {
+  modulePath: string;
+  resolverVersion: "external_staging_v1";
+  executionMode: "native_subagents";
+};
+
+export type SpeculativePrepareResult = {
+  buildStrategy: "speculative_parallel_build";
+  sourceWorkspace: string;
+  sourceArtifactDir: string;
+  externalCandidateStagingDir: string;
+  sourceBaselineManifestPath: string;
+  sourceBaselineSummaryPath: string;
+  candidateWorkspaces: CandidateWorkspaceInfo[];
+  isolationCapability: IsolationCapability;
+  parallelExecutionSupported: boolean;
+  parallelCapabilityLimitation?: string;
+  preflightDiagnostic?: string;
+  aborted: boolean;
+  abortReason?: string;
+  preparedAt?: string;
+  candidatePreparationCompletedAt?: string;
+  judgeEligibleAt?: string;
+  /** Canonical external-staging path resolution record. */
+  pathResolution: SpeculativePathResolutionTrace;
+  /** Absolute path of the shared, workspace-agnostic canonical task file. */
+  sharedTaskPath?: string;
+  /** Per-panel resolved execution assignments (one per logical panel). */
+  panelExecutionAssignments?: PanelExecutionAssignmentTrace[];
+};
+
+export type NativeRecordMainBaselineInput = {
+  runId: string;
+  mainBaseline: MainBaselineTrace;
+};
+
+export type NativeRecordMainBaselineResult = {
+  runId: string;
+  recorded: boolean;
+  mainBaseline: MainBaselineTrace;
+  mainBaselineManifestPath?: string;
+  mainBaselinePatchPath?: string;
 };
 
 export type NativeAuditPrepareResult = {
@@ -421,8 +830,17 @@ export type NativeAuditPrepareResult = {
   artifactDir: string;
   auditAgent: NativeJudgeAgentPlan;
   auditPrompt: string;
+  auditTransportPrompt: string;
+  auditPromptTransport?: PromptTransportMetadata;
   fixCyclesUsed: number;
   maxFixCycles: number;
+};
+
+export type NativeCollectInput = {
+  runId: string;
+  panelResults?: NativePanelResult[];
+  panelAttempts?: PanelAttemptTrace[];
+  mainBaseline?: MainBaselineTrace;
 };
 
 export type NativeCollectResult = {
@@ -431,6 +849,8 @@ export type NativeCollectResult = {
   reason: string;
   quorum: FusionTraceQuorum;
   judgePrompt: string;
+  judgeTransportPrompt: string;
+  judgePromptTransport?: PromptTransportMetadata;
   judgeAgent: NativeJudgeAgentPlan;
   panelStatus: Array<{
     agentName: string;
@@ -440,8 +860,163 @@ export type NativeCollectResult = {
     error?: string;
     errorType?: ModelErrorType;
   }>;
+  panelAttempts?: PanelAttemptTrace[];
+  panelLivenessCapability?: PanelLivenessCapability;
   degraded: boolean;
   todoUpdates: NativeTodoItem[];
+  councilComparison?: CouncilComparison;
+  councilComparisonMarkdown?: string;
+  speculative?: SpeculativeCollectResult;
+};
+
+export type SpeculativeCollectResult = {
+  buildStrategy: "speculative_parallel_build";
+  mainBaseline: MainBaselineTrace;
+  candidateWorkspaces: CandidateWorkspaceInfo[];
+  panelCandidateTrace: SpeculativePanelCandidateTrace[];
+  overlapObserved: boolean;
+  overlapDurationMs?: number;
+  judgeEligibleAt?: string;
+  frozenPanelIndexes?: number[];
+  lateExcludedPanelIndexes?: number[];
+  mergePatchContractPrompt: string;
+};
+
+export type NativeAdvanceInput = {
+  runId: string;
+  mainBaselineStartedAt?: string;
+  panelDispatches?: NativePanelDispatchEvent[];
+  panelResults?: NativePanelResult[];
+  panelObservations?: NativePanelObservation[];
+  judgeDispatched?: NativeJudgeDispatchEvent;
+};
+
+export type NativeAdvanceAction =
+  | {
+    type: "start_panel";
+    logicalPanelIndex: number;
+    attempt: number;
+    startReason: PanelStartReason;
+    agentName: string;
+    modelId: string;
+    prompt: string;
+    candidateWorkspacePath?: string;
+    fallbackGateAt?: string;
+  }
+  | {
+    type: "call_collect";
+    reason: string;
+    judgeEligibleAt: string;
+  }
+  | {
+    type: "wait";
+    deadline: string;
+    delayMs: number;
+    reason: "start_gate" | "inactivity" | "all_running";
+  }
+  | {
+    type: "done";
+    reason: string;
+  };
+
+export type NativeAdvanceResult = {
+  runId: string;
+  phase: "preparing_panels" | "panel_execution" | "ready_to_collect" | "judge_running" | "done";
+  nextAction: NativeAdvanceAction;
+  panelAttempts: PanelAttemptTrace[];
+  panelResults: NativePanelResult[];
+  judgeEligible: boolean;
+  judgeEligibleAt?: string;
+  panelLivenessCapability: PanelLivenessCapability;
+  runtimeCapabilities?: RuntimeCapabilityFlags;
+  todoUpdates: NativeTodoItem[];
+  speculative?: SpeculativePrepareResult;
+};
+
+export type RecoveryMetadata = {
+  recovered: true;
+  recoveredFromRunId: string | null;
+  orphanSourceArtifactRoot: string;
+  originalSharedPromptHash: string;
+  recoveryStartedAt: string;
+  mainBaselineReused: boolean;
+  recoveredPanelIndexes: number[];
+  partialPanelIndexes: number[];
+  invalidPanelIndexes: number[];
+  rerunPanelIndexes: number[];
+};
+
+export type RecoveredPanelCandidate = {
+  logicalPanelIndex: number;
+  model?: string;
+  agentName?: string;
+  classification: "usable" | "partial" | "missing" | "invalid";
+  evidence: {
+    executionContext: boolean;
+    candidateWorkspace: boolean;
+    candidateChanges: boolean;
+    candidateLocalReport: boolean;
+    sourceSideReport: boolean;
+    priorSucceededAttempt: boolean;
+    verificationRan: boolean;
+  };
+  evidenceSourcesChecked: string[];
+  workspacePath?: string;
+  reportPath?: string;
+  sourceSideReportPath?: string;
+  diffPath?: string;
+  changedFileCount?: number;
+  verification?: VerificationSummary;
+  rerunEligible: boolean;
+  rerunReason?: string;
+  /** Best report content selected for collect/judge when recovered. Not persisted in classification JSON. */
+  reportContent?: string;
+};
+
+export type RecoveryCandidateClassificationTrace = {
+  recoveredCandidates: RecoveredPanelCandidate[];
+  redispatchPlan: Array<{
+    logicalPanelIndex: number;
+    allowed: boolean;
+    reason?: string;
+  }>;
+  reusedPanelIndexes: number[];
+  partialPanelIndexes: number[];
+  rerunPanelIndexes: number[];
+};
+
+export type NativeResumeInput = {
+  trace?: FusionTraceOptions;
+  panelModels?: string[];
+  judgeModel?: string;
+  requireAllPanels?: boolean;
+  minSuccessfulPanels?: number;
+  allowDegradedJudge?: boolean;
+};
+
+export type NativeResumeResult = {
+  executionMode: "native_subagents";
+  runId: string;
+  artifactDir: string;
+  traceArtifactDir: string;
+  runStatePath: string;
+  recovery: RecoveryMetadata;
+  classification: RecoveryCandidateClassificationTrace;
+  recoveryClassificationPath: string;
+  recoveryPanelPlanPath: string;
+  recoverySummaryMarkdown: string;
+  sharedPanelPromptHash: string;
+  mainBaseline: MainBaselineTrace;
+  judgeEligible: boolean;
+  quorum: FusionTraceQuorum;
+  recoveredPanelResults: NativePanelResult[];
+  panelsToRerun: NativePanelAgentPlan[];
+  panelAgents: NativePanelAgentPlan[];
+  panelExecutionPlan: PanelExecutionPlan;
+  judgeAgent: NativeJudgeAgentPlan;
+  todoPlan: NativeTodoItem[];
+  speculative: SpeculativePrepareResult;
+  runtimeIdentity: RuntimeIdentity;
 };
 
 export type NativeFinalizeInput = {
@@ -463,6 +1038,15 @@ export type NativeFinalizeResult = {
   finalGuidance: string;
   trace: FusionRunTrace;
   traceSummary: string;
+  speculative?: SpeculativeFinalizeResult;
+};
+
+export type SpeculativeFinalizeResult = {
+  buildStrategy: "speculative_parallel_build";
+  mergePatchContractPath?: string;
+  mergePatchDecision?: MergePatchDecision;
+  mergePatchContract?: MergePatchContract;
+  appliedPatchItems?: AppliedPatchItem[];
 };
 
 export type NativeAuditFinalizeInput = {
@@ -471,6 +1055,7 @@ export type NativeAuditFinalizeInput = {
   auditError?: string;
   auditTaskId?: string;
   auditSessionId?: string;
+  appliedPatchItems?: AppliedPatchItem[];
 };
 
 export type NativeAuditFinalizeResult = {
@@ -486,4 +1071,161 @@ export type NativeAuditFinalizeResult = {
   autoFixAllowed: boolean;
   finalOutput: string;
   error?: string;
+  correctnessCoverageGate?: CorrectnessCoverageGate;
+};
+
+// ---------------------------------------------------------------------------
+// Speculative parallel build (`/fusion-build` internal mode)
+//
+// The user-facing command is `/fusion-build`. Internally the workflow runs as
+// `speculative_parallel_build`: panels build competing candidates in isolated
+// candidate workspaces while the main agent independently builds a baseline in
+// the real workspace. A visible native `fusion-judge` then compares real main
+// workspace evidence against panel candidates and produces a Merge Patch
+// Contract. The main agent applies only approved targeted patches.
+// ---------------------------------------------------------------------------
+
+export type VerificationSummary = {
+  typecheck?: "pass" | "fail" | "not_run";
+  test?: "pass" | "fail" | "not_run";
+  build?: "pass" | "fail" | "not_run";
+  commandsRun?: string[];
+  notes?: string[];
+};
+
+export type MainBaselineTrace = {
+  startedAt?: string;
+  completedAt?: string;
+  status: "queued" | "running" | "passed" | "failed" | "blocked";
+  workspacePath: string;
+  changedFiles: string[];
+  manifestPath?: string;
+  patchPath?: string;
+  verification?: VerificationSummary;
+};
+
+export type IsolationCapability = {
+  nativeCwdScoped: boolean;
+  writeBoundaryScoped: boolean;
+  hardLinkSafe: boolean;
+  symlinkSafe: boolean;
+  verified: boolean;
+  limitation?: string;
+};
+
+export type CandidateWorkspaceInfo = {
+  logicalPanelIndex: number;
+  workspacePath: string;
+  manifestPath: string;
+  /** Source-side collected report path (where the judge reads the report). */
+  reportPath: string;
+  patchPath: string;
+  gitInitialized: boolean;
+  /** Candidate-local panel output directory: `<workspace>/.fusion-panel-output`. */
+  candidateOutputDir: string;
+  /** Candidate-local report path the panel writes to (collected source-side later). */
+  candidateReportPath: string;
+  /** Candidate-local optional notes path. */
+  candidateNotesPath: string;
+};
+
+export type SpeculativePanelCandidateTrace = {
+  logicalPanelIndex: number;
+  model: string;
+  workspacePath: string;
+  reportPath?: string;
+  patchPath?: string;
+  status: "queued" | "running" | "usable" | "partial" | "failed" | "excluded";
+  verification?: VerificationSummary;
+};
+
+export type MergePatchSeverity = "BLOCKER" | "MUST_FIX" | "SAFE_ADDITION" | "REJECTED";
+
+export type MergePatchDecision =
+  | "PATCH_REQUIRED"
+  | "NO_PATCH_REQUIRED"
+  | "MAIN_BUILD_BLOCKED";
+
+export type AppliedPatchItem = {
+  severity: "BLOCKER" | "MUST_FIX" | "SAFE_ADDITION";
+  title: string;
+  status: "applied" | "skipped" | "failed";
+};
+
+export type MergePatchGap = {
+  severity: MergePatchSeverity;
+  literalRequirement: string;
+  observedMainBehavior: string;
+  evidence: string;
+  relevantPanelEvidence?: string;
+  failureScenario?: string;
+  requiredCorrection: string;
+  requiredRegressionTest?: string;
+};
+
+export type MergePatchAdoptedInsight = {
+  sourcePanels: number[];
+  idea: string;
+  whyCorrect: string;
+  whyFitsMainArchitecture: string;
+  implementationDirection: string;
+  requiredTest?: string;
+};
+
+export type MergePatchRejectedIdea = {
+  sourcePanel: number;
+  idea: string;
+  reason: string;
+};
+
+export type MergePatchPlanItem = {
+  filePath: string;
+  symbol?: string;
+  requiredChange: string;
+  requiredRegressionTest?: string;
+  risk?: string;
+};
+
+export type MergePatchContract = {
+  mainBaselineStatus: string;
+  mainBaselineKeyPaths: string[];
+  mainBaselineBlockers: string[];
+  panelCandidateStatus: Array<{
+    panelIndex: number;
+    status: "usable" | "partial" | "failed" | "excluded";
+    verificationEvidence?: string;
+  }>;
+  gaps: MergePatchGap[];
+  mainStrengthsToPreserve: string[];
+  adoptedInsights: MergePatchAdoptedInsight[];
+  rejectedIdeas: MergePatchRejectedIdea[];
+  patchPlan: MergePatchPlanItem[];
+  finalDecision: MergePatchDecision;
+};
+
+export type SpeculativeParallelBuildTrace = {
+  mode: "speculative_parallel_build";
+  sourceWorkspace: string;
+  sourceArtifactDir: string;
+  externalCandidateStagingDir: string;
+  sourceBaselineManifestPath: string;
+  parallelExecutionSupported: boolean;
+  overlapObserved: boolean;
+  overlapDurationMs?: number;
+  parallelCapabilityLimitation?: string;
+  runtimeCapabilities?: RuntimeCapabilityFlags;
+  isolationCapability: IsolationCapability;
+  pathResolution?: SpeculativePathResolutionTrace;
+  /** Per-panel resolved execution assignments (dynamic dispatch binding). */
+  panelExecutionAssignments?: PanelExecutionAssignmentTrace[];
+  mainBaseline: MainBaselineTrace;
+  panelCandidates: SpeculativePanelCandidateTrace[];
+  judgeEligibleAt?: string;
+  judgeStartedAt?: string;
+  judgeCompletedAt?: string;
+  frozenPanelIndexes?: number[];
+  lateExcludedPanelIndexes?: number[];
+  mergePatchContractPath?: string;
+  mergePatchDecision?: MergePatchDecision;
+  appliedPatchItems?: AppliedPatchItem[];
 };

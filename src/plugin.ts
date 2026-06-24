@@ -23,13 +23,24 @@ import {
   syncDefaultNativeAgents,
   syncNativeAgents,
 } from "./native/agentSync.js";
-import { nativeCollect, nativeFinalize, nativeFinalizeAudit, nativePrepare, nativePrepareAudit } from "./native/nativeCouncil.js";
+import {
+  nativeAdvance,
+  nativeCollect,
+  nativeFinalize,
+  nativeFinalizeAudit,
+  nativePrepare,
+  nativePrepareAudit,
+  nativeRecordMainBaseline,
+} from "./native/nativeCouncil.js";
+import { nativeResume } from "./native/fusionResume.js";
+import { assertValidFusionRunId } from "./native/runLocator.js";
 import type { FusionTraceOptions, NativePanelResult } from "./types.js";
 
 const outputFormatSchema = tool.schema.enum(["markdown", "json"]);
 const pluginModeSchema = tool.schema.enum(["plan", "review", "decision", "build_prompt", "architecture"]);
 const modelSourceSchema = tool.schema.enum(["auto", "opencode", "direct"]);
 const panelModeSchema = tool.schema.enum(["advisory", "candidate_build"]);
+const buildStrategySchema = tool.schema.enum(["speculative_parallel_build"]);
 const modelConfigActionSchema = tool.schema.enum(["show", "set", "reset"]);
 
 type PluginSettings = FusionTraceOptions;
@@ -134,12 +145,13 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
 
       fusion_native: tool({
         description:
-          "Native-subagent Fusion Council orchestration. Drives panels and the judge as real OpenCode Task subagents (fusion-panel-1/2/3, fusion-judge) instead of hidden SDK sessions. Stages: prepare, collect, finalize, audit_prepare, audit_finalize. Does not call panel/judge models itself.",
+          "Native-subagent Fusion Council orchestration. Drives panels and the judge as real OpenCode Task subagents (fusion-panel-1/2/3, fusion-judge) instead of hidden SDK sessions. Stages: prepare, advance, collect, record_main_baseline, finalize, audit_prepare, audit_finalize, resume. Does not call panel/judge models itself.",
         args: {
-          stage: tool.schema.enum(["prepare", "collect", "finalize", "audit_prepare", "audit_finalize"]).describe("Orchestration stage to execute."),
+          stage: tool.schema.enum(["prepare", "advance", "collect", "record_main_baseline", "finalize", "audit_prepare", "audit_finalize", "resume"]).describe("Orchestration stage to execute."),
           task: tool.schema.string().optional().describe("Original user task text (required for prepare)."),
           mode: pluginModeSchema.optional().describe("Council mode (required for prepare)."),
           panelMode: panelModeSchema.optional().describe("advisory | candidate_build (required for prepare)."),
+          buildStrategy: buildStrategySchema.optional().describe("Internal build strategy for /fusion-build. speculative_parallel_build prepares isolated candidate workspaces and a Merge Patch Contract judge flow."),
           files: tool.schema.array(tool.schema.string()).optional().describe("Project files to include as context (prepare)."),
           includeDiff: tool.schema.boolean().optional().describe("Include current git diff (prepare)."),
           promptVerbosity: tool.schema.enum(["compact", "standard", "detailed"]).optional().describe("Panel prompt verbosity (prepare)."),
@@ -149,7 +161,21 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
           requireAllPanels: tool.schema.boolean().optional().describe("Fail before judging unless every panel succeeds (prepare)."),
           minSuccessfulPanels: tool.schema.number().optional().describe("Minimum usable panels before judging (prepare, default 2)."),
           allowDegradedJudge: tool.schema.boolean().optional().describe("Allow judge in degraded quorum mode (prepare, default true)."),
-          runId: tool.schema.string().optional().describe("Fusion run id returned by prepare (required for collect and finalize)."),
+          parallelExecutionSupported: tool.schema.boolean().optional().describe("Whether the orchestrator/runtime verified true non-blocking native subagent overlap support. If false for speculative_parallel_build, /fusion-build should abort before implementation."),
+          runId: tool.schema.string().optional().describe("Fusion run id. Returned by prepare and required for collect/finalize. May be supplied to prepare to pin a deterministic run id (used by integration tests)."),
+          mainBaselineStartedAt: tool.schema.string().optional().describe("ISO timestamp when the main baseline first began in the real workspace (advance)."),
+          panelDispatches: tool.schema
+            .array(
+              tool.schema.object({
+                logicalPanelIndex: tool.schema.number(),
+                startReason: tool.schema.enum(["cascade_activity", "start_gate_timeout", "retry"]),
+                startedAt: tool.schema.string().optional(),
+                taskId: tool.schema.string().optional(),
+                sessionId: tool.schema.string().optional(),
+              }),
+            )
+            .optional()
+            .describe("Panel dispatch events observed by the visible orchestrator (advance)."),
           panelResults: tool.schema
             .array(
               tool.schema.object({
@@ -163,7 +189,74 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
               }),
             )
             .optional()
-            .describe("Native panel subagent results (collect). Pass one entry per panel returned by the Task tool."),
+            .describe("Native panel subagent results (advance or collect). Pass one entry per panel returned by the Task tool."),
+          panelObservations: tool.schema
+            .array(
+              tool.schema.object({
+                logicalPanelIndex: tool.schema.number(),
+                source: tool.schema.enum([
+                  "assistant_output",
+                  "reasoning_output",
+                  "tool_call_start",
+                  "tool_call_complete",
+                  "tool_result",
+                  "session_status",
+                  "candidate_file_mutation",
+                  "candidate_output_write",
+                  "terminal_result",
+                ]),
+                observedAt: tool.schema.string().optional(),
+              }),
+            )
+            .optional()
+            .describe("Credible panel activity observations when the runtime exposes them (advance)."),
+          judgeDispatched: tool.schema
+            .object({
+              startedAt: tool.schema.string().optional(),
+              taskId: tool.schema.string().optional(),
+              sessionId: tool.schema.string().optional(),
+            })
+            .optional()
+            .describe("Judge dispatch event recorded immediately after the visible fusion-judge Task is started (advance)."),
+          panelAttempts: tool.schema
+            .array(
+              tool.schema.object({
+                logicalPanelIndex: tool.schema.number(),
+                attempt: tool.schema.number(),
+                nativeSessionId: tool.schema.string().optional(),
+                model: tool.schema.string(),
+                startedAt: tool.schema.string(),
+                firstActivityAt: tool.schema.string().optional(),
+                lastActivityAt: tool.schema.string().optional(),
+                endedAt: tool.schema.string().optional(),
+                status: tool.schema.enum(["queued", "waiting_for_previous_output", "waiting_for_activity", "running", "healthy", "suspected_stalled", "stalled", "cancelled", "retrying", "succeeded", "partial", "failed"]),
+                startReason: tool.schema.enum(["cascade_activity", "start_gate_timeout", "retry"]),
+                stallReason: tool.schema.enum(["inactivity_timeout", "task_timeout", "task_error", "cancelled_by_orchestrator"]).optional(),
+              }),
+            )
+            .optional()
+            .describe("Native panel attempt trace (collect). Records staggered cascade start reasons, same-slot retries, and liveness watchdog outcomes. Group retries under the original logical panel index (1-3); never create fusion-panel-4."),
+          mainBaseline: tool.schema
+            .object({
+              startedAt: tool.schema.string().optional(),
+              completedAt: tool.schema.string().optional(),
+              status: tool.schema.enum(["queued", "running", "passed", "failed", "blocked"]),
+              workspacePath: tool.schema.string(),
+              changedFiles: tool.schema.array(tool.schema.string()),
+              manifestPath: tool.schema.string().optional(),
+              patchPath: tool.schema.string().optional(),
+              verification: tool.schema
+                .object({
+                  typecheck: tool.schema.enum(["pass", "fail", "not_run"]).optional(),
+                  test: tool.schema.enum(["pass", "fail", "not_run"]).optional(),
+                  build: tool.schema.enum(["pass", "fail", "not_run"]).optional(),
+                  commandsRun: tool.schema.array(tool.schema.string()).optional(),
+                  notes: tool.schema.array(tool.schema.string()).optional(),
+                })
+                .optional(),
+            })
+            .optional()
+            .describe("Main agent baseline trace for speculative_parallel_build. Record after the real-workspace baseline reaches a terminal state and before dispatching the judge."),
           judgeOutput: tool.schema.string().optional().describe("Native judge subagent output text (finalize)."),
           judgeError: tool.schema.string().optional().describe("Native judge subagent error message (finalize)."),
           judgeTaskId: tool.schema.string().optional().describe("Task id returned by the judge Task call (finalize)."),
@@ -172,6 +265,16 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
           auditError: tool.schema.string().optional().describe("Native post-build audit error message (audit_finalize)."),
           auditTaskId: tool.schema.string().optional().describe("Task id returned by the audit Task call (audit_finalize)."),
           auditSessionId: tool.schema.string().optional().describe("OpenCode session id of the audit child session (audit_finalize)."),
+          appliedPatchItems: tool.schema
+            .array(
+              tool.schema.object({
+                severity: tool.schema.enum(["BLOCKER", "MUST_FIX", "SAFE_ADDITION"]),
+                title: tool.schema.string(),
+                status: tool.schema.enum(["applied", "skipped", "failed"]),
+              }),
+            )
+            .optional()
+            .describe("Applied patch items from the Merge Patch Contract. Pass to audit_finalize after the main agent patches the real workspace."),
           traceDir: tool.schema.string().optional().describe("Override trace artifact root directory."),
           saveRunArtifacts: tool.schema.boolean().optional().describe("Write trace artifacts (default true)."),
           keepPanelSessions: tool.schema.boolean().optional().describe("Keep native child sessions visible (default true in native mode)."),
@@ -188,7 +291,9 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
               {
                 task: args.task,
                 mode: args.mode,
+                runId: args.runId,
                 panelMode: args.panelMode,
+                buildStrategy: args.buildStrategy,
                 files: args.files,
                 includeDiff: args.includeDiff,
                 promptVerbosity: args.promptVerbosity,
@@ -198,6 +303,7 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
                 requireAllPanels: args.requireAllPanels,
                 minSuccessfulPanels: args.minSuccessfulPanels,
                 allowDegradedJudge: args.allowDegradedJudge,
+                parallelExecutionSupported: args.parallelExecutionSupported,
                 trace: {
                   saveRunArtifacts: args.saveRunArtifacts ?? pluginSettings.saveRunArtifacts,
                   keepPanelSessions: args.keepPanelSessions ?? true,
@@ -210,17 +316,54 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
             return JSON.stringify(result, null, 2);
           }
 
-          if (args.stage === "collect") {
-            if (!args.runId || !args.panelResults) {
-              throw new Error("fusion_native collect requires 'runId' and 'panelResults'.");
-            }
-            const result = await nativeCollect(
+          if (args.stage === "advance") {
+            assertValidFusionRunId(args.runId ?? "");
+            const runId = args.runId!;
+            const result = await nativeAdvance(
               {
-                runId: args.runId,
-                panelResults: args.panelResults.map((entry) => ({
+                runId,
+                mainBaselineStartedAt: args.mainBaselineStartedAt,
+                panelDispatches: args.panelDispatches as import("./types.js").NativePanelDispatchEvent[] | undefined,
+                panelResults: args.panelResults?.map((entry) => ({
                   ...entry,
                   errorType: entry.errorType as NativePanelResult["errorType"],
                 })),
+                panelObservations: args.panelObservations as import("./types.js").NativePanelObservation[] | undefined,
+                judgeDispatched: args.judgeDispatched as import("./types.js").NativeJudgeDispatchEvent | undefined,
+              },
+              { cwd, traceDir },
+            );
+            return JSON.stringify(result, null, 2);
+          }
+
+          if (args.stage === "collect") {
+            assertValidFusionRunId(args.runId ?? "");
+            const runId = args.runId!;
+            const result = await nativeCollect(
+              {
+                runId,
+                panelResults: args.panelResults?.map((entry) => ({
+                  ...entry,
+                  errorType: entry.errorType as NativePanelResult["errorType"],
+                })),
+                panelAttempts: args.panelAttempts as import("./types.js").PanelAttemptTrace[] | undefined,
+                mainBaseline: args.mainBaseline as import("./types.js").MainBaselineTrace | undefined,
+              },
+              { cwd, traceDir },
+            );
+            return JSON.stringify(result, null, 2);
+          }
+
+          if (args.stage === "record_main_baseline") {
+            assertValidFusionRunId(args.runId ?? "");
+            const runId = args.runId!;
+            if (!args.mainBaseline) {
+              throw new Error("fusion_native record_main_baseline requires 'mainBaseline'.");
+            }
+            const result = await nativeRecordMainBaseline(
+              {
+                runId,
+                mainBaseline: args.mainBaseline as import("./types.js").MainBaselineTrace,
               },
               { cwd, traceDir },
             );
@@ -228,12 +371,11 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
           }
 
           if (args.stage === "finalize") {
-            if (!args.runId) {
-              throw new Error("fusion_native finalize requires 'runId'.");
-            }
+            assertValidFusionRunId(args.runId ?? "");
+            const runId = args.runId!;
             const result = await nativeFinalize(
               {
-                runId: args.runId,
+                runId,
                 judgeOutput: args.judgeOutput,
                 judgeError: args.judgeError,
                 judgeTaskId: args.judgeTaskId,
@@ -245,24 +387,43 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
           }
 
           if (args.stage === "audit_prepare") {
-            if (!args.runId) {
-              throw new Error("fusion_native audit_prepare requires 'runId'.");
-            }
-            const result = await nativePrepareAudit({ runId: args.runId }, { cwd, traceDir });
+            assertValidFusionRunId(args.runId ?? "");
+            const runId = args.runId!;
+            const result = await nativePrepareAudit({ runId }, { cwd, traceDir });
             return JSON.stringify(result, null, 2);
           }
 
           if (args.stage === "audit_finalize") {
-            if (!args.runId) {
-              throw new Error("fusion_native audit_finalize requires 'runId'.");
-            }
+            assertValidFusionRunId(args.runId ?? "");
+            const runId = args.runId!;
             const result = await nativeFinalizeAudit(
               {
-                runId: args.runId,
+                runId,
                 auditOutput: args.auditOutput,
                 auditError: args.auditError,
                 auditTaskId: args.auditTaskId,
                 auditSessionId: args.auditSessionId,
+                appliedPatchItems: args.appliedPatchItems as import("./types.js").AppliedPatchItem[] | undefined,
+              },
+              { cwd, traceDir },
+            );
+            return JSON.stringify(result, null, 2);
+          }
+
+          if (args.stage === "resume") {
+            const result = await nativeResume(
+              {
+                trace: {
+                  saveRunArtifacts: args.saveRunArtifacts ?? pluginSettings.saveRunArtifacts,
+                  keepPanelSessions: args.keepPanelSessions ?? true,
+                  traceDir,
+                  command: "fusion-resume",
+                },
+                panelModels: args.panelModels,
+                judgeModel: args.judgeModel,
+                requireAllPanels: args.requireAllPanels,
+                minSuccessfulPanels: args.minSuccessfulPanels,
+                allowDegradedJudge: args.allowDegradedJudge,
               },
               { cwd, traceDir },
             );

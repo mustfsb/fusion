@@ -1,13 +1,16 @@
-import type { ContextBundle, ContractAuditResult, CouncilMode, CouncilResult, FusionCouncilConfig, FusionModelSpec, FusionTraceQuorum, ModelRunner, PanelMode, PanelResponse } from "../types.js";
+import type { ContextBundle, ContractAuditResult, CouncilComparison, CouncilMode, CouncilResult, FusionCouncilConfig, FusionModelSpec, FusionTraceQuorum, ModelRunner, PanelMode, PanelResponse, RequirementDecisionMatrix } from "../types.js";
 import { getReasoningEffortApplication } from "../modelSpec.js";
 import { extractJsonObject } from "../utils/json.js";
 import { buildJudgePrompt } from "./prompts.js";
 import { contractAuditResultSchema, judgeResultSchema } from "./schema.js";
 import { panelSessionTitle } from "../trace/runTrace.js";
+import type { z } from "zod";
 
 export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<CouncilResult, "panel"> {
   try {
     const parsed = judgeResultSchema.parse(extractJsonObject(rawText));
+    const requirementDecisionMatrix = normalizeRequirementDecisionMatrix(parsed.requirementDecisionMatrix);
+    const councilComparison = normalizeCouncilComparison(parsed.councilComparison);
     return {
       mode,
       decision: parsed.decision,
@@ -28,6 +31,8 @@ export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<Cou
       packageEntryChecklist: parsed.packageEntryChecklist,
       buildReadyConsumerTestPlan: parsed.buildReadyConsumerTestPlan,
       rejectedRiskyIdeas: parsed.rejectedRiskyIdeas,
+      requirementDecisionMatrix,
+      councilComparison,
       finalBuildGuidance: parsed.finalBuildGuidance,
       mustNotBreakConstraints: parsed.mustNotBreakConstraints,
       requiredTests: parsed.requiredTests,
@@ -60,6 +65,8 @@ export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<Cou
       packageEntryChecklist: [],
       buildReadyConsumerTestPlan: [],
       rejectedRiskyIdeas: [],
+      requirementDecisionMatrix: { entries: [], mandatoryCount: 0, safeCompatibilityCount: 0, optionalCount: 0, rejectedCount: 0 },
+      councilComparison: undefined,
       finalBuildGuidance: "Review the raw judge output manually before implementing the original task.",
       mustNotBreakConstraints: ["Do not implement unverified judge output without checking the original user task."],
       requiredTests: [],
@@ -72,6 +79,70 @@ export function parseJudgeResponse(mode: CouncilMode, rawText: string): Omit<Cou
       finalOutput: rawText,
     };
   }
+}
+
+type ParsedMatrixEntry = z.infer<typeof import("./schema.js").requirementDecisionMatrixEntrySchemaExport>;
+
+function normalizeRequirementDecisionMatrix(entries: ParsedMatrixEntry[]): RequirementDecisionMatrix {
+  const list = entries ?? [];
+  return {
+    entries: list.map((entry) => ({
+      requirement: entry.requirement,
+      chosenBehavior: entry.chosenBehavior,
+      whyCorrect: entry.whyCorrect,
+      evidenceSource: entry.evidenceSource,
+      requiredTest: entry.requiredTest,
+      riskIfOmitted: entry.riskIfOmitted,
+      classification: entry.classification,
+    })),
+    mandatoryCount: list.filter((entry) => entry.classification === "mandatory_literal_requirement").length,
+    safeCompatibilityCount: list.filter((entry) => entry.classification === "safe_compatibility_addition").length,
+    optionalCount: list.filter((entry) => entry.classification === "optional_enhancement").length,
+    rejectedCount: list.filter((entry) => entry.classification === "rejected_scope_expansion").length,
+  };
+}
+
+type ParsedCouncilComparison = NonNullable<z.infer<typeof import("./schema.js").councilComparisonSummarySchemaExport>>;
+
+function normalizeCouncilComparison(parsed: ParsedCouncilComparison | undefined): CouncilComparison | undefined {
+  if (!parsed) return undefined;
+  return {
+    commonGround: parsed.commonGround.map((entry) => ({
+      topic: entry.topic,
+      supportedBy: entry.supportedBy,
+      confidence: entry.confidence,
+      rationale: entry.rationale,
+      taskRequirement: undefined,
+    })),
+    keyDifferences: parsed.keyDifferences.map((entry) => ({
+      topic: entry.topic,
+      panelPositions: [],
+      resolutionRule: entry.resolutionRule,
+      requiredDecision: entry.requiredDecision,
+      taskRequirement: undefined,
+    })),
+    uniqueAdditions: parsed.uniqueAdditions.map((entry) => ({
+      idea: entry.idea,
+      proposedBy: 0,
+      classification: entry.classification,
+      recommendation: entry.recommendation,
+      reason: "",
+    })),
+    partialCoverage: parsed.partialCoverage.map((entry) => ({
+      requirement: entry.requirement,
+      coveredBy: [],
+      requiredFollowUp: entry.requiredFollowUp,
+    })),
+    blindSpots: parsed.blindSpots.map((entry) => ({
+      risk: entry.risk,
+      requiredTestOrAudit: entry.requiredTestOrAudit,
+    })),
+    unresolvedDifferences: parsed.keyDifferences.length,
+    adoptedUniqueAdditions: parsed.uniqueAdditions.filter((entry) => entry.recommendation === "adopt").length,
+    deferredOrRejectedUniqueAdditions: parsed.uniqueAdditions.filter((entry) => entry.recommendation !== "adopt").length,
+    degraded: false,
+    notes: [],
+  };
 }
 
 export function parseContractAuditResponse(rawText: string): ContractAuditResult {
@@ -112,6 +183,8 @@ export async function runJudge(input: {
   keepSession?: boolean;
   judgePrompt?: string;
   quorum?: FusionTraceQuorum;
+  councilComparison?: CouncilComparison;
+  councilComparisonMarkdown?: string;
 }): Promise<CouncilResult & {
   judgeRawOutput?: string;
   judgeSessionId?: string;
@@ -132,6 +205,8 @@ export async function runJudge(input: {
       panel: input.panel,
       panelMode: input.panelMode,
       quorum: input.quorum,
+      councilComparison: input.councilComparison,
+      councilComparisonMarkdown: input.councilComparisonMarkdown,
     });
     const raw = await input.modelRunner.generate(
       judgeModelId,

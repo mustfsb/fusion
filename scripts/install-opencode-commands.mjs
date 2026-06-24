@@ -21,6 +21,7 @@ const SUPPORTED_COMMANDS = [
   "fusion-plan.md",
   "fusion-prompt.md",
   "fusion-review.md",
+  "fusion-resume.md",
   "fusion-trace.md",
 ];
 

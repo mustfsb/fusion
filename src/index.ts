@@ -3,6 +3,14 @@ export { runCouncil, formatCouncilResultMarkdown, formatLatestTraceSummary } fro
 export { parseContractAuditResponse, parseJudgeResponse } from "./council/judge.js";
 export { extractContractGate, renderContractGate, summarizeContractGate } from "./council/contractGate.js";
 export { validateCandidateOutput, buildCandidateRepairPrompt, shouldAttemptCandidateRepair } from "./council/candidateValidation.js";
+export {
+  INLINE_PROMPT_LINE_LIMIT,
+  FUSION_FULL_PROMPT_UNAVAILABLE_PREFIX,
+  physicalLineCount,
+  preparePromptTransport,
+  buildTransportBrief,
+  parseFullPromptUnavailable,
+} from "./council/promptTransport.js";
 export type { CandidateValidationStatus, CandidateValidationResult } from "./council/candidateValidation.js";
 export { collectContext } from "./context/collectContext.js";
 export { isDeniedPath, sanitizeText } from "./context/sanitize.js";

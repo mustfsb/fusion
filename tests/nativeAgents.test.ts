@@ -17,7 +17,7 @@ import {
   buildOrchestratorAgentFile,
   buildPanelAgentFile,
 } from "../src/native/agentTemplates.js";
-import { nativeCollect, nativeFinalize, nativeFinalizeAudit, nativePrepare, nativePrepareAudit, buildTodoPlan } from "../src/native/nativeCouncil.js";
+import { nativeAdvance, nativeCollect, nativeFinalize, nativeFinalizeAudit, nativePrepare, nativePrepareAudit, buildTodoPlan } from "../src/native/nativeCouncil.js";
 import { hashSharedPanelPrompt, loadRunState } from "../src/native/runState.js";
 import { parseModelArgs } from "../src/modelConfig.js";
 import { completeCandidate } from "./fixtures/candidates.js";
@@ -68,7 +68,9 @@ describe("native agent generation", () => {
     const panel1 = await readFile(path.join(tmpAgentDir, "fusion-panel-1.md"), "utf8");
     expect(panel1).toContain("mode: subagent");
     expect(panel1).toContain("model: opencode-go/kimi-k2.7-code");
-    expect(panel1).toContain("edit: deny");
+    // Speculative_parallel_build requires panel write access in candidate workspaces.
+    expect(panel1).toContain("edit: allow");
+    expect(panel1).toContain("write: allow");
     expect(panel1).toContain("task: deny");
     expect(panel1).toContain("todowrite: deny");
 
@@ -160,7 +162,7 @@ describe("native agent generation", () => {
 });
 
 describe("shared panel prompt", () => {
-  test("nativePrepare returns identical prompt hash for all three panels", async () => {
+  test("speculative prepare defers shared prompt materialization until advance", async () => {
     const prepare = await nativePrepare(
       {
         task: "Build add(a,b)",
@@ -177,10 +179,17 @@ describe("shared panel prompt", () => {
     expect(prepare.panelAgents).toHaveLength(3);
     const hashes = prepare.panelAgents.map((p) => p.promptHash);
     expect(new Set(hashes).size).toBe(1);
-    expect(hashes[0]).toBe(prepare.sharedPanelPromptHash);
-    expect(prepare.sharedPanelPromptHash).toBe(hashSharedPanelPrompt(prepare.sharedPanelPrompt));
+    expect(prepare.sharedPanelPromptHash).toBeUndefined();
+    expect(prepare.sharedPanelPrompt).toBeUndefined();
+    expect(prepare.canonicalTaskHash).toBe(hashes[0]);
     expect(prepare.panelAgents.map((p) => p.nativeTask)).toEqual([true, true, true]);
     expect(prepare.panelAgents.map((p) => p.agentName)).toEqual(["fusion-panel-1", "fusion-panel-2", "fusion-panel-3"]);
+
+    await nativeAdvance({ runId: prepare.runId }, { cwd: tmpCwd });
+    const state = await loadRunState(tmpCwd, prepare.runId);
+    expect(state.sharedPanelPromptHash).toBe(hashSharedPanelPrompt(state.sharedPanelPrompt));
+    expect(new Set(state.panelAgents.map((p) => p.promptHash)).size).toBe(1);
+    expect(state.panelAgents[0]?.promptHash).toBe(state.sharedPanelPromptHash);
   });
 
   test("run-state records the shared prompt hash and path", async () => {
@@ -197,28 +206,33 @@ describe("shared panel prompt", () => {
 });
 
 describe("native todo plan", () => {
-  test("fusion-build todo plan includes consumer-test, audit, and verification stages", () => {
+  test("fusion-build todo plan includes speculative stages, patch phase, audit, and verification", () => {
     const plan = buildTodoPlan({
       panelModelSpecs: defaultPanels,
       judgeModelSpec: { modelId: "openai/gpt-5.4" },
       command: "fusion-build",
       phase: "prepare",
+      buildStrategy: "speculative_parallel_build",
     });
     expect(plan.map((p) => p.content)).toEqual([
+      "Stage 0: isolate candidate workspaces",
       "Build Contract Gate and shared panel prompt",
-      "Panel 1 analysis — opencode-go/kimi-k2.7-code",
-      "Panel 2 analysis — opencode-go/qwen3.7-max",
-      "Panel 3 analysis — opencode-go/minimax-m3",
+      "Panel candidate build 1 — opencode-go/kimi-k2.7-code",
+      "Panel candidate build 2 — opencode-go/qwen3.7-max",
+      "Panel candidate build 3 — opencode-go/minimax-m3",
+      "Main baseline build in real workspace",
       "Validate panel outputs and determine quorum",
-      "Judge synthesis — openai/gpt-5.4",
-      "Implement approved plan",
-      "Create or update contract-focused consumer tests",
-      "Post-build contract audit",
-      "Resolve contract audit findings",
+      "Compare panel findings and resolve differences",
+      "Judge Merge Patch Contract — openai/gpt-5.4",
+      "Apply approved targeted patches from Merge Patch Contract",
+      "Run post-build contract audit",
+      "Run correctness coverage gate",
+      "Resolve one audit/fix cycle if needed",
       "Final verification",
     ]);
     expect(plan[0].status).toBe("completed");
-    expect(plan.slice(1).every((p) => p.status === "pending")).toBe(true);
+    expect(plan[1].status).toBe("completed");
+    expect(plan.slice(2).every((p) => p.status === "pending")).toBe(true);
   });
 
   test("fusion-no-build todo plan omits implement + verification stages", () => {
@@ -228,9 +242,10 @@ describe("native todo plan", () => {
       command: "fusion-no-build",
       phase: "prepare",
     });
-    expect(plan.map((p) => p.content)).not.toContain("Implement approved plan");
+    expect(plan.map((p) => p.content)).not.toContain("Implement approved contract");
     expect(plan.map((p) => p.content)).not.toContain("Post-build contract audit");
-    expect(plan).toHaveLength(6);
+    expect(plan.map((p) => p.content)).not.toContain("Run correctness coverage gate");
+    expect(plan).toHaveLength(7);
   });
 
   test("collect phase marks panel todos completed/failed and quorum todo completed", () => {
@@ -270,6 +285,7 @@ describe("native collect + quorum", () => {
       },
       { cwd: tmpCwd },
     );
+    await nativeAdvance({ runId: prepare.runId }, { cwd: tmpCwd });
 
     const collect = await nativeCollect(
       {
@@ -286,9 +302,15 @@ describe("native collect + quorum", () => {
     expect(collect.shouldProceed).toBe(true);
     expect(collect.quorum).toMatchObject({ usable: 2, total: 3, required: 2, degraded: true });
     expect(collect.degraded).toBe(true);
-    expect(collect.judgePrompt).toContain("Council quorum status");
+    // Speculative mode builds a Merge Patch Contract judge prompt (not the legacy
+    // judge prompt). It still includes the Contract Gate and candidate workspace
+    // paths. The Council Comparison Dossier is embedded when available.
+    expect(collect.judgePrompt).toContain("Merge Patch Contract");
     expect(collect.judgePrompt).toContain("Contract Gate");
-    expect(collect.judgePrompt).toContain("opencode-go/qwen3.7-max");
+    expect(collect.judgePrompt).toContain("speculative");
+    expect(collect.speculative).toBeDefined();
+    expect(collect.speculative?.buildStrategy).toBe("speculative_parallel_build");
+    expect(collect.speculative?.candidateWorkspaces).toHaveLength(3);
     expect(collect.judgeAgent.agentName).toBe("fusion-judge");
     expect(collect.panelStatus.find((p) => p.agentName === "fusion-panel-2")?.success).toBe(false);
     expect(collect.panelStatus.find((p) => p.agentName === "fusion-panel-2")?.errorType).toBe("timeout");
@@ -385,49 +407,92 @@ describe("native finalize + trace", () => {
       { cwd: tmpCwd },
     );
 
-    const judgeJson = JSON.stringify({
-      decision: "implement",
-      summary: "Use the merged minimal candidate.",
-      consensus: ["Keep add literal"],
-      contradictions: [],
-      uniqueInsights: [],
-      risks: [],
-      missingConsiderations: [],
-      requirementChecklist: ["export add"],
-      rejectedRiskyIdeas: ["no extra helpers"],
-      finalBuildGuidance: "## Final build contract\nImplement add.",
-      mustNotBreakConstraints: ["no speculative behavior"],
-      requiredTests: ["probe add(2,3)=5"],
-      finalRecommendation: "Proceed.",
-      finalOutput: "## Spec Compliance Verdict\n## Required hidden tests\n- probe add",
-      panelAssessments: [],
-      implementationPlan: ["Create src/index.ts"],
-      testPlan: ["Add vitest test"],
-      knownTraps: ["do not emit extra files"],
-      finalComplianceChecklist: ["exactly one public function"],
-    });
+    const judgeContract = [
+      "# Speculative Build Comparison",
+      "",
+      "## Main Baseline Status",
+      "- verification status: passed",
+      "- key implementation paths: src/index.ts",
+      "",
+      "## Panel Candidate Status",
+      "- panel 1: usable",
+      "- panel 2: usable",
+      "- panel 3: usable",
+      "",
+      "## Literal Requirement Gaps in Main",
+      "- severity: MUST_FIX",
+      "- literal requirement: export add from package root",
+      "- observed main behavior: add defined but not exported",
+      "- evidence: src/index.ts: add",
+      "- required correction: add `export` keyword to add function",
+      "- required regression test: package-entry import test for add",
+      "",
+      "## Main Strengths to Preserve",
+      "- pure function implementation",
+      "",
+      "## Adopted Panel Insights",
+      "- source panels: 1, 2",
+      "- idea: typed error for non-number inputs",
+      "- why correct: task requires typed errors",
+      "- why it fits the main architecture: single export, no extra surface",
+      "- exact implementation direction: add TypeError subclass",
+      "- required test: add(NaN, 1) throws typed error",
+      "",
+      "## Rejected Panel Ideas",
+      "- source panel: 3",
+      "- idea: add a Curry helper",
+      "- reason: scope risk — not requested by task",
+      "",
+      "## Patch Plan",
+      "1. src/index.ts",
+      "   symbol: add",
+      "   required change: add export keyword",
+      "   required regression test: package-entry import test",
+      "   risk: low",
+      "",
+      "## Final Patch Decision",
+      "- PATCH_REQUIRED",
+    ].join("\n");
 
     const finalize = await nativeFinalize(
-      { runId: prepare.runId, judgeOutput: judgeJson, judgeSessionId: "judge-sess" },
+      { runId: prepare.runId, judgeOutput: judgeContract, judgeSessionId: "judge-sess" },
       { cwd: tmpCwd },
     );
 
     expect(finalize.success).toBe(true);
     expect(finalize.executionMode).toBe("native_subagents");
     expect(finalize.trace.executionMode).toBe("native_subagents");
-    expect(finalize.trace.sharedPanelPromptHash).toBe(prepare.sharedPanelPromptHash);
+    const state = await loadRunState(tmpCwd, prepare.runId);
+    expect(finalize.trace.sharedPanelPromptHash).toBe(state.sharedPanelPromptHash);
     expect(finalize.trace.panelSessions).toHaveLength(3);
     const sessionHashes = finalize.trace.panelSessions?.map((s) => s.promptHash);
     expect(new Set(sessionHashes).size).toBe(1);
     expect(finalize.trace.panelSessions?.[0].nativeTask).toBe(true);
     expect(finalize.trace.panelSessions?.map((s) => s.sessionId)).toEqual(["sess-1", "sess-2", "sess-3"]);
-    expect(finalize.councilResult.summary).toBe("Use the merged minimal candidate.");
-    expect(finalize.finalGuidance).toContain("Final build contract");
+    // Speculative mode: council result is built from the Merge Patch Contract.
+    expect(finalize.councilResult.summary).toContain("Merge Patch Contract");
+    expect(finalize.councilResult.summary).toContain("PATCH_REQUIRED");
+    expect(finalize.finalGuidance).toContain("Speculative Build Comparison");
     expect(finalize.trace.contractGate?.publicExportsRequired).toBeInstanceOf(Array);
     expect(finalize.trace.postBuildAudit?.status).toBe("not_run");
     expect(finalize.traceSummary).toContain("native_subagents");
-    expect(finalize.traceSummary).toContain(prepare.sharedPanelPromptHash);
+    expect(finalize.traceSummary).toContain(state.sharedPanelPromptHash ?? "");
     expect(finalize.artifactDir).toBeTruthy();
+    // Speculative trace fields
+    expect(finalize.trace.speculative).toBeDefined();
+    expect(finalize.trace.speculative?.mode).toBe("speculative_parallel_build");
+    expect(finalize.trace.speculative?.mergePatchDecision).toBe("PATCH_REQUIRED");
+    expect(finalize.trace.speculative?.mergePatchContractPath).toBeTruthy();
+    expect(finalize.trace.speculative?.panelCandidates).toHaveLength(3);
+    expect(finalize.trace.speculative?.isolationCapability.verified).toBe(true);
+    expect(finalize.traceSummary).toContain("Speculative Parallel Build");
+    expect(finalize.traceSummary).toContain("speculative_parallel_build");
+    expect(finalize.traceSummary.toLowerCase()).toContain("build strategy");
+    expect(finalize.speculative).toBeDefined();
+    expect(finalize.speculative?.mergePatchContract).toBeDefined();
+    expect(finalize.speculative?.mergePatchDecision).toBe("PATCH_REQUIRED");
+    expect(finalize.speculative?.mergePatchContract?.gaps).toHaveLength(1);
+    expect(finalize.speculative?.mergePatchContract?.gaps[0]?.severity).toBe("MUST_FIX");
   });
 
   test("finalize records failure when judge errors", async () => {
@@ -581,10 +646,15 @@ describe("native post-build audit", () => {
 });
 
 describe("native safety", () => {
-  test("panel agent files deny edit, task, and todowrite", async () => {
+  test("panel agent files allow edit (speculative candidate workspace writes), deny task and todowrite", async () => {
     for (let index = 1; index <= 3; index += 1) {
       const file = buildPanelAgentFile({ panelIndex: index, modelId: `provider/model-${index}` });
-      expect(file.content).toContain("edit: deny");
+      // Speculative_parallel_build mode requires panels to write in their
+      // isolated candidate workspaces. The panel prompt enforces the write
+      // boundary (write ONLY in the assigned candidate workspace); the
+      // runtime does not path-scope write permissions.
+      expect(file.content).toContain("edit: allow");
+      expect(file.content).toContain("write: allow");
       expect(file.content).toContain("task: deny");
       expect(file.content).toContain("todowrite: deny");
       expect(file.content).toContain("mode: subagent");
@@ -670,6 +740,7 @@ describe("cross-platform installer", () => {
     expect(installer.SUPPORTED_COMMANDS).not.toContain("fusion-status.md");
     expect(installer.SUPPORTED_COMMANDS).toContain("fusion-build.md");
     expect(installer.SUPPORTED_COMMANDS).toContain("fusion-no-build.md");
+    expect(installer.SUPPORTED_COMMANDS).toContain("fusion-resume.md");
   });
 });
 
@@ -688,5 +759,236 @@ describe("fusion-model set syncs agents (parseModelArgs roundtrip)", () => {
     expect(result.judgeAgent.reasoningEffort).toBe("high");
     const judge = await readFile(path.join(tmpAgentDir, "fusion-judge.md"), "utf8");
     expect(judge).toContain("variant: high");
+  });
+});
+
+describe("panel execution plan and attempts trace", () => {
+  test("nativePrepare returns panelExecutionPlan with staggered cascade and liveness capability", async () => {
+    const prepare = await nativePrepare(
+      {
+        task: "Build add(a,b)",
+        mode: "build_prompt",
+        panelMode: "candidate_build",
+        command: "fusion-build",
+        trace: { saveRunArtifacts: true },
+      },
+      { cwd: tmpCwd },
+    );
+    expect(prepare.panelExecutionPlan).toBeDefined();
+    expect(prepare.panelExecutionPlan.staggered).toBe(true);
+    expect(prepare.panelExecutionPlan.startGateTimeoutMs).toBe(60_000);
+    expect(prepare.panelExecutionPlan.inactivityTimeoutMs).toBe(90_000);
+    expect(prepare.panelExecutionPlan.maxAttemptsPerPanel).toBe(2);
+    expect(prepare.panelExecutionPlan.stages).toHaveLength(3);
+    expect(prepare.panelExecutionPlan.stages[0].startsAfter).toBe("immediately");
+    expect(prepare.panelExecutionPlan.stages[1].startsAfter).toBe("previous_first_activity");
+    expect(prepare.panelExecutionPlan.stages[2].startsAfter).toBe("previous_first_activity");
+    expect(prepare.panelExecutionPlan.capability.streamActivityExposed).toBe(false);
+    expect(prepare.panelExecutionPlan.capability.tokenLevelLiveness).toBe(false);
+  });
+
+  test("nativeCollect accepts panelAttempts and records them in state and result", async () => {
+    const prepare = await nativePrepare(
+      {
+        task: "Build add(a,b)",
+        mode: "build_prompt",
+        panelMode: "candidate_build",
+        command: "fusion-build",
+        trace: { saveRunArtifacts: true },
+      },
+      { cwd: tmpCwd },
+    );
+    const panelAttempts = [
+      {
+        logicalPanelIndex: 1,
+        attempt: 1,
+        model: "opencode-go/kimi-k2.7-code",
+        startedAt: "2026-06-22T00:00:00.000Z",
+        endedAt: "2026-06-22T00:01:30.000Z",
+        status: "succeeded" as const,
+        startReason: "cascade_activity" as const,
+      },
+      {
+        logicalPanelIndex: 1,
+        attempt: 2,
+        model: "opencode-go/kimi-k2.7-code",
+        startedAt: "2026-06-22T00:01:31.000Z",
+        endedAt: "2026-06-22T00:02:30.000Z",
+        status: "succeeded" as const,
+        startReason: "retry" as const,
+      },
+      {
+        logicalPanelIndex: 2,
+        attempt: 1,
+        model: "opencode-go/qwen3.7-max",
+        startedAt: "2026-06-22T00:01:00.000Z",
+        endedAt: "2026-06-22T00:02:30.000Z",
+        status: "succeeded" as const,
+        startReason: "start_gate_timeout" as const,
+      },
+      {
+        logicalPanelIndex: 3,
+        attempt: 1,
+        model: "opencode-go/minimax-m3",
+        startedAt: "2026-06-22T00:02:00.000Z",
+        endedAt: "2026-06-22T00:03:30.000Z",
+        status: "succeeded" as const,
+        startReason: "start_gate_timeout" as const,
+      },
+    ];
+    const collect = await nativeCollect(
+      {
+        runId: prepare.runId,
+        panelResults: [
+          { agentName: "fusion-panel-1", modelId: "opencode-go/kimi-k2.7-code", content: completeCandidate },
+          { agentName: "fusion-panel-2", modelId: "opencode-go/qwen3.7-max", content: completeCandidate },
+          { agentName: "fusion-panel-3", modelId: "opencode-go/minimax-m3", content: completeCandidate },
+        ],
+        panelAttempts,
+      },
+      { cwd: tmpCwd },
+    );
+    expect(collect.panelAttempts).toEqual(panelAttempts);
+    expect(collect.panelLivenessCapability?.streamActivityExposed).toBe(false);
+    expect(collect.panelLivenessCapability?.tokenLevelLiveness).toBe(false);
+    // Verify state persisted
+    const state = await loadRunState(tmpCwd, prepare.runId);
+    expect(state.panelAttempts).toEqual(panelAttempts);
+    expect(state.panelLivenessCapability?.streamActivityExposed).toBe(false);
+  });
+
+  test("finalize trace includes panelAttempts, liveness capability, and execution plan", async () => {
+    const prepare = await nativePrepare(
+      {
+        task: "Build add(a,b)",
+        mode: "build_prompt",
+        panelMode: "candidate_build",
+        command: "fusion-build",
+        trace: { saveRunArtifacts: true },
+      },
+      { cwd: tmpCwd },
+    );
+    const panelAttempts = [
+      {
+        logicalPanelIndex: 1,
+        attempt: 1,
+        model: "opencode-go/kimi-k2.7-code",
+        startedAt: "2026-06-22T00:00:00.000Z",
+        endedAt: "2026-06-22T00:01:30.000Z",
+        status: "succeeded" as const,
+        startReason: "cascade_activity" as const,
+      },
+      {
+        logicalPanelIndex: 2,
+        attempt: 1,
+        model: "opencode-go/qwen3.7-max",
+        startedAt: "2026-06-22T00:01:00.000Z",
+        endedAt: "2026-06-22T00:02:30.000Z",
+        status: "succeeded" as const,
+        startReason: "start_gate_timeout" as const,
+      },
+    ];
+    await nativeCollect(
+      {
+        runId: prepare.runId,
+        panelResults: [
+          { agentName: "fusion-panel-1", modelId: "opencode-go/kimi-k2.7-code", content: completeCandidate },
+          { agentName: "fusion-panel-2", modelId: "opencode-go/qwen3.7-max", content: completeCandidate },
+          { agentName: "fusion-panel-3", modelId: "opencode-go/minimax-m3", content: completeCandidate },
+        ],
+        panelAttempts,
+      },
+      { cwd: tmpCwd },
+    );
+    const finalize = await nativeFinalize(
+      {
+        runId: prepare.runId,
+        judgeOutput: JSON.stringify({
+          summary: "ok",
+          finalRecommendation: "Proceed.",
+          requirementChecklist: ["export add"],
+          finalBuildGuidance: "Final build contract",
+          requiredTests: ["probe"],
+          finalOutput: "## Spec Compliance Verdict\nok",
+        }),
+      },
+      { cwd: tmpCwd },
+    );
+    expect(finalize.trace.panelAttempts).toEqual(panelAttempts);
+    expect(finalize.trace.panelLivenessCapability?.streamActivityExposed).toBe(false);
+    expect(finalize.trace.panelLivenessCapability?.tokenLevelLiveness).toBe(false);
+    expect(finalize.trace.panelExecutionPlan?.staggered).toBe(true);
+    expect(finalize.trace.panelExecutionPlan?.startGateTimeoutMs).toBe(60_000);
+    expect(finalize.traceSummary).toContain("Panel cascade");
+    expect(finalize.traceSummary).toContain("staggered");
+    expect(finalize.traceSummary).toContain("Panel liveness telemetry");
+    expect(finalize.traceSummary).toContain("streamActivity=not exposed");
+    expect(finalize.traceSummary).toContain("Panel attempts recorded");
+  });
+
+  test("trace summary shows panel attempts grouped by logical slot with retry visibility", async () => {
+    const prepare = await nativePrepare(
+      {
+        task: "Build add(a,b)",
+        mode: "build_prompt",
+        panelMode: "candidate_build",
+        command: "fusion-build",
+        trace: { saveRunArtifacts: true },
+      },
+      { cwd: tmpCwd },
+    );
+    const panelAttempts = [
+      {
+        logicalPanelIndex: 1,
+        attempt: 1,
+        model: "opencode-go/kimi-k2.7-code",
+        startedAt: "2026-06-22T00:00:00.000Z",
+        endedAt: "2026-06-22T00:01:00.000Z",
+        status: "stalled" as const,
+        startReason: "cascade_activity" as const,
+        stallReason: "task_timeout" as const,
+      },
+      {
+        logicalPanelIndex: 1,
+        attempt: 2,
+        model: "opencode-go/kimi-k2.7-code",
+        startedAt: "2026-06-22T00:01:01.000Z",
+        endedAt: "2026-06-22T00:02:30.000Z",
+        status: "succeeded" as const,
+        startReason: "retry" as const,
+      },
+    ];
+    await nativeCollect(
+      {
+        runId: prepare.runId,
+        panelResults: [
+          { agentName: "fusion-panel-1", modelId: "opencode-go/kimi-k2.7-code", content: completeCandidate },
+          { agentName: "fusion-panel-2", modelId: "opencode-go/qwen3.7-max", content: completeCandidate },
+          { agentName: "fusion-panel-3", modelId: "opencode-go/minimax-m3", content: completeCandidate },
+        ],
+        panelAttempts,
+      },
+      { cwd: tmpCwd },
+    );
+    const finalize = await nativeFinalize(
+      {
+        runId: prepare.runId,
+        judgeOutput: JSON.stringify({
+          summary: "ok",
+          finalRecommendation: "Proceed.",
+          requirementChecklist: ["export add"],
+          finalBuildGuidance: "Final build contract",
+          requiredTests: ["probe"],
+          finalOutput: "## Spec Compliance Verdict\nok",
+        }),
+      },
+      { cwd: tmpCwd },
+    );
+    expect(finalize.traceSummary).toContain("fusion-panel-1 attempt 1: stalled");
+    expect(finalize.traceSummary).toContain("fusion-panel-1 attempt 2: succeeded");
+    expect(finalize.traceSummary).toContain("startReason=retry");
+    expect(finalize.traceSummary).toContain("stallReason=task_timeout");
+    // No fusion-panel-4 ever appears
+    expect(finalize.traceSummary).not.toContain("fusion-panel-4");
   });
 });
