@@ -16,7 +16,6 @@ import {
   preparePromptTransport,
 } from "../council/promptTransport.js";
 import { parseContractAuditResponse, parseJudgeResponse } from "../council/judge.js";
-import { validateCandidateOutput } from "../council/candidateValidation.js";
 import {
   buildQuorum,
   quorumMeetsRequirement,
@@ -35,6 +34,7 @@ import {
   correctnessCoverageGateArtifactPath,
   FUSION_RUN_STATE_LIFECYCLE_VERSION,
   hashSharedPanelPrompt,
+  judgeManifestArtifactPath,
   loadRunState,
   mainBaselineManifestArtifactPath,
   mainBaselinePatchArtifactPath,
@@ -59,6 +59,7 @@ import {
   PANEL_LIVENESS_CAPABILITY,
   PanelScheduler,
   buildPanelExecutionPlan,
+  buildPanelLaunchSchedule,
 } from "./panelScheduler.js";
 import {
   collectCandidateReports,
@@ -67,6 +68,10 @@ import {
   diffAgainstBaseline,
   loadBaselineManifest,
 } from "./candidateWorkspace.js";
+import {
+  classifyCandidateEvidence,
+  renderDeterministicCandidateReport,
+} from "./candidateClassification.js";
 import { assertValidFusionRunId, assertValidFusionRunLocator, resolveRunLocatorPaths } from "./runLocator.js";
 import {
   assertPanelWorkspacesExternal,
@@ -79,6 +84,7 @@ import {
   buildPanelExecutionContext,
   buildPanelInlineDispatchPrompt,
   buildSpeculativeSharedPanelPrompt,
+  hasValidMergePatchContract,
   mergePatchArtifactPaths,
   parseCandidateWorkspaceUnusable,
   parseMergePatchContract,
@@ -308,6 +314,7 @@ export async function nativePrepare(
         : "OpenCode task overlap has not been runtime-verified. Automatic cancellation remains disabled and overlap claims are suppressed.",
       aborted: false,
       preparedAt: timestamp,
+      runLaunchRequestedAt: timestamp,
       pathResolution,
     };
 
@@ -357,6 +364,7 @@ export async function nativePrepare(
         aborted: speculative.aborted,
         abortReason: speculative.abortReason,
         preparedAt: speculative.preparedAt,
+        runLaunchRequestedAt: speculative.runLaunchRequestedAt,
         candidatePreparationCompletedAt: speculative.candidatePreparationCompletedAt,
         pathResolution: speculative.pathResolution,
         sharedTaskPath: speculative.sharedTaskPath,
@@ -772,21 +780,212 @@ function isMainBaselineTerminal(mainBaseline?: MainBaselineTrace): boolean {
   return mainBaseline.status === "passed" || mainBaseline.status === "failed" || mainBaseline.status === "blocked";
 }
 
-function computeUsablePanelCount(state: RunState, panelResults: NativePanelResult[]): number {
-  let usable = 0;
+/**
+ * Hard orchestration violation check: the main baseline's first real work must
+ * never occur after a panel has already produced a terminal result. Returns
+ * true when the firstWorkAt marker is later than any panel attempt's terminal
+ * timestamp (succeeded/failed/cancelled).
+ */
+function detectMainSerializedBehindPanels(firstWorkAt: string | undefined, attempts: PanelAttemptTrace[]): boolean {
+  if (!firstWorkAt) return false;
+  const firstWorkMs = Date.parse(firstWorkAt);
+  if (!Number.isFinite(firstWorkMs)) return false;
+  for (const attempt of attempts) {
+    const terminal = attempt.status === "succeeded" || attempt.status === "failed" || attempt.status === "cancelled";
+    if (!terminal || !attempt.endedAt) continue;
+    const endedMs = Date.parse(attempt.endedAt);
+    if (Number.isFinite(endedMs) && firstWorkMs > endedMs) return true;
+  }
+  return false;
+}
+
+type NativeCandidateAssessment = {
+  logicalPanelIndex: number;
+  agentName: string;
+  modelId: string;
+  classification: import("../types.js").CandidateClassification;
+  evidence: import("../types.js").CandidateEvidence;
+  reportContent?: string;
+  reportPath?: string;
+  verification: import("../types.js").VerificationSummary;
+  result?: NativePanelResult;
+};
+
+async function buildNativeCandidateAssessments(
+  state: RunState,
+  panelResults: NativePanelResult[],
+): Promise<NativeCandidateAssessment[]> {
+  const candidateWorkspaces = state.speculative?.candidateWorkspaces ?? [];
+  const assessments: NativeCandidateAssessment[] = [];
   for (const agent of state.panelAgents) {
-    const result = panelResults.find((entry) => entry.agentName === agent.agentName) ?? panelResults.find((entry) => entry.modelId === agent.modelId);
-    if (!result?.content || result.error) continue;
-    if (state.panelMode === "candidate_build") {
-      const validation = validateCandidateOutput(result.content);
-      if (validation.status === "passed" || validation.status === "usable_with_warnings") {
-        usable += 1;
-      }
+    const result = panelResults.find((entry) => entry.agentName === agent.agentName)
+      ?? panelResults.find((entry) => entry.modelId === agent.modelId);
+    const workspace = candidateWorkspaces.find((entry) => entry.logicalPanelIndex === agent.panelIndex);
+    const priorTerminalStatus = latestPanelTerminalStatus(state.panelAttempts ?? [], agent.panelIndex);
+
+    if (!workspace) {
+      assessments.push({
+        logicalPanelIndex: agent.panelIndex,
+        agentName: agent.agentName,
+        modelId: agent.modelId,
+        classification: "missing",
+        evidence: {
+          workspaceExists: false,
+          workspaceSafe: false,
+          executionContextMatches: false,
+          sharedPromptHashMatches: false,
+          meaningfulChangedFiles: 0,
+          changedSourceFiles: 0,
+          changedTestFiles: 0,
+          changedConfigFiles: 0,
+          changedFiles: [],
+          verification: {},
+          priorTerminalStatus,
+          finalMessageFormat: result?.content ? "concise" : "missing",
+          warnings: ["candidate workspace assignment missing"],
+        },
+        verification: { typecheck: "not_run", test: "not_run", build: "not_run", commandsRun: [], notes: ["candidate workspace assignment missing"] },
+        result,
+      });
       continue;
     }
-    usable += 1;
+
+    const candidate = await classifyCandidateEvidence({
+      logicalPanelIndex: agent.panelIndex,
+      sourceWorkspace: state.sourceWorkspace,
+      expectedSharedPromptHash: state.sharedPanelPromptHash,
+      candidateWorkspacePath: workspace.workspacePath,
+      candidateBaselineManifestPath: workspace.manifestPath,
+      executionContextSourceWorkspacePath: agent.sourceWorkspacePath,
+      executionContextSharedTaskPath: agent.sharedTaskPath,
+      sourceSideReportPath: workspace.reportPath,
+      candidateLocalReportPath: workspace.candidateReportPath,
+      finalMessage: result?.content,
+      priorTerminalStatus,
+    });
+
+    let reportContent = candidate.reportContent;
+    let reportPath = candidate.reportPath;
+    if (!reportContent && (candidate.classification === "usable" || candidate.classification === "partial")) {
+      reportContent = renderDeterministicCandidateReport({
+        logicalPanelIndex: agent.panelIndex,
+        workspacePath: workspace.workspacePath,
+        evidence: candidate.evidence,
+        classification: candidate.classification,
+      });
+      reportPath = workspace.reportPath;
+      await writeArtifactFile(reportPath, `${reportContent}\n`);
+    }
+
+    assessments.push({
+      logicalPanelIndex: agent.panelIndex,
+      agentName: agent.agentName,
+      modelId: agent.modelId,
+      classification: candidate.classification,
+      evidence: {
+        ...candidate.evidence,
+        selectedReportPath: reportPath,
+      },
+      reportContent,
+      reportPath,
+      verification: candidate.verificationSummary,
+      result,
+    });
   }
-  return usable;
+  return assessments;
+}
+
+function latestPanelTerminalStatus(
+  attempts: PanelAttemptTrace[],
+  logicalPanelIndex: number,
+): "succeeded" | "failed" | "unknown" {
+  const attempt = attempts.filter((entry) => entry.logicalPanelIndex === logicalPanelIndex).slice(-1)[0];
+  if (!attempt) return "unknown";
+  if (attempt.status === "succeeded") return "succeeded";
+  if (attempt.status === "failed" || attempt.status === "cancelled" || attempt.status === "stalled") return "failed";
+  return "unknown";
+}
+
+function mapCandidateClassificationToValidationStatus(
+  classification: import("../types.js").CandidateClassification,
+): CandidateValidationStatus {
+  if (classification === "usable") return "passed";
+  if (classification === "partial") return "usable_with_warnings";
+  return "failed";
+}
+
+function mapCandidateClassificationToTraceStatus(
+  classification: import("../types.js").CandidateClassification,
+): SpeculativePanelCandidateTrace["status"] {
+  if (classification === "usable") return "usable";
+  if (classification === "partial") return "partial";
+  if (classification === "missing") return "failed";
+  return "excluded";
+}
+
+function judgeDecisionStatus(state: RunState, mergePatchContract: MergePatchContract | undefined): import("../types.js").SpeculativeParallelBuildTrace["judgeDecisionStatus"] {
+  if (!state.speculative?.judgeStartedAt) return "JUDGE_NOT_DISPATCHED_NO_QUORUM";
+  if (!state.judgeOutput && !mergePatchContract) return "JUDGE_PENDING";
+  if (!mergePatchContract) return "JUDGE_DISPATCHED_CONTRACT_INVALID";
+  return mergePatchContract.finalDecision;
+}
+
+/**
+ * Assemble a compact, deterministic judge-preflight manifest. Paths and
+ * lightweight summaries only — never full candidate source trees. Written
+ * incrementally as panels reach terminal/usable state so the judge can be
+ * dispatched with a lean navigational context instead of cold-starting.
+ */
+async function writeJudgePreflightManifest(
+  state: RunState,
+  panelResults: NativePanelResult[],
+  cwd: string,
+  traceDir?: string,
+): Promise<string> {
+  const candidates = state.speculative?.candidateWorkspaces ?? [];
+  const attempts = state.panelAttempts ?? [];
+  const assessments = await buildNativeCandidateAssessments(state, panelResults);
+  const entries = assessments.map((assessment) => {
+    const workspace = candidates.find((entry) => entry.logicalPanelIndex === assessment.logicalPanelIndex);
+    const attempt = attempts.filter((entry) => entry.logicalPanelIndex === assessment.logicalPanelIndex).slice(-1)[0];
+    return {
+      logicalPanelIndex: assessment.logicalPanelIndex,
+      agentName: assessment.agentName,
+      model: assessment.modelId,
+      candidatePath: workspace?.workspacePath,
+      reportPath: assessment.reportPath,
+      patchPath: workspace?.patchPath,
+      manifestPath: workspace?.manifestPath,
+      classification: assessment.classification,
+      verification: assessment.verification,
+      changedFiles: assessment.evidence.changedFiles,
+      finalMessageFormat: assessment.evidence.finalMessageFormat,
+      warnings: assessment.evidence.warnings,
+      terminalStatus: attempt?.status,
+      endedAt: attempt?.endedAt,
+      error: assessment.result?.error,
+      errorType: assessment.result?.errorType,
+    };
+  });
+  const manifest = {
+    runId: state.runId,
+    assembledAt: new Date().toISOString(),
+    taskArtifactPath: state.speculative?.sharedTaskPath,
+    sharedPanelPromptHash: state.sharedPanelPromptHash,
+    mainBaselineStatus: state.speculative?.mainBaseline?.status,
+    mainBaselineManifestPath: state.speculative?.mainBaselineManifestPath,
+    councilComparisonPath: councilComparisonArtifactPath(cwd, state.runId, traceDir),
+    requirementDecisionMatrixPath: requirementDecisionMatrixArtifactPath(cwd, state.runId, traceDir),
+    panels: entries,
+    note: "Compact navigational evidence only. Inspect candidate files selectively via the paths above; never inline full source trees.",
+  };
+  const manifestPath = judgeManifestArtifactPath(cwd, state.runId, traceDir);
+  await writeArtifactFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return manifestPath;
+}
+
+function computeUsablePanelCount(assessments: NativeCandidateAssessment[]): number {
+  return assessments.filter((entry) => entry.classification === "usable").length;
 }
 
 function upsertPanelResults(existing: NativePanelResult[], incoming: NativePanelResult[]): NativePanelResult[] {
@@ -864,6 +1063,12 @@ function buildAdvanceSpeculativeResult(state: RunState): import("../types.js").S
     preparedAt: state.speculative.preparedAt,
     candidatePreparationCompletedAt: state.speculative.candidatePreparationCompletedAt,
     judgeEligibleAt: state.speculative.judgeEligibleAt,
+    launchClockAnchorMs: state.speculative.launchClockAnchorMs,
+    panelLaunchSchedule: state.speculative.panelLaunchSchedule,
+    judgeManifestPath: state.speculative.judgeManifestPath,
+    activeSchedulerCapability: state.runtimeCapabilities?.visibleTaskDispatchVerified
+      ? "persisted_due_times_visible_dispatch"
+      : "persisted_due_times_parent_turn_required",
     pathResolution: state.speculative.pathResolution!,
     sharedTaskPath: state.speculative.sharedTaskPath,
     panelExecutionAssignments: state.speculative.panelExecutionAssignments,
@@ -896,6 +1101,24 @@ export async function nativeAdvance(
           workspacePath: state.speculative.sourceWorkspace,
           changedFiles: [],
           startedAt: input.mainBaselineStartedAt,
+          // Authorization marks the parent being permitted to begin real work;
+          // it is intentionally distinct from the first actual work marker.
+          startAuthorizedAt: input.mainBaselineStartedAt,
+        },
+      },
+    };
+  }
+
+  // Record the first real parent/main workspace operation. Never fabricated:
+  // only set when the orchestrator reports an actual first-work marker.
+  if (input.mainBaselineFirstWorkAt && state.speculative?.mainBaseline && !state.speculative.mainBaseline.firstWorkAt) {
+    state = {
+      ...state,
+      speculative: {
+        ...state.speculative,
+        mainBaseline: {
+          ...state.speculative.mainBaseline,
+          firstWorkAt: input.mainBaselineFirstWorkAt,
         },
       },
     };
@@ -929,11 +1152,31 @@ export async function nativeAdvance(
     };
   }
 
+  // Launch packet is ready (staging complete). Anchor the absolute fixed-delay
+  // stagger schedule exactly once, on the original launch clock. Panel 2/3
+  // planned dispatch derives only from this anchor, never from panel activity.
+  if (state.speculative && !state.speculative.panelLaunchSchedule && isSpeculativeStagingComplete(state)) {
+    const anchorMs = Date.now();
+    state = {
+      ...state,
+      speculative: {
+        ...state.speculative,
+        launchClockAnchorMs: anchorMs,
+        panelLaunchSchedule: buildPanelLaunchSchedule(anchorMs),
+      },
+    };
+  }
+
   const scheduler = new PanelScheduler(
     state.panelModelSpecs.map((spec) => spec.modelId),
     { capability: state.panelLivenessCapability ?? PANEL_LIVENESS_CAPABILITY },
   );
   scheduler.loadAttempts(state.panelAttempts ?? []);
+  scheduler.setLaunchSchedule(state.speculative?.panelLaunchSchedule);
+
+  const launchSchedule = state.speculative?.panelLaunchSchedule
+    ? state.speculative.panelLaunchSchedule.map((entry) => ({ ...entry }))
+    : undefined;
 
   for (const dispatch of input.panelDispatches ?? []) {
     const panelIndex = resolvePanelIndex(state, { logicalPanelIndex: dispatch.logicalPanelIndex });
@@ -956,6 +1199,16 @@ export async function nativeAdvance(
       void attempt;
     }
     scheduler.markWorkspacePrepared(panelIndex, dispatch.startedAt);
+    // Record actual dispatch timing against the persisted absolute schedule,
+    // capturing real skew between planned and actual dispatch (only for the
+    // original launch; same-slot retries keep the original schedule entry).
+    const scheduleEntry = launchSchedule?.find((entry) => entry.panelIndex === panelIndex);
+    if (scheduleEntry && scheduleEntry.dispatchAt === null) {
+      const dispatchedMs = dispatch.startedAt ? Date.parse(dispatch.startedAt) : Date.now();
+      scheduleEntry.dispatchRequestedAt = Date.now();
+      scheduleEntry.dispatchAt = dispatchedMs;
+      scheduleEntry.scheduleSkewMs = dispatchedMs - scheduleEntry.plannedDispatchAt;
+    }
   }
 
   for (const observation of input.panelObservations ?? []) {
@@ -1006,7 +1259,8 @@ export async function nativeAdvance(
     }
   }
 
-  const usablePanels = computeUsablePanelCount(state, panelResults);
+  const candidateAssessments = await buildNativeCandidateAssessments(state, panelResults);
+  const usablePanels = computeUsablePanelCount(candidateAssessments);
   const requiredPanels = state.minSuccessfulPanels ?? (state.requireAllPanels ? state.panelAgents.length : 2);
   const mainBaselineTerminal = isMainBaselineTerminal(state.speculative?.mainBaseline);
   const judgeEligible = mainBaselineTerminal && usablePanels >= requiredPanels;
@@ -1031,9 +1285,20 @@ export async function nativeAdvance(
     };
   }
 
+  const attemptsForViolation = scheduler.getAttempts();
+  // Hard orchestration violation: the main baseline must never begin its first
+  // real work after a panel has already produced a terminal result. Surfaced,
+  // never hidden behind a green test run.
+  const violations = new Set<import("../types.js").OrchestrationViolationCode>(
+    state.speculative?.orchestrationViolations ?? [],
+  );
+  if (detectMainSerializedBehindPanels(state.speculative?.mainBaseline?.firstWorkAt, attemptsForViolation)) {
+    violations.add("MAIN_BASELINE_SERIALIZED_BEHIND_PANELS");
+  }
+
   state = {
     ...state,
-    panelAttempts: scheduler.getAttempts(),
+    panelAttempts: attemptsForViolation,
     panelResults,
     runtimeCapabilities: state.runtimeCapabilities ?? buildRuntimeCapabilities(state.speculative?.parallelExecutionSupported ?? true),
     speculative: state.speculative
@@ -1042,9 +1307,36 @@ export async function nativeAdvance(
         judgeEligibleAt,
         frozenPanelIndexes: [...frozenPanelIndexes].sort((a, b) => a - b),
         lateExcludedPanelIndexes: [...lateExcludedPanelIndexes].sort((a, b) => a - b),
+        panelLaunchSchedule: launchSchedule ?? state.speculative.panelLaunchSchedule,
+        orchestrationViolations: [...violations],
+        judgeDispatchAt: input.judgeDispatched?.startedAt ?? state.speculative.judgeDispatchAt,
+        panelCandidateTrace: candidateAssessments.map((entry) => ({
+          logicalPanelIndex: entry.logicalPanelIndex,
+          model: entry.modelId,
+          workspacePath: state.speculative?.candidateWorkspaces.find((workspace) => workspace.logicalPanelIndex === entry.logicalPanelIndex)?.workspacePath ?? "",
+          reportPath: entry.reportPath,
+          patchPath: state.speculative?.candidateWorkspaces.find((workspace) => workspace.logicalPanelIndex === entry.logicalPanelIndex)?.patchPath,
+          status: mapCandidateClassificationToTraceStatus(entry.classification),
+          classification: entry.classification,
+          evidence: entry.evidence,
+          warnings: entry.evidence.warnings,
+          verification: entry.verification,
+        })),
       }
       : undefined,
   };
+
+  // Incremental judge-preflight manifest: assemble compact deterministic
+  // evidence as panels reach a terminal/usable state, before main completion
+  // where possible. Paths and summaries only — never full source trees.
+  if (state.speculative && panelResults.some((r) => r.content || r.error)) {
+    try {
+      const manifestPath = await writeJudgePreflightManifest(state, panelResults, cwd, options.traceDir);
+      state = { ...state, speculative: { ...state.speculative, judgeManifestPath: manifestPath } };
+    } catch {
+      // Manifest assembly is best-effort and must never block the lifecycle.
+    }
+  }
 
   const todoUpdates = buildAdvanceTodoPlan(state);
   await writeRunState(state, cwd, options.traceDir);
@@ -1119,9 +1411,10 @@ export async function nativeAdvance(
     };
   }
 
-  const action = scheduler.nextAction();
+  const action = scheduler.nextScheduledAction();
   if (action.type === "start_panel") {
     const agent = state.panelAgents[action.panelIndex - 1];
+    const scheduleEntry = launchSchedule?.find((entry) => entry.panelIndex === action.panelIndex);
     return {
       runId: state.runId,
       phase: state.sharedPanelPrompt ? "panel_execution" : "preparing_panels",
@@ -1130,6 +1423,12 @@ export async function nativeAdvance(
         logicalPanelIndex: action.panelIndex,
         attempt: action.attempt,
         startReason: action.reason,
+        launchReason: action.reason === "recovery_rerun"
+          ? "recovery_rerun"
+          : action.reason === "initial_immediate"
+            ? "initial_immediate"
+            : "scheduled_delay",
+        plannedDispatchAt: scheduleEntry?.plannedDispatchAt,
         agentName: agent?.agentName ?? `fusion-panel-${action.panelIndex}`,
         modelId: agent?.modelId ?? "",
         prompt: state.buildStrategy === "speculative_parallel_build"
@@ -1225,7 +1524,7 @@ export async function nativeCollect(
   }
   const config = getDefaultFusionConfig();
   const mergedPanelResults = upsertPanelResults(state.panelResults ?? [], input.panelResults ?? []);
-  const panelResponses = buildPanelResponsesFromNativeResults(state, mergedPanelResults, config);
+  const panelResponses = await buildPanelResponsesFromNativeResults(state, mergedPanelResults, config);
   const panelAttempts = input.panelAttempts ?? state.panelAttempts ?? [];
   const panelLivenessCapability = state.panelLivenessCapability ?? PANEL_LIVENESS_CAPABILITY;
   const quorumInput = {
@@ -1276,7 +1575,7 @@ export async function nativeCollect(
     // workspace; this copies those reports source-side without fabricating any.
     await collectCandidateReports(state.speculative.candidateWorkspaces);
 
-    const panelCandidateTrace = buildPanelCandidateTrace(state, panelResponses, state.speculative.candidateWorkspaces);
+    const panelCandidateTrace = await buildPanelCandidateTrace(state, panelResponses, state.speculative.candidateWorkspaces, mergedPanelResults);
     const overlapObserved = computeOverlapObserved(mainBaseline, panelCandidateTrace, panelAttempts);
     const overlapDurationMs = computeOverlapDurationMs(mainBaseline, panelAttempts);
 
@@ -1432,34 +1731,41 @@ export async function nativeCollect(
  * candidate workspace info. Each candidate is marked usable/partial/failed
  * based on panel success and candidate validation status.
  */
-function buildPanelCandidateTrace(
+async function buildPanelCandidateTrace(
   state: RunState,
   panelResponses: PanelResponse[],
   candidateWorkspaces: CandidateWorkspaceInfo[],
-): SpeculativePanelCandidateTrace[] {
+  panelResults: NativePanelResult[],
+): Promise<SpeculativePanelCandidateTrace[]> {
+  void panelResponses;
+  const assessments = await buildNativeCandidateAssessments(state, panelResults);
   return candidateWorkspaces.map((ws) => {
-    const response = panelResponses[ws.logicalPanelIndex - 1];
-    let status: SpeculativePanelCandidateTrace["status"] = "queued";
-    if (response) {
-      if (!response.success) {
-        status = "failed";
-      } else if (response.candidateValidationStatus === "passed") {
-        status = "usable";
-      } else if (response.candidateValidationStatus === "usable_with_warnings") {
-        status = "partial";
-      } else if (response.candidateValidationStatus === "failed") {
-        status = "excluded";
-      } else {
-        status = "usable";
-      }
-    }
+    const assessment = assessments.find((entry) => entry.logicalPanelIndex === ws.logicalPanelIndex);
     return {
       logicalPanelIndex: ws.logicalPanelIndex,
       model: state.panelModelSpecs[ws.logicalPanelIndex - 1]?.modelId ?? "",
       workspacePath: ws.workspacePath,
-      reportPath: ws.reportPath,
+      reportPath: assessment?.reportPath ?? ws.reportPath,
       patchPath: ws.patchPath,
-      status,
+      status: mapCandidateClassificationToTraceStatus(assessment?.classification ?? "missing"),
+      classification: assessment?.classification ?? "missing",
+      evidence: assessment?.evidence ?? {
+        workspaceExists: false,
+        workspaceSafe: false,
+        executionContextMatches: false,
+        sharedPromptHashMatches: false,
+        meaningfulChangedFiles: 0,
+        changedSourceFiles: 0,
+        changedTestFiles: 0,
+        changedConfigFiles: 0,
+        changedFiles: [],
+        verification: {},
+        priorTerminalStatus: "unknown",
+        finalMessageFormat: "missing",
+        warnings: ["candidate assessment unavailable"],
+      },
+      warnings: assessment?.evidence.warnings ?? ["candidate assessment unavailable"],
+      verification: assessment?.verification,
     };
   });
 }
@@ -1554,9 +1860,15 @@ export async function nativeRecordMainBaseline(
     }
   }
 
+  const terminal = mainBaseline.status === "passed" || mainBaseline.status === "failed" || mainBaseline.status === "blocked";
   const recorded: MainBaselineTrace = {
     ...mainBaseline,
     startedAt: mainBaseline.startedAt ?? state.speculative.mainBaseline?.startedAt,
+    startAuthorizedAt: state.speculative.mainBaseline?.startAuthorizedAt ?? mainBaseline.startAuthorizedAt,
+    firstWorkAt: state.speculative.mainBaseline?.firstWorkAt ?? mainBaseline.firstWorkAt,
+    terminalAt: terminal
+      ? (state.speculative.mainBaseline?.terminalAt ?? mainBaseline.completedAt ?? new Date().toISOString())
+      : state.speculative.mainBaseline?.terminalAt,
     workspacePath: mainBaseline.workspacePath ?? state.speculative.sourceWorkspace,
     changedFiles,
     manifestPath: mainBaselineManifestPath,
@@ -1671,7 +1983,54 @@ export async function nativeFinalize(
   let mergePatchDecision: import("../types.js").MergePatchDecision | undefined;
   let speculativeFinalize: import("../types.js").SpeculativeFinalizeResult | undefined;
   if (isSpeculative) {
-    mergePatchContract = parseMergePatchContract(input.judgeOutput);
+    const parsedContract = parseMergePatchContract(input.judgeOutput);
+    if (!hasValidMergePatchContract(parsedContract) || !parsedContract.finalDecision) {
+      const message = "Judge returned an invalid Merge Patch Contract; final patch decision was missing or unsupported.";
+      const trace: FusionRunTrace = {
+        ...baseTrace,
+        judge: {
+          modelId: state.judgeModelSpec.modelId,
+          success: false,
+          error: message,
+          elapsedMs: judgeElapsedMs,
+          sessionId: input.judgeSessionId,
+          reasoningEffort: state.judgeModelSpec.reasoningEffort,
+          reasoningEffortApplied: getReasoningEffortApplication(state.judgeModelSpec),
+          rawModelSpec: state.judgeModelSpec.raw,
+        },
+        errors: [message],
+      };
+      await writeRunArtifacts({
+        runId: state.runId,
+        cwd,
+        traceDir: traceOptions.traceDir,
+        task: state.task,
+        mode: state.mode,
+        panelMode: state.panelMode,
+        command: state.command,
+        contractGate: state.contractGate,
+        context: state.context,
+        panelModels: state.panelModelSpecs.map((spec) => spec.modelId),
+        judgeModel: state.judgeModelSpec.modelId,
+        panelResponses: panel,
+        panelPrompts: state.panelModelSpecs.map(() => state.sharedPanelPrompt),
+        judgePrompt: state.judgePrompt,
+        judgeOutput: input.judgeOutput,
+        trace,
+      });
+      return {
+        runId: state.runId,
+        executionMode: NATIVE_EXECUTION_MODE,
+        success: false,
+        error: message,
+        artifactDir,
+        councilResult: failureCouncilResult(state, message),
+        finalGuidance: message,
+        trace,
+        traceSummary: formatLatestTraceSummary(trace),
+      };
+    }
+    mergePatchContract = parsedContract;
     mergePatchDecision = mergePatchContract.finalDecision;
     mergePatchContractPath = mergePatchContractArtifactPath(cwd, state.runId, traceOptions.traceDir);
     if (state.traceOptions.saveRunArtifacts !== false) {
@@ -1809,18 +2168,19 @@ function buildCouncilResultFromMergePatchContract(
   judgeOutput: string,
 ): CouncilResult {
   const approved = selectApprovedPatchItems(contract);
+  const finalDecision = contract.finalDecision ?? "MAIN_BUILD_BLOCKED";
   return {
     mode: state.mode,
     panelMode: state.panelMode,
     buildStrategy: state.buildStrategy,
-    decision: contract.finalDecision === "MAIN_BUILD_BLOCKED" ? "do_not_implement" : "implement",
-    summary: `Merge Patch Contract: ${contract.finalDecision} (${approved.blockers.length} blockers, ${approved.mustFix.length} must-fix, ${approved.safeAdditions.length} safe additions, ${approved.rejected.length} rejected)`,
+    decision: finalDecision === "MAIN_BUILD_BLOCKED" ? "do_not_implement" : "implement",
+    summary: `Merge Patch Contract: ${finalDecision} (${approved.blockers.length} blockers, ${approved.mustFix.length} must-fix, ${approved.safeAdditions.length} safe additions, ${approved.rejected.length} rejected)`,
     consensus: contract.mainStrengthsToPreserve,
     contradictions: contract.rejectedIdeas.map((r) => r.idea),
     uniqueInsights: contract.adoptedInsights.map((i) => i.idea),
     risks: contract.gaps.filter((g) => g.severity !== "REJECTED").map((g) => g.literalRequirement),
     missingConsiderations: contract.mainBaselineBlockers,
-    finalRecommendation: contract.finalDecision,
+    finalRecommendation: finalDecision,
     requirementChecklist: contract.gaps.filter((g) => g.severity === "BLOCKER" || g.severity === "MUST_FIX").map((g) => g.literalRequirement),
     safeCompatibilityAdditions: contract.gaps.filter((g) => g.severity === "SAFE_ADDITION").map((g) => g.literalRequirement),
     optionalNiceties: [],
@@ -1864,6 +2224,11 @@ function buildSpeculativeTrace(
     runtimeCapabilities: state.runtimeCapabilities,
     isolationCapability: spec.isolationCapability,
     pathResolution: spec.pathResolution,
+    launchClockAnchorMs: spec.launchClockAnchorMs,
+    panelLaunchSchedule: spec.panelLaunchSchedule,
+    activeSchedulerCapability: state.runtimeCapabilities?.visibleTaskDispatchVerified
+      ? "persisted_due_times_visible_dispatch"
+      : "persisted_due_times_parent_turn_required",
     panelExecutionAssignments: spec.panelExecutionAssignments,
     mainBaseline: spec.mainBaseline ?? {
       status: "blocked",
@@ -1871,13 +2236,25 @@ function buildSpeculativeTrace(
       changedFiles: [],
     },
     panelCandidates: spec.panelCandidateTrace ?? [],
+    judgeManifestPath: spec.judgeManifestPath,
     judgeEligibleAt: spec.judgeEligibleAt,
+    judgeDispatchAt: spec.judgeDispatchAt,
     judgeStartedAt: spec.judgeStartedAt,
     judgeCompletedAt: spec.judgeCompletedAt,
+    judgeFirstCredibleActivityAt: spec.judgeFirstCredibleActivityAt,
+    judgeLastCredibleActivityAt: spec.judgeLastCredibleActivityAt,
+    judgeSuspectedStalledAt: spec.judgeSuspectedStalledAt,
+    judgeTerminalAt: spec.judgeTerminalAt,
+    judgeAttempt: spec.judgeAttempt,
+    judgeRetryScheduledAt: spec.judgeRetryScheduledAt,
+    judgeDispatched: Boolean(spec.judgeStartedAt),
+    judgeTerminal: Boolean(spec.judgeCompletedAt),
+    judgeContractValid: Boolean(mergePatchContract && mergePatchDecision),
+    judgeDecisionStatus: judgeDecisionStatus(state, mergePatchContract),
     frozenPanelIndexes: spec.frozenPanelIndexes,
     lateExcludedPanelIndexes: spec.lateExcludedPanelIndexes,
-    mergePatchContractPath,
-    mergePatchDecision,
+    mergePatchContractPath: mergePatchContract ? mergePatchContractPath : undefined,
+    mergePatchDecision: mergePatchContract ? mergePatchDecision : undefined,
     appliedPatchItems: spec.appliedPatchItems,
   };
 }
@@ -2143,15 +2520,19 @@ export async function nativeFinalizeAudit(
   };
 }
 
-function buildPanelResponsesFromNativeResults(
+async function buildPanelResponsesFromNativeResults(
   state: RunState,
   results: NativePanelResult[],
   config: FusionCouncilConfig,
-): PanelResponse[] {
+): Promise<PanelResponse[]> {
+  const candidateAssessments = state.panelMode === "candidate_build"
+    ? await buildNativeCandidateAssessments(state, results)
+    : [];
   return state.panelAgents.map((agent) => {
     const result = results.find((entry) => entry.agentName === agent.agentName) ??
       results.find((entry) => entry.modelId === agent.modelId) ??
       results[agent.panelIndex - 1];
+    const candidateAssessment = candidateAssessments.find((entry) => entry.logicalPanelIndex === agent.panelIndex);
     const modelId = agent.modelId;
     const provider = providerLabelForModel(modelId, config, NATIVE_RUNNER);
     const spec = state.panelModelSpecs[agent.panelIndex - 1];
@@ -2219,8 +2600,9 @@ function buildPanelResponsesFromNativeResults(
     }
 
     if (state.panelMode === "candidate_build") {
-      const validation = validateCandidateOutput(content);
-      const success = validation.status !== "failed";
+      const classification = candidateAssessment?.classification ?? "invalid";
+      const success = classification === "usable" || classification === "partial";
+      const validationStatus = mapCandidateClassificationToValidationStatus(classification);
       return {
         modelId,
         provider,
@@ -2231,10 +2613,10 @@ function buildPanelResponsesFromNativeResults(
         prompt: state.sharedPanelPrompt,
         repairAttempted: false,
         candidateValidationPassed: success,
-        candidateValidationStatus: validation.status,
-        candidateValidationScore: validation.score,
-        candidateValidationWarnings: validation.warnings,
-        candidateValidationMissingItems: validation.missingSections,
+        candidateValidationStatus: validationStatus,
+        candidateValidationScore: candidateAssessment?.evidence.meaningfulChangedFiles ?? 0,
+        candidateValidationWarnings: candidateAssessment?.evidence.warnings ?? [],
+        candidateValidationMissingItems: validationStatus === "failed" ? [candidateAssessment?.result?.error ?? candidateAssessment?.evidence.warnings[0] ?? "candidate invalid"] : [],
         sessionId: result.sessionId,
         ...identity,
         ...effortFields,

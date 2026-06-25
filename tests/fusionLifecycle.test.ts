@@ -7,7 +7,7 @@ import fusionCouncilPlugin from "../src/plugin.js";
 import { assertValidFusionRunId, isValidFusionRunId } from "../src/native/runLocator.js";
 import { nativeAdvance, nativePrepare, nativeCollect, nativeFinalize, nativeRecordMainBaseline } from "../src/native/nativeCouncil.js";
 import { loadRunState, writeRunState } from "../src/native/runState.js";
-import { completeCandidate } from "./fixtures/candidates.js";
+import { completeCandidate, conciseCompletedCandidate } from "./fixtures/candidates.js";
 import { DEFAULT_TRACE_DIR } from "../src/trace/runTrace.js";
 
 type AnyContext = {
@@ -39,6 +39,15 @@ async function getFusionNativeTool() {
   const fusionNative = plugin.tool?.fusion_native;
   if (!fusionNative) throw new Error("fusion_native tool not exported by plugin");
   return fusionNative;
+}
+
+async function mutateCandidateWorkspace(
+  workspacePath: string,
+  suffix: string,
+) {
+  const srcDir = path.join(workspacePath, "src");
+  await mkdir(srcDir, { recursive: true });
+  await writeFile(path.join(srcDir, "index.ts"), `export const value = ${JSON.stringify(suffix)};\n`, "utf8");
 }
 
 const PASS_SCRIPTS = {
@@ -277,7 +286,7 @@ describe("fusion advance lifecycle", () => {
     await nativeAdvance(
       {
         runId: prepare.runId,
-        panelDispatches: [{ logicalPanelIndex: 1, startReason: "cascade_activity", startedAt: dispatchAt }],
+        panelDispatches: [{ logicalPanelIndex: 1, startReason: "initial_immediate", startedAt: dispatchAt }],
       },
       { cwd: sourceWorkspace },
     );
@@ -288,14 +297,14 @@ describe("fusion advance lifecycle", () => {
     expect(Date.parse(firstPanelDispatchAt!)).toBeGreaterThanOrEqual(mainStartedAt);
   });
 
-  test("panel 2 starts immediately after panel 1 credible activity", async () => {
+  test("panel 2/3 launch on the absolute schedule, not panel 1 activity", async () => {
     await mkdir(path.join(sourceWorkspace, "src"), { recursive: true });
     await writeFile(path.join(sourceWorkspace, "package.json"), JSON.stringify({ name: "advance-cascade", scripts: PASS_SCRIPTS }), "utf8");
     await writeFile(path.join(sourceWorkspace, "src", "index.ts"), "export const value = 1;\n", "utf8");
 
     const prepare = await nativePrepare(
       {
-        task: "Cascade test.",
+        task: "Absolute schedule test.",
         mode: "build_prompt",
         panelMode: "candidate_build",
         buildStrategy: "speculative_parallel_build",
@@ -306,28 +315,52 @@ describe("fusion advance lifecycle", () => {
 
     const first = await nativeAdvance({ runId: prepare.runId }, { cwd: sourceWorkspace });
     expect(first.nextAction.type).toBe("start_panel");
+    expect(first.nextAction.logicalPanelIndex).toBe(1);
+
+    // The persisted absolute schedule anchors panel 2 at +60s and panel 3 at +120s.
+    const scheduled = await loadRunState(sourceWorkspace, prepare.runId);
+    const schedule = scheduled.speculative!.panelLaunchSchedule!;
+    expect(schedule).toHaveLength(3);
+    const anchor = scheduled.speculative!.launchClockAnchorMs!;
+    expect(schedule[0].plannedDispatchAt).toBe(anchor);
+    expect(schedule[1].plannedDispatchAt).toBe(anchor + 60_000);
+    expect(schedule[2].plannedDispatchAt).toBe(anchor + 120_000);
+
+    // Dispatch panel 1 and feed real credible activity. Panel 2 must NOT launch
+    // early just because panel 1 is active — it is gated only by the clock.
     await nativeAdvance(
       {
         runId: prepare.runId,
-        panelDispatches: [{ logicalPanelIndex: 1, startReason: "cascade_activity", startedAt: new Date().toISOString() }],
+        panelDispatches: [{ logicalPanelIndex: 1, startReason: "initial_immediate", startedAt: new Date().toISOString() }],
         panelObservations: [{ logicalPanelIndex: 1, source: "candidate_output_write", observedAt: new Date().toISOString() }],
       },
       { cwd: sourceWorkspace },
     );
+    const beforeDue = await nativeAdvance({ runId: prepare.runId }, { cwd: sourceWorkspace });
+    expect(beforeDue.nextAction.type).toBe("wait");
+
+    // Simulate the schedule clock reaching panel 2's window while panel 1 stays
+    // completely silent (no further activity). Panel 2 still launches on time.
+    const due = await loadRunState(sourceWorkspace, prepare.runId);
+    const past = Date.now() - 5_000;
+    due.speculative!.panelLaunchSchedule = due.speculative!.panelLaunchSchedule!.map((entry) =>
+      entry.panelIndex === 2 ? { ...entry, plannedDispatchAt: past } : entry);
+    await writeRunState(due, sourceWorkspace);
+
     const second = await nativeAdvance({ runId: prepare.runId }, { cwd: sourceWorkspace });
     expect(second.nextAction.type).toBe("start_panel");
     expect(second.nextAction.logicalPanelIndex).toBe(2);
-    expect(second.nextAction.startReason).toBe("cascade_activity");
+    expect(second.nextAction.launchReason).toBe("scheduled_delay");
   });
 
-  test("panel 3 bypasses a silent panel 2 through the fallback gate without creating panel 4", async () => {
+  test("panel 3 launches on schedule even when panel 2 is silent/stalled, without creating panel 4", async () => {
     await mkdir(path.join(sourceWorkspace, "src"), { recursive: true });
     await writeFile(path.join(sourceWorkspace, "package.json"), JSON.stringify({ name: "advance-bypass", scripts: PASS_SCRIPTS }), "utf8");
     await writeFile(path.join(sourceWorkspace, "src", "index.ts"), "export const value = 1;\n", "utf8");
 
     const prepare = await nativePrepare(
       {
-        task: "Bypass silent panel 2.",
+        task: "Panel 3 schedule independence.",
         mode: "build_prompt",
         panelMode: "candidate_build",
         buildStrategy: "speculative_parallel_build",
@@ -336,28 +369,31 @@ describe("fusion advance lifecycle", () => {
       { cwd: sourceWorkspace },
     );
 
+    // Dispatch panels 1 and 2; both stay silent (no observations).
+    await nativeAdvance({ runId: prepare.runId }, { cwd: sourceWorkspace });
     await nativeAdvance(
       {
         runId: prepare.runId,
         panelDispatches: [
-          { logicalPanelIndex: 1, startReason: "cascade_activity", startedAt: new Date(Date.now() - 120_000).toISOString() },
-          { logicalPanelIndex: 2, startReason: "start_gate_timeout", startedAt: new Date(Date.now() - 120_000).toISOString() },
+          { logicalPanelIndex: 1, startReason: "initial_immediate", startedAt: new Date(Date.now() - 120_000).toISOString() },
+          { logicalPanelIndex: 2, startReason: "scheduled_delay", startedAt: new Date(Date.now() - 120_000).toISOString() },
         ],
       },
       { cwd: sourceWorkspace },
     );
 
+    // Advance the schedule clock to panel 3's window. Panel 2 has no output and
+    // is suspected stalled, but panel 3 launches purely on its scheduled time.
     const state = await loadRunState(sourceWorkspace, prepare.runId);
-    state.panelAttempts = (state.panelAttempts ?? []).map((attempt) =>
-      attempt.logicalPanelIndex === 2
-        ? { ...attempt, startedAt: new Date(Date.now() - 120_000).toISOString(), dispatchAt: new Date(Date.now() - 120_000).toISOString() }
-        : attempt);
+    const past = Date.now() - 5_000;
+    state.speculative!.panelLaunchSchedule = state.speculative!.panelLaunchSchedule!.map((entry) =>
+      entry.panelIndex === 3 ? { ...entry, plannedDispatchAt: past } : entry);
     await writeRunState(state, sourceWorkspace);
 
     const next = await nativeAdvance({ runId: prepare.runId }, { cwd: sourceWorkspace });
     expect(next.nextAction.type).toBe("start_panel");
     expect(next.nextAction.logicalPanelIndex).toBe(3);
-    expect(next.nextAction.startReason).toBe("start_gate_timeout");
+    expect(next.nextAction.launchReason).toBe("scheduled_delay");
     expect(next.panelAttempts.every((attempt) => attempt.logicalPanelIndex <= 3)).toBe(true);
   });
 
@@ -379,6 +415,12 @@ describe("fusion advance lifecycle", () => {
     );
 
     await nativeAdvance({ runId: prepare.runId, mainBaselineStartedAt: new Date().toISOString() }, { cwd: sourceWorkspace });
+    await nativeAdvance({ runId: prepare.runId }, { cwd: sourceWorkspace });
+    const stateAfterPrepare = await loadRunState(sourceWorkspace, prepare.runId);
+    await Promise.all(
+      (stateAfterPrepare.speculative?.candidateWorkspaces ?? []).slice(0, 2).map((workspace, index) =>
+        mutateCandidateWorkspace(workspace.workspacePath, `candidate-${index + 1}`)),
+    );
     await nativeRecordMainBaseline(
       {
         runId: prepare.runId,
@@ -407,5 +449,60 @@ describe("fusion advance lifecycle", () => {
     expect(advance.nextAction.type).toBe("call_collect");
     expect(advance.judgeEligible).toBe(true);
     expect(advance.judgeEligibleAt).toBeTruthy();
+  });
+
+  test("two usable concise-output candidates satisfy quorum and preserve judge dispatch eligibility", async () => {
+    await mkdir(path.join(sourceWorkspace, "src"), { recursive: true });
+    await writeFile(path.join(sourceWorkspace, "package.json"), JSON.stringify({ name: "advance-concise", scripts: PASS_SCRIPTS }), "utf8");
+    await writeFile(path.join(sourceWorkspace, "src", "index.ts"), "export const value = 1;\n", "utf8");
+
+    const prepare = await nativePrepare(
+      {
+        task: "Concise quorum test.",
+        mode: "build_prompt",
+        panelMode: "candidate_build",
+        buildStrategy: "speculative_parallel_build",
+        command: "fusion-build",
+        minSuccessfulPanels: 2,
+      },
+      { cwd: sourceWorkspace },
+    );
+
+    await nativeAdvance({ runId: prepare.runId, mainBaselineStartedAt: new Date().toISOString() }, { cwd: sourceWorkspace });
+    await nativeAdvance({ runId: prepare.runId }, { cwd: sourceWorkspace });
+    const state = await loadRunState(sourceWorkspace, prepare.runId);
+    await Promise.all(
+      (state.speculative?.candidateWorkspaces ?? []).slice(0, 2).map((workspace, index) =>
+        mutateCandidateWorkspace(workspace.workspacePath, `concise-${index + 1}`)),
+    );
+    await nativeRecordMainBaseline(
+      {
+        runId: prepare.runId,
+        mainBaseline: {
+          status: "passed",
+          workspacePath: sourceWorkspace,
+          changedFiles: ["src/index.ts"],
+          completedAt: new Date().toISOString(),
+          verification: { typecheck: "pass", test: "pass", build: "pass" },
+        },
+      },
+      { cwd: sourceWorkspace },
+    );
+
+    const advance = await nativeAdvance(
+      {
+        runId: prepare.runId,
+        panelResults: [
+          { agentName: "fusion-panel-1", modelId: prepare.panelAgents[0].modelId, content: conciseCompletedCandidate },
+          { agentName: "fusion-panel-2", modelId: prepare.panelAgents[1].modelId, content: conciseCompletedCandidate },
+        ],
+      },
+      { cwd: sourceWorkspace },
+    );
+
+    expect(advance.nextAction.type).toBe("call_collect");
+    expect(advance.judgeEligible).toBe(true);
+    const updated = await loadRunState(sourceWorkspace, prepare.runId);
+    expect(updated.speculative?.judgeManifestPath).toBeTruthy();
   });
 });

@@ -1,7 +1,6 @@
 import { access, copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getDefaultFusionConfig } from "../config.js";
-import { validateCandidateOutput } from "../council/candidateValidation.js";
 import { buildQuorum, quorumMeetsRequirement } from "../council/runCouncil.js";
 import { resolveModels } from "../modelConfig.js";
 import { createRecoveredRunId, DEFAULT_TRACE_DIR, resolveTraceRoot } from "../trace/runTrace.js";
@@ -58,6 +57,7 @@ import {
 } from "./runState.js";
 import { createCandidateWorkspaces, honestIsolationCapability } from "./candidateWorkspace.js";
 import { assertNoUnresolvedPlaceholders } from "./placeholderGuard.js";
+import { assertValidFusionRunId, assertValidFusionRunLocator, resolveRunLocatorPaths } from "./runLocator.js";
 import {
   assertPanelRedispatchIsRequired,
   buildRecoveryClassificationTrace,
@@ -256,6 +256,63 @@ async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+async function loadExplicitSpeculativeAttempt(
+  cwd: string,
+  runId: string,
+  traceDir: string | undefined,
+): Promise<{ attempt: OrphanAttemptDescriptor; state: RunState; artifactDir: string; candidateWorkspaces: CandidateWorkspaceInfo[] }> {
+  assertValidFusionRunId(runId);
+  const locator = resolveRunLocatorPaths(cwd, runId, traceDir);
+  const state = await assertValidFusionRunLocator({
+    runId,
+    traceArtifactDir: locator.traceArtifactDir,
+    runStatePath: locator.runStatePath,
+    expectedSourceWorkspace: cwd,
+  });
+  if (state.buildStrategy !== "speculative_parallel_build" || !state.speculative) {
+    throw new FusionCouncilError("FUSION_RESUME_RUN_NOT_SPECULATIVE: selected run is not a speculative /fusion-build run");
+  }
+  if (!state.speculative.sharedTaskPath && !state.sharedPanelPromptPath) {
+    throw new FusionCouncilError("FUSION_RESUME_SHARED_TASK_MISSING: selected run does not have a shared task artifact path");
+  }
+  const sharedPromptPath = state.speculative.sharedTaskPath ?? state.sharedPanelPromptPath;
+  const sharedPromptText = await readFile(sharedPromptPath, "utf8");
+  const panelContexts: OrphanAttemptDescriptor["panelContexts"] = [];
+  for (const assignment of state.speculative.panelExecutionAssignments ?? []) {
+    if (!(await pathExists(assignment.executionContextPath))) continue;
+    const text = await readFile(assignment.executionContextPath, "utf8");
+    const parsed = parsePanelExecutionContext(text);
+    if (!parsed) continue;
+    panelContexts.push({ ...parsed, artifactPath: assignment.executionContextPath });
+  }
+  if (panelContexts.length === 0) {
+    throw new FusionCouncilError("FUSION_RESUME_PANEL_CONTEXTS_MISSING: selected run has no valid panel execution context artifacts");
+  }
+  const baselineManifest = await loadBaselineManifest(state.speculative.sourceBaselineManifestPath);
+  if (!baselineManifest) {
+    throw new FusionCouncilError("FUSION_RESUME_BASELINE_INVALID: selected run baseline manifest is unreadable");
+  }
+  return {
+    attempt: {
+      orphanSourceArtifactRoot: locator.traceArtifactDir,
+      sourceWorkspace: cwd,
+      sharedPromptPath,
+      sharedPromptHash: state.sharedPanelPromptHash,
+      sharedPromptText,
+      baselineManifestPath: state.speculative.sourceBaselineManifestPath,
+      baselineManifest,
+      taskText: state.task,
+      panelContexts,
+      externalStagingDir: state.speculative.externalCandidateStagingDir,
+      recoveredFromRunId: runId,
+      panelAttempts: state.panelAttempts ?? [],
+    },
+    state,
+    artifactDir: locator.traceArtifactDir,
+    candidateWorkspaces: state.speculative.candidateWorkspaces,
+  };
+}
+
 function resolveTraceOptions(trace?: FusionTraceOptions): FusionTraceOptions {
   return {
     saveRunArtifacts: trace?.saveRunArtifacts ?? true,
@@ -315,28 +372,29 @@ export async function nativeResume(
   const cwd = options.cwd;
   const traceOptions = resolveTraceOptions(input.trace);
   const traceDir = traceOptions.traceDir;
-  const discovery = await discoverOrphanSpeculativeAttempt(cwd);
+  const explicit = input.runId
+    ? await loadExplicitSpeculativeAttempt(cwd, input.runId, traceDir)
+    : undefined;
+  const discovery = explicit ? undefined : await discoverOrphanSpeculativeAttempt(cwd);
 
-  if (discovery.status === "not_found") {
+  if (!explicit && discovery?.status === "not_found") {
     throw new FusionCouncilError("FUSION_RESUME_NOT_FOUND: no orphaned speculative run matched the current workspace");
   }
-  if (discovery.status === "ambiguous") {
+  if (!explicit && discovery?.status === "ambiguous") {
     throw new FusionCouncilError(
       `FUSION_RESUME_AMBIGUOUS: multiple orphaned speculative attempts matched (${discovery.candidates.join(", ")})`,
     );
   }
 
-  const attempt = discovery.attempt;
+  const attempt = explicit?.attempt ?? (discovery && discovery.status === "found" ? discovery.attempt : undefined);
+  if (!attempt) {
+    throw new FusionCouncilError("FUSION_RESUME_NOT_FOUND: no resumable speculative run matched the current workspace");
+  }
   const config = getDefaultFusionConfig();
   const resolved = await resolveModels({ panelModels: input.panelModels, judgeModel: input.judgeModel });
   const panelModelSpecs = resolved.panelModels.slice(0, 3);
   while (panelModelSpecs.length < 3) panelModelSpecs.push(panelModelSpecs[0]!);
   const judgeModelSpec = resolved.judgeModel;
-
-  const currentBaseline = await loadBaselineManifest(attempt.baselineManifestPath);
-  if (!currentBaseline) {
-    throw new FusionCouncilError("FUSION_RESUME_BASELINE_INVALID: orphan baseline manifest is unreadable");
-  }
 
   if (path.resolve(attempt.baselineManifest.sourcePath) !== path.resolve(cwd)) {
     throw new FusionCouncilError(
@@ -344,25 +402,36 @@ export async function nativeResume(
     );
   }
 
-  const workspaceDiff = await diffAgainstBaseline(cwd, attempt.baselineManifest);
-  const mainVerification = await runWorkspaceVerification(cwd);
-  if (mainVerification.typecheck === "fail" || mainVerification.test === "fail" || mainVerification.build === "fail") {
+  const workspaceDiff = explicit?.state.speculative?.mainBaseline
+    ? {
+      changedFiles: explicit.state.speculative.mainBaseline.changedFiles,
+      addedFiles: [] as string[],
+      removedFiles: [] as string[],
+    }
+    : await diffAgainstBaseline(cwd, attempt.baselineManifest);
+  const mainVerification = explicit?.state.speculative?.mainBaseline?.verification ?? await runWorkspaceVerification(cwd);
+  if ((mainVerification.typecheck === "fail" || mainVerification.test === "fail" || mainVerification.build === "fail") && !explicit) {
     throw new FusionCouncilError("FUSION_RESUME_BASELINE_VERIFICATION_FAILED: current main workspace verification failed");
   }
 
-  const runId = createRecoveredRunId();
-  const recoveredArtifactDir = path.join(resolveTraceRoot(cwd, traceDir), runId);
+  const runId = explicit?.state.runId ?? createRecoveredRunId();
+  const recoveredArtifactDir = explicit?.artifactDir ?? path.join(resolveTraceRoot(cwd, traceDir), runId);
   if (path.resolve(recoveredArtifactDir) === path.resolve(cwd)) {
     throw new FusionCouncilError("FUSION_RESUME_LOCATOR_INVALID: recovered trace directory must not equal source workspace");
   }
 
-  const { sharedPromptPath, panelAssignments: recoveredWorkspaces } = await migrateOrphanArtifacts(
-    attempt,
-    recoveredArtifactDir,
-    runId,
-    traceDir,
-    cwd,
-  );
+  const { sharedPromptPath, panelAssignments: recoveredWorkspaces } = explicit
+    ? {
+      sharedPromptPath: explicit.attempt.sharedPromptPath,
+      panelAssignments: explicit.candidateWorkspaces,
+    }
+    : await migrateOrphanArtifacts(
+      attempt,
+      recoveredArtifactDir,
+      runId,
+      traceDir,
+      cwd,
+    );
 
   const recoveryAttempt: RecoveryAttemptContext = {
     sourceWorkspace: attempt.sourceWorkspace,
@@ -562,7 +631,7 @@ export async function nativeResume(
   const sharedPanelPrompt = attempt.sharedPromptText;
 
   const recoveryStartedAt = new Date().toISOString();
-  const mainBaseline: MainBaselineTrace = {
+  const mainBaseline: MainBaselineTrace = explicit?.state.speculative?.mainBaseline ?? {
     status: "passed",
     workspacePath: cwd,
     changedFiles: [...workspaceDiff.changedFiles, ...workspaceDiff.addedFiles, ...workspaceDiff.removedFiles],
@@ -572,15 +641,17 @@ export async function nativeResume(
     completedAt: recoveryStartedAt,
   };
 
-  await writeFile(
-    mainBaseline.manifestPath!,
-    `${JSON.stringify(await captureBaselineManifest(cwd), null, 2)}\n`,
-    "utf8",
-  );
+  if (!explicit) {
+    await writeFile(
+      mainBaseline.manifestPath!,
+      `${JSON.stringify(await captureBaselineManifest(cwd), null, 2)}\n`,
+      "utf8",
+    );
+  }
 
   const recovery: RecoveryMetadata = {
     recovered: true,
-    recoveredFromRunId: attempt.recoveredFromRunId,
+    recoveredFromRunId: explicit ? explicit.state.runId : attempt.recoveredFromRunId,
     orphanSourceArtifactRoot: attempt.orphanSourceArtifactRoot,
     originalSharedPromptHash: attempt.sharedPromptHash,
     recoveryStartedAt,
@@ -736,8 +807,7 @@ function buildResumePanelResponsesFromClassification(
     const modelId = classified.model ?? panelModelSpecs[classified.logicalPanelIndex - 1]?.modelId ?? "unknown";
     if (classified.classification === "usable" || classified.classification === "partial") {
       const content = classified.reportContent ?? "";
-      const validation = content ? validateCandidateOutput(content) : { status: "failed" as const, score: 0, warnings: [], missingSections: [] };
-      const success = classified.classification === "usable" || validation.status !== "failed";
+      const success = classified.classification === "usable";
       return {
         modelId,
         provider: "native",
@@ -747,10 +817,10 @@ function buildResumePanelResponsesFromClassification(
         prompt: sharedPrompt,
         latencyMs: 0,
         candidateValidationPassed: success,
-        candidateValidationStatus: classified.classification === "partial" ? "usable_with_warnings" : validation.status,
-        candidateValidationScore: validation.score,
-        candidateValidationWarnings: validation.warnings,
-        candidateValidationMissingItems: validation.missingSections,
+        candidateValidationStatus: classified.classification === "partial" ? "usable_with_warnings" : "passed",
+        candidateValidationScore: classified.evidence.meaningfulChangedFiles,
+        candidateValidationWarnings: classified.evidence.warnings,
+        candidateValidationMissingItems: classified.classification === "partial" ? [classified.rerunReason ?? "candidate evidence incomplete"] : [],
       } satisfies PanelResponse;
     }
     return {

@@ -28,10 +28,13 @@ Call `fusion_native` with stage `resume`:
 ```json
 {
   "stage": "resume",
+  "runId": "$ARGUMENTS",
   "minSuccessfulPanels": 2,
   "allowDegradedJudge": true
 }
 ```
+
+Omit `runId` when you want the existing safe orphan discovery behavior. Pass a concrete run ID such as `fusion-20260624-183742-39fc7a` when recovering a completed or terminal trace directory in place.
 
 Do NOT pass `panelModels` or `judgeModel` unless the user explicitly overrode them.
 
@@ -88,3 +91,21 @@ When `judgeEligible` is true (or collect returns `shouldProceed: true`):
 - Preserve visible native panel/judge behavior, external candidate staging, Contract Gate, Council Comparison Dossier, Merge Patch Contract, Correctness Coverage Gate, post-build audit, and one-fix-cycle semantics.
 
 Final response must include: recovered run ID, trace artifact path, recovery metadata, main baseline reuse status, recovered vs invalid panel indexes, quorum, judge eligibility, and verification results.
+
+## real_parallel_process_build supervisor recovery
+
+If the orphaned run is a `real_parallel_process_build` run (it has a
+`supervisor-state.json` under `.opencode/fusion-runs/<runId>/`), resume the
+detached supervisor instead of the native-subagent flow:
+
+```json
+{ "stage": "resume", "runId": "<runId>" }
+```
+
+via the `fusion_supervisor` tool. Supervisor resume inspects live worker PIDs,
+recovers completed worker result artifacts, reuses completed valid workers
+(it never reruns a valid completed main implementation or valid completed
+panel), and resumes the judge or patch stage when prerequisites are already met.
+The supervisor state alone is sufficient to continue after OpenCode restart,
+plugin reload, or parent chat closure. Use `{ "stage": "status", "runId": "<runId>" }`
+first to inspect live PIDs and the concurrency verdict.

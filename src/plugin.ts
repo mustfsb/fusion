@@ -33,6 +33,8 @@ import {
   nativeRecordMainBaseline,
 } from "./native/nativeCouncil.js";
 import { nativeResume } from "./native/fusionResume.js";
+import { launchRealParallelBuild, reportSupervisorStatus } from "./native/supervisorLaunch.js";
+import { superviseRun } from "./native/fusionSupervisor.js";
 import { assertValidFusionRunId } from "./native/runLocator.js";
 import type { FusionTraceOptions, NativePanelResult } from "./types.js";
 
@@ -163,12 +165,13 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
           allowDegradedJudge: tool.schema.boolean().optional().describe("Allow judge in degraded quorum mode (prepare, default true)."),
           parallelExecutionSupported: tool.schema.boolean().optional().describe("Whether the orchestrator/runtime verified true non-blocking native subagent overlap support. If false for speculative_parallel_build, /fusion-build should abort before implementation."),
           runId: tool.schema.string().optional().describe("Fusion run id. Returned by prepare and required for collect/finalize. May be supplied to prepare to pin a deterministic run id (used by integration tests)."),
-          mainBaselineStartedAt: tool.schema.string().optional().describe("ISO timestamp when the main baseline first began in the real workspace (advance)."),
+          mainBaselineStartedAt: tool.schema.string().optional().describe("ISO timestamp authorizing the main baseline to begin in the real workspace (advance). Authorization, not work."),
+          mainBaselineFirstWorkAt: tool.schema.string().optional().describe("ISO timestamp of the first real parent/main workspace operation that changes or intentionally inspects implementation state (advance). Must reflect actual work, never a fabricated marker."),
           panelDispatches: tool.schema
             .array(
               tool.schema.object({
                 logicalPanelIndex: tool.schema.number(),
-                startReason: tool.schema.enum(["cascade_activity", "start_gate_timeout", "retry"]),
+                startReason: tool.schema.enum(["initial_immediate", "scheduled_delay", "recovery_rerun", "cascade_activity", "start_gate_timeout", "retry"]),
                 startedAt: tool.schema.string().optional(),
                 taskId: tool.schema.string().optional(),
                 sessionId: tool.schema.string().optional(),
@@ -230,7 +233,7 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
                 lastActivityAt: tool.schema.string().optional(),
                 endedAt: tool.schema.string().optional(),
                 status: tool.schema.enum(["queued", "waiting_for_previous_output", "waiting_for_activity", "running", "healthy", "suspected_stalled", "stalled", "cancelled", "retrying", "succeeded", "partial", "failed"]),
-                startReason: tool.schema.enum(["cascade_activity", "start_gate_timeout", "retry"]),
+                startReason: tool.schema.enum(["initial_immediate", "scheduled_delay", "recovery_rerun", "cascade_activity", "start_gate_timeout", "retry"]),
                 stallReason: tool.schema.enum(["inactivity_timeout", "task_timeout", "task_error", "cancelled_by_orchestrator"]).optional(),
               }),
             )
@@ -323,6 +326,7 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
               {
                 runId,
                 mainBaselineStartedAt: args.mainBaselineStartedAt,
+                mainBaselineFirstWorkAt: args.mainBaselineFirstWorkAt,
                 panelDispatches: args.panelDispatches as import("./types.js").NativePanelDispatchEvent[] | undefined,
                 panelResults: args.panelResults?.map((entry) => ({
                   ...entry,
@@ -419,6 +423,7 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
                   traceDir,
                   command: "fusion-resume",
                 },
+                runId: args.runId,
                 panelModels: args.panelModels,
                 judgeModel: args.judgeModel,
                 requireAllPanels: args.requireAllPanels,
@@ -431,6 +436,52 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
           }
 
           throw new Error(`Unknown fusion_native stage: ${String(args.stage)}`);
+        },
+      }),
+
+      fusion_supervisor: tool({
+        description:
+          "Default /fusion-build engine: real_parallel_process_build. Launches a detached Node supervisor that spawns four real concurrent OpenCode CLI worker processes (fusion-main-builder + fusion-panel-1/2/3), then a visible judge and optional patch worker. Stages: launch (minimal bootstrap + detached supervisor), status (live worker/concurrency report), resume (reattach + continue without rerunning completed workers). Uses child_process.spawn of the installed opencode CLI; never calls model APIs or hidden SDK runners.",
+        args: {
+          stage: tool.schema.enum(["launch", "status", "resume"]).describe("Supervisor stage."),
+          task: tool.schema.string().optional().describe("Original user task text (required for launch)."),
+          runId: tool.schema.string().optional().describe("Fusion run id (required for status/resume)."),
+          panelModels: tool.schema.array(tool.schema.string()).optional().describe("Override panel model IDs (launch). Defaults to saved /fusion-model config."),
+          judgeModel: tool.schema.string().optional().describe("Override judge model ID (launch)."),
+          mainModel: tool.schema.string().optional().describe("Override main builder/patch worker model ID (launch). Defaults to FUSION_MAIN_MODEL env or panel model 1."),
+          sourceWorkspace: tool.schema.string().optional().describe("Absolute path of the real source workspace owned by the main builder (launch). Defaults to the project directory."),
+          command: tool.schema.string().optional().describe("Command name for trace metadata (launch)."),
+          inline: tool.schema.boolean().optional().describe("Run the supervisor in-process instead of detached (testing/restricted environments)."),
+          traceDir: tool.schema.string().optional().describe("Override trace artifact root directory."),
+        },
+        async execute(args, context) {
+          const cwd = context.directory;
+          const traceDir = args.traceDir ?? pluginSettings.traceDir;
+          if (args.stage === "launch") {
+            if (!args.task) throw new Error("fusion_supervisor launch requires 'task'.");
+            const result = await launchRealParallelBuild({
+              task: args.task,
+              cwd,
+              traceDir,
+              command: args.command ?? "fusion-build",
+              sourceWorkspace: args.sourceWorkspace,
+              panelModels: args.panelModels,
+              judgeModel: args.judgeModel,
+              mainModel: args.mainModel,
+              inline: args.inline,
+            });
+            return JSON.stringify(result, null, 2);
+          }
+          if (args.stage === "status") {
+            assertValidFusionRunId(args.runId ?? "");
+            return JSON.stringify(await reportSupervisorStatus(args.runId!, cwd, traceDir), null, 2);
+          }
+          if (args.stage === "resume") {
+            assertValidFusionRunId(args.runId ?? "");
+            const state = await superviseRun(args.runId!, { cwd, traceDir });
+            return JSON.stringify({ runId: state.runId, phase: state.phase, concurrency: state.concurrency }, null, 2);
+          }
+          throw new Error(`Unknown fusion_supervisor stage: ${String(args.stage)}`);
         },
       }),
 

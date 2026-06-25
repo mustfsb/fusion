@@ -11,15 +11,22 @@ export type PanelMode = "advisory" | "candidate_build";
 /**
  * Internal build strategy for `/fusion-build`.
  *
- * - `speculative_parallel_build`: panels build competing candidates in isolated
- *   workspaces while the main agent independently builds a baseline in the real
- *   workspace; a judge then produces a Merge Patch Contract; the main agent
- *   applies only approved targeted patches. This is the default and only
- *   strategy for `/fusion-build`.
+ * - `real_parallel_process_build`: the DEFAULT strategy. A detached Node
+ *   supervisor spawns four real concurrent OpenCode CLI worker processes
+ *   (fusion-main-builder + fusion-panel-1/2/3) immediately after a minimal
+ *   immutable source snapshot, monitors them as independent processes, then
+ *   runs a visible judge process and an optional patch worker. Concurrency is
+ *   real OS-level process overlap, not prompt wording.
+ * - `speculative_parallel_build`: legacy native-subagent compatibility fallback.
+ *   Panels build competing candidates in isolated workspaces driven by the
+ *   parent orchestrator's advance loop. Retained only as a non-default fallback.
  *
  * `/fusion-no-build` does not set a build strategy (it remains planning-only).
  */
-export type BuildStrategy = "speculative_parallel_build";
+export type BuildStrategy = "real_parallel_process_build" | "speculative_parallel_build";
+
+/** The default `/fusion-build` strategy. */
+export const DEFAULT_BUILD_STRATEGY: BuildStrategy = "real_parallel_process_build";
 
 export type PromptVerbosity = "compact" | "standard" | "detailed";
 
@@ -309,7 +316,75 @@ export type PanelAttemptStatus =
   | "partial"
   | "failed";
 
-export type PanelStartReason = "cascade_activity" | "start_gate_timeout" | "retry";
+export type PanelStartReason =
+  | "initial_immediate"
+  | "scheduled_delay"
+  | "recovery_rerun"
+  | "cascade_activity"
+  | "start_gate_timeout"
+  | "retry";
+
+/**
+ * Absolute launch reason for the fixed-delay panel stagger schedule.
+ * Distinct from {@link PanelStartReason}, which is the legacy activity-cascade
+ * vocabulary retained for backward-compatible attempt traces.
+ */
+export type PanelLaunchReason =
+  | "initial_immediate"
+  | "scheduled_delay"
+  | "recovery_rerun";
+
+export type CandidateClassification = "usable" | "partial" | "missing" | "invalid";
+
+export type CandidateEvidenceVerificationStatus = "passed" | "failed" | "unknown";
+
+export type CandidateFinalMessageFormat =
+  | "structured"
+  | "concise"
+  | "missing"
+  | "invalid";
+
+export type CandidateEvidence = {
+  workspaceExists: boolean;
+  workspaceSafe: boolean;
+  executionContextMatches: boolean;
+  sharedPromptHashMatches: boolean;
+  meaningfulChangedFiles: number;
+  changedSourceFiles: number;
+  changedTestFiles: number;
+  changedConfigFiles: number;
+  changedFiles: string[];
+  verification: {
+    typecheck?: CandidateEvidenceVerificationStatus;
+    test?: CandidateEvidenceVerificationStatus;
+    build?: CandidateEvidenceVerificationStatus;
+  };
+  candidateLocalReportPath?: string;
+  sourceSideReportPath?: string;
+  selectedReportPath?: string;
+  priorTerminalStatus?: "succeeded" | "failed" | "unknown";
+  finalMessageFormat: CandidateFinalMessageFormat;
+  warnings: string[];
+};
+
+/**
+ * Per-panel absolute launch schedule entry. `plannedDispatchAt` derives only
+ * from the original launch clock (anchor + fixed delay), never from previous
+ * panel activity, output, or completion.
+ */
+export type PanelLaunchSchedule = {
+  panelIndex: 1 | 2 | 3;
+  plannedDispatchAt: number;
+  dispatchRequestedAt: number | null;
+  dispatchAt: number | null;
+  launchReason: PanelLaunchReason;
+  scheduleSkewMs: number | null;
+};
+
+/** Hard orchestration violation codes surfaced in the trace, never hidden. */
+export type OrchestrationViolationCode =
+  | "MAIN_BASELINE_SERIALIZED_BEHIND_PANELS"
+  | "NATIVE_DELAYED_TASK_DISPATCH_UNAVAILABLE";
 
 export type PanelStallReason =
   | "inactivity_timeout"
@@ -381,7 +456,7 @@ export type PanelExecutionStage = {
   panelIndex: number;
   agentName: string;
   modelId: string;
-  startsAfter: "immediately" | "previous_first_activity" | "previous_start_gate_timeout";
+  startsAfter: "immediately" | "launch_clock" | "previous_first_activity" | "previous_start_gate_timeout";
   startGateTimeoutMs: number;
 };
 
@@ -800,8 +875,14 @@ export type SpeculativePrepareResult = {
   aborted: boolean;
   abortReason?: string;
   preparedAt?: string;
+  /** When the run launch was first requested (minimal bootstrap entry). */
+  runLaunchRequestedAt?: string;
   candidatePreparationCompletedAt?: string;
   judgeEligibleAt?: string;
+  launchClockAnchorMs?: number;
+  panelLaunchSchedule?: PanelLaunchSchedule[];
+  judgeManifestPath?: string;
+  activeSchedulerCapability?: "persisted_due_times_parent_turn_required" | "persisted_due_times_visible_dispatch";
   /** Canonical external-staging path resolution record. */
   pathResolution: SpeculativePathResolutionTrace;
   /** Absolute path of the shared, workspace-agnostic canonical task file. */
@@ -884,7 +965,14 @@ export type SpeculativeCollectResult = {
 
 export type NativeAdvanceInput = {
   runId: string;
+  /** Authorizes the main baseline (parent permitted to begin implementation). */
   mainBaselineStartedAt?: string;
+  /**
+   * First real parent/main workspace operation. Must reflect an actual
+   * workspace change or intentional implementation inspection — never a
+   * fabricated marker recorded before real work begins.
+   */
+  mainBaselineFirstWorkAt?: string;
   panelDispatches?: NativePanelDispatchEvent[];
   panelResults?: NativePanelResult[];
   panelObservations?: NativePanelObservation[];
@@ -897,6 +985,10 @@ export type NativeAdvanceAction =
     logicalPanelIndex: number;
     attempt: number;
     startReason: PanelStartReason;
+    /** Absolute launch reason for the fixed-delay stagger schedule. */
+    launchReason?: PanelLaunchReason;
+    /** Persisted absolute planned dispatch time (ms epoch), if scheduled. */
+    plannedDispatchAt?: number;
     agentName: string;
     modelId: string;
     prompt: string;
@@ -950,16 +1042,8 @@ export type RecoveredPanelCandidate = {
   logicalPanelIndex: number;
   model?: string;
   agentName?: string;
-  classification: "usable" | "partial" | "missing" | "invalid";
-  evidence: {
-    executionContext: boolean;
-    candidateWorkspace: boolean;
-    candidateChanges: boolean;
-    candidateLocalReport: boolean;
-    sourceSideReport: boolean;
-    priorSucceededAttempt: boolean;
-    verificationRan: boolean;
-  };
+  classification: CandidateClassification;
+  evidence: CandidateEvidence;
   evidenceSourcesChecked: string[];
   workspacePath?: string;
   reportPath?: string;
@@ -986,6 +1070,7 @@ export type RecoveryCandidateClassificationTrace = {
 };
 
 export type NativeResumeInput = {
+  runId?: string;
   trace?: FusionTraceOptions;
   panelModels?: string[];
   judgeModel?: string;
@@ -1096,6 +1181,19 @@ export type VerificationSummary = {
 export type MainBaselineTrace = {
   startedAt?: string;
   completedAt?: string;
+  /**
+   * When the parent/main agent was authorized to begin real implementation
+   * (immediately after minimal bootstrap). Authorization is not work.
+   */
+  startAuthorizedAt?: string;
+  /**
+   * First actual parent/main workspace operation that changes or intentionally
+   * inspects implementation state. Never fabricated; only set from a real
+   * reported first-work marker.
+   */
+  firstWorkAt?: string;
+  /** When the main baseline reached a terminal (passed/failed/blocked) state. */
+  terminalAt?: string;
   status: "queued" | "running" | "passed" | "failed" | "blocked";
   workspacePath: string;
   changedFiles: string[];
@@ -1136,6 +1234,9 @@ export type SpeculativePanelCandidateTrace = {
   reportPath?: string;
   patchPath?: string;
   status: "queued" | "running" | "usable" | "partial" | "failed" | "excluded";
+  classification: CandidateClassification;
+  evidence: CandidateEvidence;
+  warnings: string[];
   verification?: VerificationSummary;
 };
 
@@ -1200,7 +1301,7 @@ export type MergePatchContract = {
   adoptedInsights: MergePatchAdoptedInsight[];
   rejectedIdeas: MergePatchRejectedIdea[];
   patchPlan: MergePatchPlanItem[];
-  finalDecision: MergePatchDecision;
+  finalDecision?: MergePatchDecision;
 };
 
 export type SpeculativeParallelBuildTrace = {
@@ -1216,13 +1317,28 @@ export type SpeculativeParallelBuildTrace = {
   runtimeCapabilities?: RuntimeCapabilityFlags;
   isolationCapability: IsolationCapability;
   pathResolution?: SpeculativePathResolutionTrace;
+  launchClockAnchorMs?: number;
+  panelLaunchSchedule?: PanelLaunchSchedule[];
+  activeSchedulerCapability?: "persisted_due_times_parent_turn_required" | "persisted_due_times_visible_dispatch";
   /** Per-panel resolved execution assignments (dynamic dispatch binding). */
   panelExecutionAssignments?: PanelExecutionAssignmentTrace[];
   mainBaseline: MainBaselineTrace;
   panelCandidates: SpeculativePanelCandidateTrace[];
+  judgeManifestPath?: string;
   judgeEligibleAt?: string;
+  judgeDispatchAt?: string;
   judgeStartedAt?: string;
   judgeCompletedAt?: string;
+  judgeFirstCredibleActivityAt?: string;
+  judgeLastCredibleActivityAt?: string;
+  judgeSuspectedStalledAt?: string;
+  judgeTerminalAt?: string;
+  judgeAttempt?: number;
+  judgeRetryScheduledAt?: string;
+  judgeDispatched?: boolean;
+  judgeTerminal?: boolean;
+  judgeContractValid?: boolean;
+  judgeDecisionStatus?: MergePatchDecision | "JUDGE_NOT_DISPATCHED_NO_QUORUM" | "JUDGE_DISPATCHED_CONTRACT_INVALID" | "JUDGE_PENDING";
   frozenPanelIndexes?: number[];
   lateExcludedPanelIndexes?: number[];
   mergePatchContractPath?: string;

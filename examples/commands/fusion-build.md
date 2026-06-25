@@ -17,7 +17,44 @@ Use `fusion_native` for deterministic orchestration state only.
 
 Pass the exact user task text through without rewriting: `$ARGUMENTS`
 
-The default and only `/fusion-build` workflow is `speculative_parallel_build`.
+## Default execution mechanism: real_parallel_process_build
+
+The DEFAULT `/fusion-build` engine is `real_parallel_process_build`, driven by a
+detached Node process supervisor. It does not depend on the parent model calling
+advance, on prompt sleeps, on panel activity gates, on panel completion before
+main work, or on manual continuation. Use the `fusion_supervisor` tool:
+
+```json
+{ "stage": "launch", "task": "$ARGUMENTS", "command": "fusion-build" }
+```
+
+`launch` performs a minimal safe bootstrap (immutable source snapshot, isolated
+candidate workspaces, canonical task artifact) and then spawns a detached
+supervisor that immediately launches four real concurrent OpenCode CLI worker
+processes without awaiting any of them:
+
+```txt
+T+0s  immutable source snapshot complete
+T+0s  fusion-main-builder spawned   (real source workspace)
+T+0s  fusion-panel-1 spawned        (isolated candidate workspace)
+T+0s  fusion-panel-2 spawned        (isolated candidate workspace)
+T+0s  fusion-panel-3 spawned        (isolated candidate workspace)
+```
+
+The supervisor monitors all four as independent processes (PIDs, stdout/stderr
+activity, result-artifact writes, workspace mutations, exit codes), launches the
+visible judge only after main AND all three panels are terminal, writes a Merge
+Patch Contract, runs the patch worker on `PATCH_REQUIRED`, and performs final
+verification + audit. It survives parent/orchestrator session closure, OpenCode
+restart, and plugin reload. Poll progress with
+`{ "stage": "status", "runId": "<runId>" }` and continue an interrupted run with
+`{ "stage": "resume", "runId": "<runId>" }` (completed valid workers are reused,
+never rerun). The trace renders an explicit
+`REAL_PARALLEL_EXECUTION_CONFIRMED` / `REAL_PARALLEL_EXECUTION_NOT_CONFIRMED`
+verdict from true process-interval overlap.
+
+The legacy `speculative_parallel_build` native-subagent flow below is retained
+only as a non-default compatibility fallback.
 Never add `/fusion-spec-build`.
 
 ## Step 1: Fast Prepare
@@ -78,7 +115,19 @@ Immediately after successful minimal prepare, before any panel staging or dispat
 }
 ```
 
-2. Begin implementation in the real source workspace right away.
+`mainBaselineStartedAt` records authorization only (the parent is permitted to begin). It is intentionally distinct from first real work.
+
+2. Begin implementation in the real source workspace right away. As soon as you perform the first real workspace operation that changes or intentionally inspects implementation state, record it once:
+
+```json
+{
+  "stage": "advance",
+  "runId": "<runId>",
+  "mainBaselineFirstWorkAt": "<ISO timestamp of the first real workspace operation>"
+}
+```
+
+`mainBaselineFirstWorkAt` must be a real first-work marker, never fabricated before work begins. If it lands after any panel terminal result, the runtime records the hard violation `MAIN_BASELINE_SERIALIZED_BEHIND_PANELS` in the trace.
 
 Do NOT wait for:
 
@@ -150,7 +199,7 @@ Immediately call `fusion_native advance` again with the dispatch event:
   "panelDispatches": [
     {
       "logicalPanelIndex": 1,
-      "startReason": "cascade_activity",
+       "startReason": "initial_immediate",
       "startedAt": "<ISO timestamp>",
       "taskId": "<if available>",
       "sessionId": "<if available>"
@@ -159,17 +208,29 @@ Immediately call `fusion_native advance` again with the dispatch event:
 }
 ```
 
+### Absolute stagger schedule (not activity-gated)
+
+Panel launch timing is driven by a persisted, monotonic absolute schedule, not by previous-panel activity, output, success, failure, or your own reasoning about elapsed time:
+
+```txt
+Panel 1: launch immediately once the launch packet is ready (delay 0)
+Panel 2: launch at launch-clock anchor + 60 seconds
+Panel 3: launch at launch-clock anchor + 120 seconds
+```
+
+`advance` persists `speculative.panelLaunchSchedule` with each panel's `plannedDispatchAt`. Panel 2 never waits for Panel 1, and Panel 3 never waits for Panel 2 — a stuck or silent earlier panel cannot delay a later scheduled launch. Same-slot retries fire immediately (`launchReason: "recovery_rerun"`) and never shift the original Panel 2/3 schedule.
+
 ### If `nextAction.type` is `wait`
 
 Obey the returned scheduler deadline. Do not invent your own timer.
 
-- Use `nextAction.delayMs`
-- Sleep only for that returned delay
-- Call `fusion_native advance` again when it expires
+- Use `nextAction.delayMs` (this is the time until the next panel's `plannedDispatchAt`)
+- Wait only for that returned delay while you keep working the main baseline
+- Call `fusion_native advance` again when it expires; the persisted schedule launches each panel on time even if you call slightly late
 
-The bounded silent-panel fallback gate currently defaults to about 45 seconds from the previous panel dispatch when no credible activity can be observed. This replaces hardcoded `sleep 60` orchestration.
+Activity detection still runs for tracing, stall diagnosis, and same-slot retry. A bounded silent-panel liveness fallback gate (about 45 seconds without credible activity) only affects diagnostics and retry eligibility — it does not gate the original Panel 2/3 launches, which fire purely on `plannedDispatchAt`. A silent or stuck Panel 2 must not block Panel 3 forever. This replaces any `sleep 60` or wait-for-panel-activity orchestration.
 
-When the previous panel shows no credible activity within that window, the next panel may launch with `startReason: "start_gate_timeout"`. A silent or stuck Panel 2 must not block Panel 3 forever.
+When a scheduled launch arrives the action is `start_panel` with `startReason: "scheduled_delay"` and `launchReason: "scheduled_delay"`.
 
 This is the live staggered cascade.
 
@@ -207,7 +268,7 @@ Do not count:
 
 If the runtime exposes no real child-session activity, that is fine. Keep calling `advance` on its returned wait deadlines and on real panel completions. Do not fabricate telemetry.
 
-If `advance` returns `start_panel` with `startReason: "retry"`, redispatch the SAME logical slot. Never create `fusion-panel-4`.
+If `advance` returns `start_panel` with `startReason: "recovery_rerun"`, redispatch the SAME logical slot. Never create `fusion-panel-4`.
 
 Do not automatically cancel panels unless Fusion runtime capability reporting explicitly says cancellation/abort is supported. Current default behavior is conservative.
 
@@ -268,6 +329,10 @@ You may omit a missing late panel. `collect` will use the persisted run-state an
 Call `todowrite` with `todoUpdates`.
 
 If `shouldProceed` is false, stop and report the reason honestly.
+
+Judge dispatch is quorum-first: as soon as the main baseline is terminal AND at least 2 usable panel candidates exist, the candidate subset is frozen, `judgeEligibleAt` is persisted, and the judge dispatches immediately. A third panel that is still running, stalled, retrying, or late becomes `late_excluded` for that judge run.
+
+The judge starts lean. `advance` writes an incremental `judge-preflight-manifest.json` (path in `speculative.judgeManifestPath`) as panels reach a usable/terminal state — compact navigational evidence only (candidate paths, report paths, classifications), never inlined source trees. The `judgeTransportPrompt` carries task artifact path/hash, the main workspace and verification summary paths, usable candidate workspace paths, panel report paths, and the Council Comparison / Contract Gate / decision-matrix artifact paths. The judge inspects candidate files selectively from those paths; it does not receive full candidate source trees, huge diffs, or duplicated task text in its initial context.
 
 If `shouldProceed` is true:
 
@@ -344,5 +409,26 @@ Final response must include:
 - applied patch items
 - post-build audit status
 - verification results
+
+Also surface the launch/overlap/judge timeline from the persisted run-state:
+
+```txt
+Launch:
+- run launch requested (speculative.runLaunchRequestedAt)
+- main authorized (mainBaseline.startAuthorizedAt)
+- main first work (mainBaseline.firstWorkAt)
+- panel 1/2/3 planned vs dispatched (speculative.panelLaunchSchedule[*].plannedDispatchAt / dispatchAt / scheduleSkewMs)
+
+Overlap:
+- main vs panel overlap (speculative.overlapObserved / overlapDurationMs)
+
+Judge:
+- judge eligible (speculative.judgeEligibleAt)
+- judge dispatched (speculative.judgeDispatchAt)
+- candidate subset frozen (speculative.frozenPanelIndexes) / late excluded (speculative.lateExcludedPanelIndexes)
+
+Warnings:
+- orchestration violations (speculative.orchestrationViolations), including MAIN_BASELINE_SERIALIZED_BEHIND_PANELS
+```
 
 Tell the user they can inspect `fusion-panel-1/2/3` and `fusion-judge` child sessions in the OpenCode UI, and they can inspect raw artifacts via `/fusion-trace`.

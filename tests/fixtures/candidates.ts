@@ -78,6 +78,11 @@ export const completeCandidate = [
   "- All exports present",
   "- Visible tests are supplemented with package-entry probes",
   "- No rollback/replay concerns",
+  "",
+  "## 9. Verification",
+  "- typecheck: passed",
+  "- test: passed",
+  "- build: passed",
 ].join("\n");
 
 export const planOnlyCandidate = [
@@ -87,6 +92,15 @@ export const planOnlyCandidate = [
   "3. Add tests later",
   "This is only a high-level plan without concrete code.",
 ].join("\n");
+
+export const conciseCompletedCandidate = [
+  "Completed.",
+  "- typecheck: pass",
+  "- test: pass",
+  "- build: pass",
+].join("\n");
+
+export const refusalOnlyCandidate = "I cannot implement this request.\n";
 
 export const incompleteCandidateMissingSelfReview = [
   "# Candidate Proposal",

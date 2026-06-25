@@ -12,7 +12,11 @@ import {
   type RecoveryAttemptContext,
 } from "../src/native/recoveryClassification.js";
 import { buildPanelExecutionContext, parsePanelExecutionContext } from "../src/native/speculativeBuild.js";
-import { completeCandidate } from "./fixtures/candidates.js";
+import {
+  completeCandidate,
+  conciseCompletedCandidate,
+  refusalOnlyCandidate,
+} from "./fixtures/candidates.js";
 
 const PASS_SCRIPTS = {
   typecheck: "node -e \"process.exit(0)\"",
@@ -143,8 +147,8 @@ describe("recovery classification", () => {
       modelId,
     });
     expect(result.classification).toBe("usable");
-    expect(result.evidence.sourceSideReport).toBe(true);
-    expect(result.evidence.candidateLocalReport).toBe(false);
+    expect(result.evidence.sourceSideReportPath).toBeTruthy();
+    expect(result.evidence.candidateLocalReportPath).toBeUndefined();
     expect(result.rerunEligible).toBe(false);
   });
 
@@ -161,8 +165,56 @@ describe("recovery classification", () => {
       modelId,
     });
     expect(result.classification).toBe("usable");
-    expect(result.evidence.priorSucceededAttempt).toBe(true);
+    expect(result.evidence.priorTerminalStatus).toBe("succeeded");
     expect(result.rerunEligible).toBe(false);
+  });
+
+  test("concise completed output with passed verification remains usable", async () => {
+    const { attempt, agentName, modelId } = await buildAttempt({
+      panelIndex: 1,
+      changed: true,
+      sourceReport: conciseCompletedCandidate,
+    });
+    const result = await classifyRecoveredPanelCandidate({
+      logicalPanelIndex: 1,
+      attempt,
+      agentName,
+      modelId,
+    });
+    expect(result.classification).toBe("usable");
+    expect(result.evidence.finalMessageFormat).toBe("missing");
+  });
+
+  test("missing structured headings never invalidates a valid candidate", async () => {
+    const { attempt, agentName, modelId } = await buildAttempt({
+      panelIndex: 1,
+      changed: true,
+      sourceReport: "Completed.\n- typecheck: pass\n- test: pass\n- build: pass\n",
+    });
+    const result = await classifyRecoveredPanelCandidate({
+      logicalPanelIndex: 1,
+      attempt,
+      agentName,
+      modelId,
+    });
+    expect(result.classification).toBe("usable");
+    expect(result.evidence.warnings.join(" ")).toMatch(/concise/i);
+  });
+
+  test("no report plus terminal success and passed verification is still usable", async () => {
+    const { attempt, agentName, modelId } = await buildAttempt({
+      panelIndex: 2,
+      changed: true,
+      priorSucceeded: true,
+    });
+    const result = await classifyRecoveredPanelCandidate({
+      logicalPanelIndex: 2,
+      attempt,
+      agentName,
+      modelId,
+    });
+    expect(result.classification).toBe("usable");
+    expect(result.reportContent).toContain("# Candidate Status");
   });
 
   test("missing report alone does not make candidate rerun-eligible when workspace unchanged", async () => {
@@ -174,7 +226,7 @@ describe("recovery classification", () => {
       modelId,
     });
     expect(result.classification).toBe("invalid");
-    expect(result.rerunReason).toMatch(/untouched baseline copy/i);
+    expect(result.rerunReason).toMatch(/no meaningful/i);
     expect(isWeakRerunReason("missing local report")).toBe(true);
   });
 
@@ -207,18 +259,40 @@ describe("recovery classification", () => {
     expect(assessReportContent("FUSION_ADVISORY: no implementation\n").valid).toBe(false);
   });
 
+  test("refusal-only candidate with no meaningful changes is invalid", async () => {
+    const { attempt, agentName, modelId } = await buildAttempt({
+      panelIndex: 1,
+      changed: false,
+      sourceReport: refusalOnlyCandidate,
+    });
+    const result = await classifyRecoveredPanelCandidate({
+      logicalPanelIndex: 1,
+      attempt,
+      agentName,
+      modelId,
+    });
+    expect(result.classification).toBe("invalid");
+    expect(result.rerunReason).toMatch(/no meaningful|refusal|candidate workspace/i);
+  });
+
   test("assertPanelRedispatchIsRequired rejects weak reasons", () => {
     const candidate = {
       logicalPanelIndex: 1,
       classification: "invalid" as const,
       evidence: {
-        executionContext: true,
-        candidateWorkspace: true,
-        candidateChanges: false,
-        candidateLocalReport: false,
-        sourceSideReport: false,
-        priorSucceededAttempt: false,
-        verificationRan: true,
+        workspaceExists: true,
+        workspaceSafe: true,
+        executionContextMatches: true,
+        sharedPromptHashMatches: true,
+        meaningfulChangedFiles: 0,
+        changedSourceFiles: 0,
+        changedTestFiles: 0,
+        changedConfigFiles: 0,
+        changedFiles: [],
+        verification: {},
+        priorTerminalStatus: "unknown" as const,
+        finalMessageFormat: "missing" as const,
+        warnings: [],
       },
       evidenceSourcesChecked: [
         "execution_context",

@@ -82,17 +82,22 @@ During a Fusion run, open the native child sessions created by `fusion-panel-1`,
 
 The `fusion_native` plugin tool (stages `prepare`, `advance`, `collect`, `finalize`, `audit_prepare`, `audit_finalize`) handles the deterministic parts — fast run creation, deferred panel staging, staggered dispatch decisions, SHA-256 prompt hash, candidate validation tiers, quorum, judge prompt, judge parsing, final guidance, and trace artifacts — without ever calling a panel or judge model itself. In `/fusion-build`, `prepare` now returns quickly and `advance` owns the live runtime state machine. The trace records `executionMode: "native_subagents"`, `sharedPanelPromptHash` when materialized, `panelSessions`, `panelAttempts`, and runtime capability flags.
 
+In speculative candidate-build mode, candidate validation now uses workspace evidence first and chat output last. A candidate can count toward quorum with a concise final message such as `Completed.` when the external candidate workspace is safe, task identity matches, meaningful source/test/config changes exist, verification evidence is passing, and at least one report/session/final-message evidence source is present. Missing markdown headings never invalidate otherwise usable candidate code.
+
 The prepare result returns the minimal run metadata immediately; `advance` then materializes candidate workspaces and returns deterministic `nextAction` decisions (`start_panel`, `wait`, `call_collect`, `done`) for the visible orchestrator.
 
 ### Staggered panel cascade and liveness watchdog
 
-Native panel execution uses a staggered cascade with a start-gate fallback and a same-slot retry policy:
+Native panel execution uses a staggered cascade driven by an **absolute, persisted, monotonic launch schedule** plus a same-slot retry policy. Panel launches are no longer activity-gated:
 
-- **Panel 1 starts first.**
-- **Panel 2 starts when Panel 1 produces its first observable output activity**, or after a **bounded fallback gate of about 45 seconds** when no credible activity is observable.
-- **Panel 3 starts the same way** after Panel 2.
+- **Panel 1 starts first** (delay 0) once the launch packet is ready.
+- **Panel 2 starts at the launch-clock anchor + 60 seconds**, derived only from the original launch clock — never from Panel 1 activity, output, success, failure, retry, or timeout.
+- **Panel 3 starts at the launch-clock anchor + 120 seconds**, independent of Panel 2.
+- The schedule is persisted in `speculative.panelLaunchSchedule` (`plannedDispatchAt` / `dispatchAt` / `scheduleSkewMs` / `launchReason`); the scheduler tick returns the next due action without the orchestrator reasoning about elapsed time. The main builder keeps coding throughout.
+- Fresh launches use `initial_immediate` for Panel 1 and `scheduled_delay` for Panels 2 and 3. Same-slot retries use `recovery_rerun`. Legacy `cascade_activity` / `start_gate_timeout` remain accepted only when recovering older traces.
 - The cascade retains staggered order — it never starts all remaining panels simultaneously.
-- A silent or stuck Panel 2 does not block Panel 3 forever; the scheduler can bypass it through the bounded fallback gate.
+- A silent or stuck Panel 2 does not block Panel 3; Panel 3 fires purely on its scheduled `plannedDispatchAt`. Activity detection and the **bounded fallback gate of about 45 seconds** now only inform stall diagnostics and retry eligibility, not the original Panel 2/3 launches.
+- The main baseline is authorized (`mainBaseline.startAuthorizedAt`) and does its first real work (`mainBaseline.firstWorkAt`) independently of all panel work. If first work follows any panel terminal result, the trace records the hard violation `MAIN_BASELINE_SERIALIZED_BEHIND_PANELS`.
 - Each logical panel slot (`fusion-panel-1`, `fusion-panel-2`, `fusion-panel-3`) gets **one original attempt plus one replacement attempt** (`MAX_PANEL_ATTEMPTS = 2`). A retry uses the same configured model and the same canonical prompt/brief artifacts, and stays attached to the same logical panel index. The trace never creates `fusion-panel-4`.
 - If a panel Task returns an error or times out, mark the attempt `stalled` and retry once. If the replacement also stalls or fails, mark that logical slot `failed` and continue using existing quorum semantics. Do not fabricate a candidate response.
 
@@ -370,6 +375,9 @@ The tool output and markdown result include run ID, artifact path, panel/judge s
 ### `/fusion-resume` — recover orphaned speculative runs
 
 Use `/fusion-resume` when a speculative `/fusion-build` was interrupted or left orphaned (for example, collect/finalize ran with an empty run ID). Recovery:
+
+- `/fusion-resume` with no argument preserves the existing safe orphan discovery flow.
+- `/fusion-resume fusion-20260624-183742-39fc7a` reopens that exact run in place, reclassifies existing candidate workspaces with the fixed evidence rules, preserves the existing main baseline, avoids rerunning valid panel slots, and proceeds to judge only when usable quorum exists.
 
 - searches the current workspace only for one coherent orphaned attempt;
 - validates orphan artifacts before reuse and never silently guesses;

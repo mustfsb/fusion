@@ -766,7 +766,7 @@ function extractPatchPlan(sections: SectionMap): MergePatchPlanItem[] {
   return items;
 }
 
-function extractFinalDecision(sections: SectionMap): MergePatchDecision {
+function extractFinalDecision(sections: SectionMap): MergePatchDecision | undefined {
   const body = sections.get("final patch decision") ?? [];
   const text = body.join("\n");
   for (const value of DECISION_VALUES) {
@@ -774,8 +774,12 @@ function extractFinalDecision(sections: SectionMap): MergePatchDecision {
       return value;
     }
   }
-  // Fallback: infer from gaps
-  return "NO_PATCH_REQUIRED";
+  return undefined;
+}
+
+export function hasValidMergePatchContract(contract: MergePatchContract): boolean {
+  return Boolean(contract.finalDecision)
+    && (contract.mainBaselineStatus.trim().length > 0 || contract.patchPlan.length > 0 || contract.gaps.length > 0 || contract.panelCandidateStatus.length > 0);
 }
 
 function parsePanelList(raw?: string): number[] {
@@ -847,20 +851,35 @@ export function renderSpeculativeTraceSummary(speculative: NonNullable<import(".
   lines.push("");
   lines.push("Main baseline:");
   lines.push(`- workspace: ${speculative.mainBaseline.workspacePath}`);
+  lines.push(`- launch anchor: ${speculative.launchClockAnchorMs ?? "n/a"}`);
   lines.push(`- started: ${speculative.mainBaseline.startedAt ?? "n/a"}`);
   lines.push(`- completed: ${speculative.mainBaseline.completedAt ?? "n/a"}`);
   lines.push(`- verification: ${formatVerification(speculative.mainBaseline.verification)}`);
   lines.push(`- changed files: ${speculative.mainBaseline.changedFiles.length ? speculative.mainBaseline.changedFiles.join(", ") : "none"}`);
   lines.push("");
+  lines.push("Scheduling:");
+  lines.push(`- active scheduler capability: ${speculative.activeSchedulerCapability ?? "n/a"}`);
+  for (const scheduleEntry of speculative.panelLaunchSchedule ?? []) {
+    lines.push(`- panel ${scheduleEntry.panelIndex} planned / actual: ${new Date(scheduleEntry.plannedDispatchAt).toISOString()} / ${scheduleEntry.dispatchAt !== null ? new Date(scheduleEntry.dispatchAt).toISOString() : "n/a"}`);
+    lines.push(`  dispatch skew: ${scheduleEntry.scheduleSkewMs ?? "n/a"}`);
+    lines.push(`  launch reason: ${scheduleEntry.launchReason}`);
+  }
+  lines.push("");
+  lines.push("Candidate validation:");
   lines.push("Panel candidates:");
   for (const candidate of speculative.panelCandidates) {
-    lines.push(`- panel ${candidate.logicalPanelIndex}: model=${candidate.model}; workspace=${candidate.workspacePath}; status=${candidate.status}; report=${candidate.reportPath ?? "n/a"}; verification=${formatVerification(candidate.verification)}`);
+    lines.push(`- panel ${candidate.logicalPanelIndex}: model=${candidate.model}; workspace=${candidate.workspacePath}; classification=${candidate.classification}; status=${candidate.status}; report=${candidate.reportPath ?? "n/a"}; verification=${formatVerification(candidate.verification)}`);
+    lines.push(`  final message format: ${candidate.evidence.finalMessageFormat}`);
+    lines.push(`  warnings: ${candidate.warnings.length ? candidate.warnings.join("; ") : "none"}`);
   }
   lines.push("");
   lines.push("Judge:");
-  lines.push(`- quorum: ${speculative.panelCandidates.filter((c) => c.status === "usable" || c.status === "partial").length}/${speculative.panelCandidates.length} usable+partial`);
+  lines.push(`- quorum: ${speculative.panelCandidates.filter((c) => c.classification === "usable").length}/${speculative.panelCandidates.length} usable`);
+  lines.push(`- eligibility: ${speculative.judgeEligibleAt ?? "n/a"}`);
+  lines.push(`- dispatched: ${speculative.judgeDispatched ? "yes" : "no"}`);
   lines.push(`- merge patch contract: ${speculative.mergePatchContractPath ?? "n/a"}`);
-  lines.push(`- final decision: ${speculative.mergePatchDecision ?? "n/a"}`);
+  lines.push(`- judge decision status: ${speculative.judgeDecisionStatus ?? "n/a"}`);
+  lines.push(`- actual final decision: ${speculative.mergePatchDecision ?? "n/a"}`);
   const blockers = speculative.appliedPatchItems?.filter((i) => i.severity === "BLOCKER") ?? [];
   const mustFix = speculative.appliedPatchItems?.filter((i) => i.severity === "MUST_FIX") ?? [];
   const safeAdds = speculative.appliedPatchItems?.filter((i) => i.severity === "SAFE_ADDITION") ?? [];

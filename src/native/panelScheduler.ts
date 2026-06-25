@@ -1,4 +1,4 @@
-import type { FusionModelSpec } from "../modelSpec.js";
+import type { FusionModelSpec, PanelLaunchReason, PanelLaunchSchedule } from "../types.js";
 
 export const PANEL_START_GATE_TIMEOUT_MS = 60_000;
 export const PANEL_INACTIVITY_TIMEOUT_MS = 90_000;
@@ -6,6 +6,39 @@ export const MAX_PANEL_ATTEMPTS = 2;
 export const PANEL_COUNT = 3;
 export const PANEL_START_GATE_FALLBACK_TIMEOUT_MS = 45_000;
 export const PANEL_SUSPECTED_STALL_TIMEOUT_MS = 30_000;
+
+/**
+ * Absolute fixed-delay launch schedule. Panel 2 and Panel 3 timing derive only
+ * from the original launch clock anchor, never from previous-panel activity,
+ * output, success, failure, or completion. This replaces the legacy
+ * activity-gated cascade for the purpose of *launching* panels. Activity/stall
+ * detection still runs for tracing and same-slot retry, but it does not gate
+ * the original Panel 2/3 launches.
+ */
+export const PANEL_1_LAUNCH_DELAY_MS = 0;
+export const PANEL_2_LAUNCH_DELAY_MS = 60_000;
+export const PANEL_3_LAUNCH_DELAY_MS = 120_000;
+export const PANEL_LAUNCH_DELAYS_MS: readonly number[] = [
+  PANEL_1_LAUNCH_DELAY_MS,
+  PANEL_2_LAUNCH_DELAY_MS,
+  PANEL_3_LAUNCH_DELAY_MS,
+];
+
+/**
+ * Build the persisted absolute launch schedule from a single launch-clock
+ * anchor. Each `plannedDispatchAt = anchor + fixedDelay`. Monotonic and
+ * deterministic — no model reasoning required to compute the next due action.
+ */
+export function buildPanelLaunchSchedule(anchorMs: number): PanelLaunchSchedule[] {
+  return PANEL_LAUNCH_DELAYS_MS.map((delay, index) => ({
+    panelIndex: (index + 1) as 1 | 2 | 3,
+    plannedDispatchAt: anchorMs + delay,
+    dispatchRequestedAt: null,
+    dispatchAt: null,
+    launchReason: (index === 0 ? "initial_immediate" : "scheduled_delay") as PanelLaunchReason,
+    scheduleSkewMs: null,
+  }));
+}
 
 export type PanelAttemptStatus =
   | "queued"
@@ -21,7 +54,13 @@ export type PanelAttemptStatus =
   | "partial"
   | "failed";
 
-export type PanelStartReason = "cascade_activity" | "start_gate_timeout" | "retry";
+export type PanelStartReason =
+  | "initial_immediate"
+  | "scheduled_delay"
+  | "recovery_rerun"
+  | "cascade_activity"
+  | "start_gate_timeout"
+  | "retry";
 
 export type PanelStallReason =
   | "inactivity_timeout"
@@ -98,7 +137,7 @@ export type PanelExecutionStage = {
   panelIndex: number;
   agentName: string;
   modelId: string;
-  startsAfter: "immediately" | "previous_first_activity" | "previous_start_gate_timeout";
+  startsAfter: "immediately" | "launch_clock" | "previous_first_activity" | "previous_start_gate_timeout";
   startGateTimeoutMs: number;
 };
 
@@ -147,7 +186,7 @@ export function buildPanelExecutionPlan(
     panelIndex: agent.panelIndex,
     agentName: agent.agentName,
     modelId: agent.modelId,
-    startsAfter: index === 0 ? "immediately" : "previous_first_activity",
+    startsAfter: index === 0 ? "immediately" : "launch_clock",
     startGateTimeoutMs,
   }));
   return {
@@ -166,6 +205,7 @@ export class PanelScheduler {
   private readonly activityBySlot: Map<number, { first: number; last: number; pendingTool: boolean }> = new Map();
   private readonly options: Required<PanelSchedulerOptions>;
   private readonly panelModels: string[];
+  private launchSchedule: PanelLaunchSchedule[] | undefined;
 
   constructor(panelModels: string[], options?: PanelSchedulerOptions) {
     this.panelModels = panelModels.slice(0, PANEL_COUNT);
@@ -181,6 +221,77 @@ export class PanelScheduler {
 
   getCapability(): PanelLivenessCapability {
     return { ...this.options.capability };
+  }
+
+  /** Install the persisted absolute launch schedule that drives launch timing. */
+  setLaunchSchedule(schedule: PanelLaunchSchedule[] | undefined): void {
+    this.launchSchedule = schedule ? schedule.map((entry) => ({ ...entry })) : undefined;
+  }
+
+  private plannedDispatchAt(panelIndex: number): number | undefined {
+    const entry = this.launchSchedule?.find((s) => s.panelIndex === panelIndex);
+    return entry?.plannedDispatchAt;
+  }
+
+  /**
+   * Schedule-driven next action. Original Panel 2/3 launches are gated only by
+   * the absolute `plannedDispatchAt` clock — never by previous-panel activity,
+   * output, success, failure, retry, or timeout. Same-slot retries fire
+   * immediately and do not alter the original launch schedule. Stall/cancel
+   * detection still runs for tracing. Falls back to the legacy activity cascade
+   * only when no launch schedule has been installed.
+   */
+  nextScheduledAction(): PanelSchedulerAction {
+    if (!this.launchSchedule) return this.nextAction();
+    const now = this.options.now();
+    for (let i = 1; i <= PANEL_COUNT; i += 1) {
+      if (this.shouldMarkSuspectedStalled(i)) this.markSuspectedStalled(i);
+    }
+    for (let i = 1; i <= PANEL_COUNT; i += 1) {
+      const cancel = this.shouldCancelForInactivity(i);
+      if (cancel.cancel) {
+        const attempt = this.currentAttempt(i);
+        return { type: "cancel_panel", panelIndex: i, attempt: attempt?.attempt ?? 1, reason: cancel.reason ?? "inactivity_timeout" };
+      }
+    }
+    // Same-slot retries first — immediate, independent of the launch schedule.
+    for (let i = 1; i <= PANEL_COUNT; i += 1) {
+      const current = this.currentAttempt(i);
+      if (current && (current.status === "stalled" || current.status === "cancelled") && current.attempt < this.options.maxAttempts) {
+        return { type: "start_panel", panelIndex: i, attempt: current.attempt + 1, reason: "recovery_rerun" };
+      }
+    }
+    // Fresh launches: a slot that has never been dispatched launches the moment
+    // its absolute plannedDispatchAt is due, regardless of any other panel.
+    for (let i = 1; i <= PANEL_COUNT; i += 1) {
+      if (this.currentAttempt(i)) continue;
+      const due = this.plannedDispatchAt(i) ?? now;
+      if (now >= due) {
+        return { type: "start_panel", panelIndex: i, attempt: 1, reason: i === 1 ? "initial_immediate" : "scheduled_delay" };
+      }
+    }
+    if (this.isTerminal()) return { type: "done" };
+    // Wait until the next not-yet-launched slot becomes due, or a liveness
+    // deadline for an active slot when token-level telemetry is exposed.
+    const deadlines: number[] = [];
+    for (let i = 1; i <= PANEL_COUNT; i += 1) {
+      if (!this.currentAttempt(i)) {
+        const due = this.plannedDispatchAt(i);
+        if (due !== undefined && due > now) deadlines.push(due);
+        continue;
+      }
+      const attempt = this.currentAttempt(i);
+      if (attempt && this.options.capability.tokenLevelLiveness
+        && ["waiting_for_activity", "running", "healthy", "suspected_stalled", "retrying"].includes(attempt.status)) {
+        const activity = this.activityBySlot.get(i);
+        const lastTs = activity?.last ?? new Date(attempt.startedAt).getTime();
+        deadlines.push(lastTs + this.options.inactivityTimeoutMs);
+      }
+    }
+    if (deadlines.length === 0) {
+      return { type: "wait", deadlineMs: now + 15_000, reason: "all_running" };
+    }
+    return { type: "wait", deadlineMs: Math.min(...deadlines), reason: "all_running" };
   }
 
   getAttempts(): PanelAttemptTrace[] {

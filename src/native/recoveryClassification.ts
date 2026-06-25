@@ -2,7 +2,6 @@ import { execFile } from "node:child_process";
 import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { validateCandidateOutput } from "../council/candidateValidation.js";
 import { FusionCouncilError } from "../utils/errors.js";
 import type {
   PanelAttemptTrace,
@@ -12,13 +11,13 @@ import type {
 } from "../types.js";
 import {
   candidatePanelOutputPaths,
-  diffAgainstBaseline,
-  loadBaselineManifest,
   type BaselineManifest,
 } from "./candidateWorkspace.js";
-import { hashSharedPanelPrompt } from "./runState.js";
-import { isPathContainedWithin } from "./speculativeWorkspacePaths.js";
-import { parseCandidateWorkspaceUnusable, type ParsedPanelExecutionContext } from "./speculativeBuild.js";
+import { type ParsedPanelExecutionContext } from "./speculativeBuild.js";
+import {
+  classifyCandidateEvidence,
+  renderDeterministicCandidateReport,
+} from "./candidateClassification.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -120,10 +119,6 @@ export function isWeakRerunReason(reason: string | undefined): boolean {
 export function assessReportContent(text: string | undefined): ReportAssessment {
   const trimmed = text?.trim() ?? "";
   if (!trimmed) return { valid: false, reason: "absent" };
-
-  if (parseCandidateWorkspaceUnusable(trimmed).unusable) {
-    return { valid: false, reason: "workspace-unusable marker" };
-  }
   if (/^FUSION_(?:ADVISORY|BLOCK)/i.test(trimmed)) {
     return { valid: false, reason: "advisory/block marker" };
   }
@@ -137,17 +132,9 @@ export function assessReportContent(text: string | undefined): ReportAssessment 
     return { valid: false, reason: "refusal without implementation" };
   }
 
-  const validation = validateCandidateOutput(trimmed);
-  if (validation.status === "failed" && validation.score < 3) {
-    return {
-      valid: false,
-      reason: `report validation failed: ${validation.missingSections.join(", ") || "insufficient content"}`,
-    };
-  }
-
   return {
     valid: true,
-    kind: validation.status === "passed" ? "full" : "partial",
+    kind: /^#{1,6}\s+/m.test(trimmed) ? "full" : "partial",
     content: trimmed,
     path: "",
   };
@@ -179,69 +166,11 @@ function hasPriorSucceededAttempt(
   );
 }
 
-async function sharedPromptHashMatches(sharedTaskPath: string, expectedHash: string): Promise<boolean> {
-  const text = await readTextIfExists(sharedTaskPath);
-  if (!text) return false;
-  return hashSharedPanelPrompt(text) === expectedHash;
-}
-
-function buildRecoveryReportStub(input: {
-  logicalPanelIndex: number;
-  workspacePath: string;
-  changedFiles: string[];
-  verification?: VerificationSummary;
-  priorSucceededAttempt: boolean;
-}): string {
-  const verificationLines = input.verification
-    ? [
-        `- typecheck: ${input.verification.typecheck ?? "not_run"}`,
-        `- test: ${input.verification.test ?? "not_run"}`,
-        `- build: ${input.verification.build ?? "not_run"}`,
-      ]
-    : ["- verification not rerun during recovery classification"];
-
-  return [
-    "# Candidate Status",
-    "- completed (recovered from existing candidate workspace)",
-    "",
-    "## Verification",
-    ...verificationLines,
-    "",
-    "## Files Changed",
-    ...input.changedFiles.map((file) => `- ${file}`),
-    "",
-    "## Recovery Evidence",
-    `- candidate workspace: ${input.workspacePath}`,
-    `- prior successful native attempt: ${input.priorSucceededAttempt ? "yes" : "no"}`,
-    "",
-    "## Implementation Guidance",
-    "Recovered candidate implementation exists in the assigned external candidate workspace.",
-    "",
-    "## Requirement Ledger",
-    "- Recovered from interrupted speculative build; inspect workspace diff for implementation evidence.",
-    "",
-    "## Hidden Probe Test Plan",
-    "- Verify recovered candidate workspace tests and build commands.",
-    "",
-    "## Public API / Error Contract Checklist",
-    "- Inspect recovered candidate workspace exports and error handling.",
-  ].join("\n");
-}
-
 export async function classifyRecoveredPanelCandidate(
   input: ClassifyRecoveredPanelInput,
 ): Promise<RecoveredPanelCandidate> {
   const { logicalPanelIndex, attempt, agentName, modelId } = input;
   const ctx = attempt.panelContexts.find((entry) => entry.logicalPanelIndex === logicalPanelIndex);
-  const evidence = {
-    executionContext: false,
-    candidateWorkspace: false,
-    candidateChanges: false,
-    candidateLocalReport: false,
-    sourceSideReport: false,
-    priorSucceededAttempt: false,
-    verificationRan: false,
-  };
   const evidenceSourcesChecked: RecoveryEvidenceSource[] = [];
 
   if (!ctx) {
@@ -250,141 +179,68 @@ export async function classifyRecoveredPanelCandidate(
       model: modelId,
       agentName,
       classification: "missing",
-      evidence,
+      evidence: {
+        workspaceExists: false,
+        workspaceSafe: false,
+        executionContextMatches: false,
+        sharedPromptHashMatches: false,
+        meaningfulChangedFiles: 0,
+        changedSourceFiles: 0,
+        changedTestFiles: 0,
+        changedConfigFiles: 0,
+        changedFiles: [],
+        verification: {},
+        priorTerminalStatus: "unknown",
+        finalMessageFormat: "missing",
+        warnings: ["no panel execution context artifact found for this logical slot"],
+      },
       evidenceSourcesChecked: [...RECOVERY_EVIDENCE_SOURCES],
       rerunEligible: true,
       rerunReason: "no panel execution context artifact found for this logical slot",
     };
   }
 
-  evidenceSourcesChecked.push("execution_context");
-  const executionContextValid =
-    path.resolve(ctx.sourceWorkspacePath) === path.resolve(attempt.sourceWorkspace)
-    && await sharedPromptHashMatches(ctx.sharedTaskPath, attempt.sharedPromptHash);
-  evidence.executionContext = executionContextValid;
-
-  evidenceSourcesChecked.push("candidate_workspace");
-  const workspacePath = path.resolve(ctx.candidateWorkspacePath);
-  const workspaceExists = await pathExists(workspacePath);
-  const workspaceExternal = workspaceExists && !isPathContainedWithin(workspacePath, attempt.sourceWorkspace);
-  evidence.candidateWorkspace = workspaceExternal;
-
   evidenceSourcesChecked.push("prior_succeeded_attempt");
   const priorSucceededAttempt = hasPriorSucceededAttempt(logicalPanelIndex, attempt.panelAttempts);
-  evidence.priorSucceededAttempt = priorSucceededAttempt;
-
-  let changedFiles: string[] = [];
-  evidenceSourcesChecked.push("candidate_changes");
-  if (workspaceExternal) {
-    const candidateManifestPath = path.join(attempt.externalStagingDir, `panel-${logicalPanelIndex}-manifest.json`);
-    const candidateBaseline = await loadBaselineManifest(candidateManifestPath);
-    const baselineForDiff = candidateBaseline ?? attempt.baselineManifest;
-    const diff = await diffAgainstBaseline(workspacePath, baselineForDiff);
-    changedFiles = [...diff.changedFiles, ...diff.addedFiles, ...diff.removedFiles];
-    evidence.candidateChanges = changedFiles.length > 0;
-  }
-
-  evidenceSourcesChecked.push("source_side_report");
-  const sourceSideReportPath = path.join(attempt.orphanSourceArtifactRoot, `panel-${logicalPanelIndex}-report.md`);
-  const sourceSideText = await readTextIfExists(sourceSideReportPath);
-  const sourceAssessment = assessReportContent(sourceSideText);
-  evidence.sourceSideReport = sourceAssessment.valid;
-  const sourceReport = sourceAssessment.valid
-    ? { ...sourceAssessment, path: sourceSideReportPath }
-    : undefined;
-
-  evidenceSourcesChecked.push("candidate_local_report");
-  const localReportPath = candidatePanelOutputPaths(workspacePath).reportPath;
-  const localText = await readTextIfExists(localReportPath);
-  const localAssessment = assessReportContent(localText);
-  evidence.candidateLocalReport = localAssessment.valid;
-  const localReport = localAssessment.valid
-    ? { ...localAssessment, path: localReportPath }
-    : undefined;
-
   let verification: VerificationSummary | undefined;
   evidenceSourcesChecked.push("verification");
-  if (workspaceExternal) {
-    verification = await runWorkspaceVerification(workspacePath, input.verificationOptions);
-    evidence.verificationRan = true;
-  }
+  verification = await runWorkspaceVerification(path.resolve(ctx.candidateWorkspacePath), input.verificationOptions);
 
-  const bestReport = sourceReport ?? localReport;
-  const verificationPassing = verification
-    ? verification.typecheck !== "fail" && verification.test !== "fail" && verification.build !== "fail"
-    : false;
-  const hasReportEvidence = Boolean(bestReport);
-  const hasStrongWorkspaceEvidence =
-    evidence.candidateChanges && (verificationPassing || (evidence.verificationRan && priorSucceededAttempt));
+  evidenceSourcesChecked.push("execution_context", "candidate_workspace", "candidate_changes", "source_side_report", "candidate_local_report");
+  const sourceSideReportPath = path.join(attempt.orphanSourceArtifactRoot, `panel-${logicalPanelIndex}-report.md`);
+  const localReportPath = candidatePanelOutputPaths(path.resolve(ctx.candidateWorkspacePath)).reportPath;
+  const candidate = await classifyCandidateEvidence({
+    logicalPanelIndex,
+    sourceWorkspace: attempt.sourceWorkspace,
+    expectedSharedPromptHash: attempt.sharedPromptHash,
+    candidateWorkspacePath: ctx.candidateWorkspacePath,
+    candidateBaselineManifestPath: path.join(attempt.externalStagingDir, `panel-${logicalPanelIndex}-manifest.json`),
+    fallbackBaselineManifest: attempt.baselineManifest,
+    executionContextSourceWorkspacePath: ctx.sourceWorkspacePath,
+    executionContextSharedTaskPath: ctx.sharedTaskPath,
+    sourceSideReportPath,
+    candidateLocalReportPath: localReportPath,
+    explicitVerification: verification,
+    priorTerminalStatus: priorSucceededAttempt ? "succeeded" : "unknown",
+  });
 
-  if (!executionContextValid) {
-    return finish({
-      classification: "invalid",
-      rerunReason: "execution context does not match recovered source workspace or shared prompt",
-    });
-  }
-  if (!workspaceExternal) {
-    return finish({
-      classification: workspaceExists ? "invalid" : "missing",
-      rerunReason: workspaceExists
-        ? "candidate workspace resolves inside or equal to source workspace"
-        : "no external candidate workspace found for this logical slot",
-    });
-  }
-  if (!evidence.candidateChanges) {
-    return finish({
-      classification: "invalid",
-      rerunReason: "candidate workspace is only an untouched baseline copy with no meaningful project changes",
-    });
-  }
-
-  const advisoryOnly = sourceSideText && /^FUSION_ADVISORY/i.test(sourceSideText.trim());
-  if (advisoryOnly && !hasReportEvidence && !priorSucceededAttempt) {
-    return finish({
-      classification: "invalid",
-      rerunReason: "advisory-only report with no supported candidate workspace implementation",
-    });
-  }
-
-  if (!hasReportEvidence && !priorSucceededAttempt && !verificationPassing) {
-    return finish({
-      classification: "missing",
-      rerunReason: "no valid report or prior successful attempt evidence after workspace inspection",
-    });
-  }
-
-  if (hasReportEvidence || hasStrongWorkspaceEvidence) {
-    const reportPath = bestReport?.path;
-    const reportContent = bestReport?.content
-      ?? buildRecoveryReportStub({
+  const reportContent = candidate.reportContent
+    ?? (candidate.classification === "usable" || candidate.classification === "partial"
+      ? renderDeterministicCandidateReport({
         logicalPanelIndex,
-        workspacePath,
-        changedFiles,
-        verification,
-        priorSucceededAttempt,
-      });
-    const classification =
-      verificationPassing || bestReport?.kind === "full" || (hasReportEvidence && priorSucceededAttempt)
-        ? "usable"
-        : "partial";
-    return finish({
-      classification,
-      rerunReason: undefined,
-      reportPath,
-      reportContent,
-    });
-  }
-
+        workspacePath: path.resolve(ctx.candidateWorkspacePath),
+        evidence: candidate.evidence,
+        classification: candidate.classification,
+      })
+      : undefined);
+  const reportPath = candidate.reportPath;
   return finish({
-    classification: "partial",
-    rerunReason: undefined,
-    reportContent: buildRecoveryReportStub({
-      logicalPanelIndex,
-      workspacePath,
-      changedFiles,
-      verification,
-      priorSucceededAttempt,
-    }),
+    classification: candidate.classification,
+    rerunReason: candidate.rerunReason,
+    reportPath,
+    reportContent,
+    evidence: candidate.evidence,
+    verification: candidate.verificationSummary,
   });
 
   function finish(details: {
@@ -392,6 +248,8 @@ export async function classifyRecoveredPanelCandidate(
     rerunReason?: string;
     reportPath?: string;
     reportContent?: string;
+    evidence: RecoveredPanelCandidate["evidence"];
+    verification: VerificationSummary;
   }): RecoveredPanelCandidate {
     const rerunEligible = details.classification === "missing" || details.classification === "invalid";
     return {
@@ -399,13 +257,13 @@ export async function classifyRecoveredPanelCandidate(
       model: ctx?.modelId ?? modelId,
       agentName,
       classification: details.classification,
-      evidence,
+      evidence: details.evidence,
       evidenceSourcesChecked,
-      workspacePath: workspaceExternal ? workspacePath : undefined,
+      workspacePath: details.evidence.workspaceSafe ? path.resolve(ctx!.candidateWorkspacePath) : undefined,
       reportPath: details.reportPath,
-      sourceSideReportPath: sourceAssessment.valid ? sourceSideReportPath : undefined,
-      changedFileCount: changedFiles.length,
-      verification,
+      sourceSideReportPath: details.evidence.sourceSideReportPath,
+      changedFileCount: details.evidence.changedFiles.length,
+      verification: details.verification,
       rerunEligible,
       rerunReason: rerunEligible ? details.rerunReason : undefined,
       reportContent: details.reportContent,
@@ -481,9 +339,11 @@ export function renderRecoveryPanelPlanMarkdown(
     lines.push(`- candidate workspace: ${candidate.workspacePath ?? "n/a"}`);
     lines.push(`- source-side report: ${candidate.sourceSideReportPath ?? "n/a"}`);
     lines.push(`- local report: ${candidate.reportPath ?? "n/a"}`);
-    lines.push(`- prior successful attempt: ${candidate.evidence.priorSucceededAttempt ? "yes" : "no"}`);
+    lines.push(`- prior terminal status: ${candidate.evidence.priorTerminalStatus ?? "unknown"}`);
     lines.push(`- changed files: ${candidate.changedFileCount ?? 0}`);
     lines.push(`- verification: ${formatVerification(candidate.verification)}`);
+    lines.push(`- final message format: ${candidate.evidence.finalMessageFormat}`);
+    lines.push(`- warnings: ${candidate.evidence.warnings.length ? candidate.evidence.warnings.join("; ") : "none"}`);
     lines.push(`- rerun eligible: ${candidate.rerunEligible ? "yes" : "no"}`);
     lines.push(`- rerun reason: ${candidate.rerunReason ?? "n/a"}`);
     lines.push("");

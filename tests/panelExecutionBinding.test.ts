@@ -96,6 +96,14 @@ async function prepareSpeculative() {
   };
 }
 
+async function mutateCandidates(prepare: Awaited<ReturnType<typeof prepareSpeculative>>, count = 3) {
+  await Promise.all((prepare.speculative?.candidateWorkspaces ?? []).slice(0, count).map(async (workspace, index) => {
+    const srcDir = path.join(workspace.workspacePath, "src");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(path.join(srcDir, "index.ts"), `export const candidate = ${index + 1};\n`, "utf8");
+  }));
+}
+
 describe("speculative per-panel execution binding", () => {
   test("each panel gets a distinct, fully resolved execution context (no placeholders)", async () => {
     const prepare = await prepareSpeculative();
@@ -198,6 +206,7 @@ describe("speculative per-panel execution binding", () => {
 
   test("a panel with source-workspace CWD but a valid candidate path proceeds (absolute-path mode)", async () => {
     const prepare = await prepareSpeculative();
+    await mutateCandidates(prepare);
     for (const assignment of prepare.speculative?.panelExecutionAssignments ?? []) {
       expect(assignment.absolutePathModeRequired).toBe(true);
       expect(assignment.nativeCwdScoped).toBe(false);
@@ -222,6 +231,7 @@ describe("speculative per-panel execution binding", () => {
 
   test("FUSION_CANDIDATE_WORKSPACE_UNUSABLE marker marks a panel failed and produces no advisory report", async () => {
     const prepare = await prepareSpeculative();
+    await mutateCandidates(prepare, 3);
     const badPath = prepare.speculative?.candidateWorkspaces[1].workspacePath ?? "/missing";
     const marker = `${FUSION_CANDIDATE_WORKSPACE_UNUSABLE_PREFIX} ${badPath}`;
     expect(parseCandidateWorkspaceUnusable(marker)).toEqual({ unusable: true, path: badPath });
@@ -245,7 +255,7 @@ describe("speculative per-panel execution binding", () => {
     expect(collect.quorum.usable).toBe(2);
     // and it is not surfaced as a usable candidate trace entry
     const trace2 = collect.speculative?.panelCandidateTrace.find((c) => c.logicalPanelIndex === 2);
-    expect(trace2?.status).toBe("failed");
+    expect(trace2?.status).toBe("excluded");
   });
 
   test("panel report written inside candidate workspace is collected into source-side artifacts", async () => {

@@ -62,7 +62,7 @@ describe("isActivityMeaningful", () => {
 });
 
 describe("buildPanelExecutionPlan", () => {
-  test("panel 1 starts immediately, panels 2 and 3 start after previous first activity", () => {
+  test("panel 1 starts immediately, panels 2 and 3 follow the launch clock", () => {
     const plan = buildPanelExecutionPlan(
       [
         { panelIndex: 1, agentName: "fusion-panel-1", modelId: "provider-a/model-1" },
@@ -80,8 +80,8 @@ describe("buildPanelExecutionPlan", () => {
     expect(plan.inactivityTimeoutMs).toBe(PANEL_INACTIVITY_TIMEOUT_MS);
     expect(plan.maxAttemptsPerPanel).toBe(MAX_PANEL_ATTEMPTS);
     expect(plan.stages[0].startsAfter).toBe("immediately");
-    expect(plan.stages[1].startsAfter).toBe("previous_first_activity");
-    expect(plan.stages[2].startsAfter).toBe("previous_first_activity");
+    expect(plan.stages[1].startsAfter).toBe("launch_clock");
+    expect(plan.stages[2].startsAfter).toBe("launch_clock");
     expect(plan.capability).toEqual(PANEL_LIVENESS_CAPABILITY);
   });
 });

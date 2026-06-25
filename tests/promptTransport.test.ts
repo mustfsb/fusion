@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -36,6 +36,11 @@ async function prepareMaterializedCandidateBuild(task: string) {
   );
   await nativeAdvance({ runId: prepare.runId }, { cwd: tmpCwd });
   const state = await loadRunState(tmpCwd, prepare.runId);
+  await Promise.all((state.speculative?.candidateWorkspaces ?? []).map(async (workspace, index) => {
+    const srcDir = path.join(workspace.workspacePath, "src");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(path.join(srcDir, "index.ts"), `export const candidate = ${index + 1};\n`, "utf8");
+  }));
   return {
     ...prepare,
     sharedPanelPrompt: state.sharedPanelPrompt,

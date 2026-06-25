@@ -47,8 +47,8 @@ describe("docs and examples", () => {
     expect(command).toContain("fusion-judge");
     expect(command).toContain("staggered cascade");
     expect(command).toContain("45 seconds");
-    expect(command).toContain("start_gate_timeout");
-    expect(command).toContain("retry");
+    expect(command).toContain("scheduled_delay");
+    expect(command).toContain("recovery_rerun");
     expect(command).toContain("fusion-panel-4");
     expect(command).toContain("panelResults");
     expect(command).toContain("shared panel prompt hash");
@@ -81,6 +81,25 @@ describe("docs and examples", () => {
     expect(command).toContain("Pass the exact user task text");
     expect(command).toContain("$ARGUMENTS");
     expect(command).toContain("Do NOT use the legacy all-in-one `fusion_council` tool");
+  });
+
+  test("fusion-build documents the default real_parallel_process_build supervisor", async () => {
+    const command = await readFile("examples/commands/fusion-build.md", "utf8");
+    expect(command).toContain("real_parallel_process_build");
+    expect(command).toContain("fusion_supervisor");
+    expect(command).toContain('"stage": "launch"');
+    expect(command).toContain("fusion-main-builder");
+    expect(command).toContain("detached Node process supervisor");
+    expect(command).toContain("REAL_PARALLEL_EXECUTION_CONFIRMED");
+    expect(command).toContain("non-default compatibility fallback");
+  });
+
+  test("fusion-resume documents supervisor recovery", async () => {
+    const command = await readFile("examples/commands/fusion-resume.md", "utf8");
+    expect(command).toContain("real_parallel_process_build");
+    expect(command).toContain("supervisor-state.json");
+    expect(command).toContain("fusion_supervisor");
+    expect(command).toContain('"stage": "resume"');
   });
 
   test("fusion-no-build command exists and preserves advisory-only workflow requirements", async () => {

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -45,6 +45,16 @@ function gate(): ContractGate {
 
 function panel(modelId: string, content: string, success = true): PanelResponse {
   return { modelId, provider: "test", success, content, latencyMs: 1 };
+}
+
+async function stageAndMutateCandidates(tmpCwd: string, runId: string, count = 3) {
+  await nativeAdvance({ runId }, { cwd: tmpCwd });
+  const state = await loadRunState(tmpCwd, runId);
+  await Promise.all((state.speculative?.candidateWorkspaces ?? []).slice(0, count).map(async (workspace, index) => {
+    const srcDir = path.join(workspace.workspacePath, "src");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(path.join(srcDir, "index.ts"), `export const candidate = ${index + 1};\n`, "utf8");
+  }));
 }
 
 const PANEL_A = [
@@ -666,6 +676,7 @@ describe("Native build pipeline with comparison + gate", () => {
         { cwd: tmpCwd },
       );
 
+      await stageAndMutateCandidates(tmpCwd, prepare.runId);
       const collect = await nativeCollect(
         {
           runId: prepare.runId,
@@ -746,6 +757,7 @@ describe("Native build pipeline with comparison + gate", () => {
         },
         { cwd: tmpCwd },
       );
+      await stageAndMutateCandidates(tmpCwd, prepare.runId);
       await nativeCollect(
         {
           runId: prepare.runId,
@@ -849,6 +861,7 @@ describe("Native build pipeline with comparison + gate", () => {
         },
         { cwd: tmpCwd },
       );
+      await stageAndMutateCandidates(tmpCwd, prepare.runId);
       await nativeCollect(
         {
           runId: prepare.runId,
@@ -961,6 +974,7 @@ describe("Native build pipeline with comparison + gate", () => {
         },
         { cwd: tmpCwd },
       );
+      await stageAndMutateCandidates(tmpCwd, prepare.runId);
       await nativeCollect(
         {
           runId: prepare.runId,
@@ -1183,6 +1197,7 @@ describe("Regression: native architecture and installer safety", () => {
         },
         { cwd: tmp },
       );
+      await stageAndMutateCandidates(tmp, prepare.runId);
       const collect = await nativeCollect(
         {
           runId: prepare.runId,

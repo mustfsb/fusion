@@ -15,7 +15,7 @@ import {
   parseMergePatchContract,
   selectApprovedPatchItems,
 } from "../src/native/speculativeBuild.js";
-import { completeCandidate } from "./fixtures/candidates.js";
+import { completeCandidate, conciseCompletedCandidate } from "./fixtures/candidates.js";
 
 let tmpCwd: string;
 
@@ -32,6 +32,10 @@ afterEach(async () => {
   vi.useRealTimers();
   await rm(tmpCwd, { recursive: true, force: true });
 });
+
+async function mutateCandidateWorkspace(workspacePath: string, value: string) {
+  await writeFile(path.join(workspacePath, "src", "index.ts"), `export const candidate = ${JSON.stringify(value)};\n`, "utf8");
+}
 
 describe("Merge Patch Contract parsing", () => {
   test("parses required sections and decisions", () => {
@@ -141,6 +145,9 @@ describe("speculative parallel build smoke", () => {
     );
     expect(record.recorded).toBe(true);
     expect(record.mainBaseline.status).toBe("passed");
+
+    const state = await import("../src/native/runState.js").then((mod) => mod.loadRunState(tmpCwd, prepare.runId));
+    await Promise.all((state.speculative?.candidateWorkspaces ?? []).map((workspace, index) => mutateCandidateWorkspace(workspace.workspacePath, `candidate-${index + 1}`)));
 
     const collect = await nativeCollect(
       {
@@ -282,5 +289,61 @@ describe("speculative parallel build smoke", () => {
 
     const contractText = await readFile(finalize.speculative?.mergePatchContractPath ?? "", "utf8");
     expect(contractText).toContain("PATCH_REQUIRED");
+  });
+
+  test("invalid judge output never falls back to NO_PATCH_REQUIRED", async () => {
+    const prepare = await nativePrepare(
+      {
+        task: "Invalid contract test",
+        mode: "build_prompt",
+        panelMode: "candidate_build",
+        buildStrategy: "speculative_parallel_build",
+        command: "fusion-build",
+        minSuccessfulPanels: 2,
+        parallelExecutionSupported: true,
+      },
+      { cwd: tmpCwd },
+    );
+    await nativeAdvance({ runId: prepare.runId }, { cwd: tmpCwd });
+    const state = await import("../src/native/runState.js").then((mod) => mod.loadRunState(tmpCwd, prepare.runId));
+    await Promise.all((state.speculative?.candidateWorkspaces ?? []).slice(0, 2).map((workspace, index) => mutateCandidateWorkspace(workspace.workspacePath, `invalid-${index + 1}`)));
+    await nativeRecordMainBaseline(
+      {
+        runId: prepare.runId,
+        mainBaseline: {
+          status: "passed",
+          workspacePath: tmpCwd,
+          changedFiles: ["src/index.ts"],
+          verification: { typecheck: "pass", test: "pass", build: "pass" },
+        },
+      },
+      { cwd: tmpCwd },
+    );
+    await nativeCollect(
+      {
+        runId: prepare.runId,
+        panelResults: [
+          { agentName: "fusion-panel-1", modelId: prepare.panelAgents[0].modelId, content: conciseCompletedCandidate },
+          { agentName: "fusion-panel-2", modelId: prepare.panelAgents[1].modelId, content: conciseCompletedCandidate },
+        ],
+        mainBaseline: {
+          status: "passed",
+          workspacePath: tmpCwd,
+          changedFiles: ["src/index.ts"],
+          verification: { typecheck: "pass", test: "pass", build: "pass" },
+        },
+      },
+      { cwd: tmpCwd },
+    );
+    const finalize = await nativeFinalize(
+      {
+        runId: prepare.runId,
+        judgeOutput: "# Speculative Build Comparison\n\n## Main Baseline Status\n- verification status: passed\n",
+      },
+      { cwd: tmpCwd },
+    );
+    expect(finalize.success).toBe(false);
+    expect(finalize.trace.speculative?.mergePatchDecision).toBeUndefined();
+    expect(finalize.traceSummary).not.toContain("NO_PATCH_REQUIRED");
   });
 });

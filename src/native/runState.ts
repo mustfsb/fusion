@@ -110,6 +110,28 @@ export type SpeculativeRunState = {
   abortReason?: string;
   preparedAt?: string;
   candidatePreparationCompletedAt?: string;
+  // --- Real concurrent launch contract (absolute stagger schedule) ---
+  /** When the run launch was first requested (minimal bootstrap entry). */
+  runLaunchRequestedAt?: string;
+  /** Bounded synchronous source snapshot capture, traced separately. */
+  sourceSnapshotStartedAt?: string;
+  sourceSnapshotCompletedAt?: string;
+  sourceSnapshotDurationMs?: number;
+  /** Original launch clock anchor (ms epoch) for the fixed-delay schedule. */
+  launchClockAnchorMs?: number;
+  /** Persisted absolute per-panel launch schedule. */
+  panelLaunchSchedule?: import("../types.js").PanelLaunchSchedule[];
+  /** Hard orchestration violations; surfaced, never hidden. */
+  orchestrationViolations?: import("../types.js").OrchestrationViolationCode[];
+  // --- Judge liveness / incremental preflight ---
+  judgeManifestPath?: string;
+  judgeDispatchAt?: string;
+  judgeFirstCredibleActivityAt?: string;
+  judgeLastCredibleActivityAt?: string;
+  judgeSuspectedStalledAt?: string;
+  judgeTerminalAt?: string;
+  judgeAttempt?: number;
+  judgeRetryScheduledAt?: string;
   pathResolution?: SpeculativePathResolutionTrace;
   sharedTaskPath?: string;
   panelExecutionAssignments?: import("../types.js").PanelExecutionAssignmentTrace[];
@@ -204,6 +226,10 @@ export function mainBaselinePatchArtifactPath(cwd: string, runId: string, traceD
 
 export function mergePatchContractArtifactPath(cwd: string, runId: string, traceDir?: string): string {
   return path.join(resolveTraceRoot(cwd, traceDir), runId, "merge-patch-contract.full.md");
+}
+
+export function judgeManifestArtifactPath(cwd: string, runId: string, traceDir?: string): string {
+  return path.join(resolveTraceRoot(cwd, traceDir), runId, "judge-preflight-manifest.json");
 }
 
 export async function writeArtifactFile(filePath: string, content: string): Promise<string> {

@@ -680,27 +680,49 @@ function renderSpeculativeTraceSection(speculative: NonNullable<FusionRunTrace["
   lines.push("");
   lines.push("Main baseline:");
   lines.push(`- workspace: ${speculative.mainBaseline.workspacePath}`);
+  lines.push(`- launch anchor: ${speculative.launchClockAnchorMs ?? "n/a"}`);
   lines.push(`- started: ${speculative.mainBaseline.startedAt ?? "n/a"}`);
   lines.push(`- completed: ${speculative.mainBaseline.completedAt ?? "n/a"}`);
   const mv = speculative.mainBaseline.verification;
   lines.push(`- verification: ${mv ? [mv.typecheck, mv.test, mv.build].filter(Boolean).join("/") : "n/a"}`);
   lines.push(`- changed files: ${speculative.mainBaseline.changedFiles.length ? speculative.mainBaseline.changedFiles.join(", ") : "none"}`);
   lines.push("");
-  lines.push("Panel candidates:");
+  lines.push("Scheduling:");
+  lines.push(`- active scheduler capability: ${speculative.activeSchedulerCapability ?? "n/a"}`);
+  for (const entry of speculative.panelLaunchSchedule ?? []) {
+    lines.push(`- panel ${entry.panelIndex} planned / actual: ${new Date(entry.plannedDispatchAt).toISOString()} / ${entry.dispatchAt !== null ? new Date(entry.dispatchAt).toISOString() : "n/a"}`);
+    lines.push(`  dispatch skew: ${entry.scheduleSkewMs ?? "n/a"}`);
+    lines.push(`  launch reason: ${entry.launchReason}`);
+  }
+  lines.push("");
+  lines.push("Candidate validation:");
   for (const candidate of speculative.panelCandidates) {
-    lines.push(`- panel ${candidate.logicalPanelIndex}: model=${candidate.model}; workspace=${candidate.workspacePath}; status=${candidate.status}; report=${candidate.reportPath ?? "n/a"}`);
+    lines.push(`- panel ${candidate.logicalPanelIndex}: model=${candidate.model}; workspace=${candidate.workspacePath}; classification=${candidate.classification}; status=${candidate.status}`);
+    lines.push(`  workspace evidence: exists=${candidate.evidence.workspaceExists ? "yes" : "no"}; safe=${candidate.evidence.workspaceSafe ? "yes" : "no"}`);
+    lines.push(`  changed-file evidence: meaningful=${candidate.evidence.meaningfulChangedFiles}; source=${candidate.evidence.changedSourceFiles}; test=${candidate.evidence.changedTestFiles}; config=${candidate.evidence.changedConfigFiles}`);
+    lines.push(`  verification: ${formatVerification(candidate.verification)} (raw=${candidate.evidence.verification.typecheck ?? "unknown"}/${candidate.evidence.verification.test ?? "unknown"}/${candidate.evidence.verification.build ?? "unknown"})`);
+    lines.push(`  reports: selected=${candidate.evidence.selectedReportPath ?? candidate.reportPath ?? "n/a"}; source=${candidate.evidence.sourceSideReportPath ?? "n/a"}; local=${candidate.evidence.candidateLocalReportPath ?? "n/a"}`);
+    lines.push(`  final message format: ${candidate.evidence.finalMessageFormat}`);
+    lines.push(`  warnings: ${candidate.warnings.length ? candidate.warnings.join("; ") : "none"}`);
   }
   lines.push("");
   lines.push("Judge:");
-  const usableCount = speculative.panelCandidates.filter((c) => c.status === "usable" || c.status === "partial").length;
-  lines.push(`- quorum: ${usableCount}/${speculative.panelCandidates.length} usable+partial`);
+  const usableCount = speculative.panelCandidates.filter((c) => c.classification === "usable").length;
+  lines.push(`- quorum: ${usableCount}/${speculative.panelCandidates.length} usable`);
+  lines.push(`- eligibility: ${speculative.judgeEligibleAt ?? "n/a"}`);
+  lines.push(`- dispatched: ${speculative.judgeDispatched ? "yes" : "no"}`);
   lines.push(`- judge eligible at: ${speculative.judgeEligibleAt ?? "n/a"}`);
+  lines.push(`- judge dispatch at: ${speculative.judgeDispatchAt ?? "n/a"}`);
   lines.push(`- judge started at: ${speculative.judgeStartedAt ?? "n/a"}`);
   lines.push(`- judge completed at: ${speculative.judgeCompletedAt ?? "n/a"}`);
+  lines.push(`- judge terminal: ${speculative.judgeTerminal ? "yes" : "no"}`);
+  lines.push(`- judge manifest: ${speculative.judgeManifestPath ?? "n/a"}`);
   lines.push(`- frozen panel indexes: ${speculative.frozenPanelIndexes?.length ? speculative.frozenPanelIndexes.join(", ") : "none"}`);
   lines.push(`- late excluded panel indexes: ${speculative.lateExcludedPanelIndexes?.length ? speculative.lateExcludedPanelIndexes.join(", ") : "none"}`);
   lines.push(`- merge patch contract: ${speculative.mergePatchContractPath ?? "n/a"}`);
-  lines.push(`- final decision: ${speculative.mergePatchDecision ?? "n/a"}`);
+  lines.push(`- contract valid: ${speculative.judgeContractValid ? "yes" : "no"}`);
+  lines.push(`- judge decision status: ${speculative.judgeDecisionStatus ?? "n/a"}`);
+  lines.push(`- actual final decision: ${speculative.mergePatchDecision ?? "n/a"}`);
   const appliedItems = speculative.appliedPatchItems ?? [];
   lines.push(`- blockers applied: ${appliedItems.filter((i) => i.severity === "BLOCKER" && i.status === "applied").length}`);
   lines.push(`- must-fix applied: ${appliedItems.filter((i) => i.severity === "MUST_FIX" && i.status === "applied").length}`);
@@ -711,6 +733,13 @@ function renderSpeculativeTraceSection(speculative: NonNullable<FusionRunTrace["
   lines.push(`- skipped: ${appliedItems.filter((i) => i.status === "skipped").length}`);
   lines.push(`- failed: ${appliedItems.filter((i) => i.status === "failed").length}`);
   return lines;
+}
+
+function formatVerification(
+  verification: NonNullable<NonNullable<FusionRunTrace["speculative"]>["mainBaseline"]>["verification"] | undefined,
+): string {
+  if (!verification) return "n/a";
+  return [verification.typecheck, verification.test, verification.build].filter(Boolean).join("/") || "n/a";
 }
 
 function formatNativePanelSessions(sessions: NonNullable<FusionRunTrace["panelSessions"]>): string[] {

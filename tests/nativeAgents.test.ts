@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -34,6 +34,16 @@ beforeEach(async () => {
 afterEach(async () => {
   await Promise.all([rm(tmpAgentDir, { recursive: true, force: true }), rm(tmpCwd, { recursive: true, force: true })]);
 });
+
+async function stageAndMutateCandidates(runId: string, count = 3) {
+  await nativeAdvance({ runId }, { cwd: tmpCwd });
+  const state = await loadRunState(tmpCwd, runId);
+  await Promise.all((state.speculative?.candidateWorkspaces ?? []).slice(0, count).map(async (workspace, index) => {
+    const srcDir = path.join(workspace.workspacePath, "src");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(path.join(srcDir, "index.ts"), `export const candidate = ${index + 1};\n`, "utf8");
+  }));
+}
 
 const defaultPanels: FusionModelSpec[] = [
   { modelId: "opencode-go/kimi-k2.7-code", raw: "opencode-go/kimi-k2.7-code" },
@@ -285,7 +295,7 @@ describe("native collect + quorum", () => {
       },
       { cwd: tmpCwd },
     );
-    await nativeAdvance({ runId: prepare.runId }, { cwd: tmpCwd });
+    await stageAndMutateCandidates(prepare.runId, 3);
 
     const collect = await nativeCollect(
       {
@@ -329,6 +339,7 @@ describe("native collect + quorum", () => {
       },
       { cwd: tmpCwd },
     );
+    await stageAndMutateCandidates(prepare.runId, 2);
 
     const collect = await nativeCollect(
       {
@@ -361,6 +372,15 @@ describe("native collect + quorum", () => {
       { cwd: tmpCwd },
     );
 
+    await stageAndMutateCandidates(prepare.runId, 3);
+    // Undo the workspace change for panel 2 so its only evidence is the
+    // incomplete plan text. Without meaningful workspace changes the candidate
+    // is classified invalid/failed even though panels 1 and 3 are usable.
+    const state = await loadRunState(tmpCwd, prepare.runId);
+    const panel2Workspace = state.speculative?.candidateWorkspaces[1];
+    if (panel2Workspace) {
+      await rm(path.join(panel2Workspace.workspacePath, "src", "index.ts"), { force: true });
+    }
     const collect = await nativeCollect(
       {
         runId: prepare.runId,
@@ -395,6 +415,7 @@ describe("native finalize + trace", () => {
       },
       { cwd: tmpCwd },
     );
+    await stageAndMutateCandidates(prepare.runId);
     await nativeCollect(
       {
         runId: prepare.runId,
@@ -507,6 +528,7 @@ describe("native finalize + trace", () => {
       },
       { cwd: tmpCwd },
     );
+    await stageAndMutateCandidates(prepare.runId);
     await nativeCollect(
       {
         runId: prepare.runId,
@@ -542,6 +564,7 @@ describe("native post-build audit", () => {
       },
       { cwd: tmpCwd },
     );
+    await stageAndMutateCandidates(prepare.runId);
     await nativeCollect(
       {
         runId: prepare.runId,
@@ -556,14 +579,43 @@ describe("native post-build audit", () => {
     await nativeFinalize(
       {
         runId: prepare.runId,
-        judgeOutput: JSON.stringify({
-          summary: "ok",
-          finalRecommendation: "Proceed.",
-          requirementChecklist: ["export add"],
-          finalBuildGuidance: "Final build contract",
-          requiredTests: ["package-entry import test"],
-          finalOutput: "## Final Build Contract\nContract",
-        }),
+        judgeOutput: [
+          "# Speculative Build Comparison",
+          "",
+          "## Main Baseline Status",
+          "- verification status: passed",
+          "- key implementation paths: src/index.ts",
+          "",
+          "## Panel Candidate Status",
+          "- panel 1: usable",
+          "- panel 2: usable",
+          "- panel 3: usable",
+          "",
+          "## Literal Requirement Gaps in Main",
+          "- severity: MUST_FIX",
+          "- literal requirement: export add(a,b)",
+          "- observed main behavior: not exported",
+          "- evidence: src/index.ts",
+          "- required correction: export add",
+          "- required regression test: package-entry import test",
+          "",
+          "## Main Strengths to Preserve",
+          "",
+          "## Adopted Panel Insights",
+          "",
+          "## Rejected Panel Ideas",
+          "",
+          "## Patch Plan",
+          "1. src/index.ts",
+          "   symbol: add",
+          "   required change: export add function",
+          "   required regression test: package-entry import test",
+          "   risk: low",
+          "",
+          "## Final Patch Decision",
+          "- PATCH_REQUIRED",
+        ].join("\n"),
+        judgeSessionId: "j1",
       },
       { cwd: tmpCwd },
     );
@@ -781,8 +833,8 @@ describe("panel execution plan and attempts trace", () => {
     expect(prepare.panelExecutionPlan.maxAttemptsPerPanel).toBe(2);
     expect(prepare.panelExecutionPlan.stages).toHaveLength(3);
     expect(prepare.panelExecutionPlan.stages[0].startsAfter).toBe("immediately");
-    expect(prepare.panelExecutionPlan.stages[1].startsAfter).toBe("previous_first_activity");
-    expect(prepare.panelExecutionPlan.stages[2].startsAfter).toBe("previous_first_activity");
+    expect(prepare.panelExecutionPlan.stages[1].startsAfter).toBe("launch_clock");
+    expect(prepare.panelExecutionPlan.stages[2].startsAfter).toBe("launch_clock");
     expect(prepare.panelExecutionPlan.capability.streamActivityExposed).toBe(false);
     expect(prepare.panelExecutionPlan.capability.tokenLevelLiveness).toBe(false);
   });
