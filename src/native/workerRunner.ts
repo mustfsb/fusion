@@ -80,6 +80,10 @@ export type OpenCodeProcessWorkerRunnerOptions = {
  * machine-readable result/status artifacts to the paths exposed via env.
  */
 export function buildOpenCodeRunArgs(spec: WorkerSpawnSpec): string[] {
+  const testEntry = process.env.FUSION_OPENCODE_TEST_ENTRY;
+  if (testEntry) {
+    return [testEntry];
+  }
   const args = [
     "run",
     "--model",

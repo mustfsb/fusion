@@ -1,25 +1,33 @@
 /**
- * Type model for the `real_parallel_process_build` strategy.
+ * Type model for the hybrid `hybrid_external_main_native_panels` strategy.
  *
- * This strategy is driven by a durable, detached Node supervisor that spawns
- * REAL concurrent OpenCode CLI worker processes (one main builder + three
- * panels), then a visible judge process and an optional patch worker. Every
- * worker is a genuine OS process tracked by PID; concurrency here means actual
- * overlapping process intervals, never prompt wording.
+ * Fresh `/fusion-build` uses a hybrid visible-native pipeline:
+ * - ONE external `opencode run` main builder in an ISOLATED main candidate
+ *   workspace (never the real source workspace during initial implementation);
+ * - THREE visible native Task subagents for panels (`fusion-panel-1/2/3`) in
+ *   isolated panel candidate workspaces, all derived from the same immutable
+ *   pre-main source snapshot;
+ * - On successful main terminal, the main candidate is promoted snapshot-
+ *   relatively into the real source workspace (panels may still be running);
+ * - ONE visible native Task subagent for the judge (`fusion-judge`) that runs
+ *   directly against the promoted real source workspace, compares all
+ *   implementations, writes a Merge Patch Contract, and applies targeted fixes
+ *   ITSELF — there is no second external patch worker.
  *
- * Nothing in this module performs model calls or HTTP. Process execution is
- * delegated to the {@link WorkerRunner} abstraction so tests can inject a fake
- * OpenCode executable.
+ * Nothing in this module performs model calls or HTTP. External workers use
+ * {@link WorkerRunner}; native panel/judge dispatch uses
+ * {@link NativeSubagentDispatcher}.
  */
 
-export type WorkerRole = "main" | "panel" | "judge" | "patch";
+export type WorkerRole = "main" | "panel" | "judge";
+
+export type WorkerExecutionKind = "external_process" | "native_subagent";
 
 /** Stable worker identifiers used as session titles and trace labels. */
 export const WORKER_ID = {
   main: "fusion-main-builder",
   panel: (index: number) => `fusion-panel-${index}`,
   judge: "fusion-judge",
-  patch: "fusion-main-patch-worker",
 } as const;
 
 /**
@@ -96,10 +104,21 @@ export type WorkerCandidateEvidence = {
 export type WorkerRecord = {
   workerId: string;
   role: WorkerRole;
+  executionKind: WorkerExecutionKind;
   /** 1-based logical panel slot for panel workers. */
   logicalPanelIndex?: number;
   modelId: string;
+  configuredModelId?: string;
+  requestedModelId?: string;
+  observedProviderId?: string;
+  observedModelId?: string;
   variant?: string;
+  agentId?: string;
+  sessionId?: string;
+  dispatchMechanism?: string;
+  dispatchRequestedAt?: string;
+  dispatchedAt?: string;
+  terminalAt?: string;
   /** Absolute workspace this worker owns. */
   workspacePath: string;
   /** Canonical task artifact + hash shared byte-identically by all panels. */
@@ -120,6 +139,8 @@ export type WorkerRecord = {
   launchRequestedAt?: string;
   /** When the OS reported the process started (pid assigned). */
   spawnedAt?: string;
+  /** When the worker's owned workspace was fully materialized and ready. */
+  workspaceReadyAt?: string;
   firstActivityAt?: string;
   lastActivityAt?: string;
   endedAt?: string;
@@ -137,23 +158,77 @@ export type WorkerRecord = {
 
 export type SupervisorPhase =
   | "bootstrapping"
+  | "running"
   | "workers_running"
+  | "promotion"
   | "judge"
-  | "patch"
-  | "audit"
   | "done"
   | "aborted";
 
 export type ConcurrencyVerdict =
-  | "REAL_PARALLEL_EXECUTION_CONFIRMED"
-  | "REAL_PARALLEL_EXECUTION_NOT_CONFIRMED";
+  | "HYBRID_PARALLEL_LAUNCH_CONFIRMED"
+  | "HYBRID_PARALLEL_LAUNCH_NOT_CONFIRMED";
 
 export type SupervisorConcurrency = {
   verdict: ConcurrencyVerdict;
-  /** Number of panel processes whose run interval overlapped the main process. */
-  panelsOverlappingMain: number;
-  overlapDurationMs: number;
+  /** Number of native panel dispatches that succeeded at launch. */
+  panelsLaunched: number;
+  /** Whether all four primary launch timestamps were recorded. */
+  allLaunchTimestampsRecorded: boolean;
+  /** Whether panel dispatch requests were issued without serial completion waits. */
+  parallelPanelDispatchIssued: boolean;
+  /** Whether any panel was dispatched through external opencode run (must be false). */
+  noPanelViaExternalCli: boolean;
+  /** Whether the main requested model equals the observed runtime model. */
+  mainModelMatched: boolean;
+  mainLaunchAt?: string;
+  panelLaunchAt?: Partial<Record<1 | 2 | 3, string>>;
   blockingReason?: string;
+};
+
+export type NativePanelSessionTrace = {
+  panelNumber: 1 | 2 | 3;
+  sessionId?: string;
+  agentId: string;
+  configuredModelId: string;
+  candidateWorkspace: string;
+  dispatchRequestedAt?: string;
+  dispatchedAt?: string;
+  terminalAt?: string;
+  status: WorkerStatus;
+  resultArtifactPath: string;
+};
+
+export type NativeJudgeSessionTrace = {
+  sessionId?: string;
+  agentId: string;
+  configuredModelId: string;
+  dispatchRequestedAt?: string;
+  dispatchedAt?: string;
+  terminalAt?: string;
+  status: WorkerStatus;
+  mergePatchContractPath?: string;
+  appliedPatchSummary?: string;
+};
+
+export type ExternalMainWorkerTrace = {
+  pid?: number;
+  requestedModelId?: string;
+  configuredModelId?: string;
+  observedProviderId?: string;
+  observedModelId?: string;
+  /** Isolated main candidate workspace (never the source workspace pre-promotion). */
+  workspace: string;
+  status: WorkerStatus;
+  stdoutPath: string;
+  stderrPath: string;
+  launchRequestedAt?: string;
+  spawnedAt?: string;
+  endedAt?: string;
+  exitCode?: number | null;
+  /** Whether the main candidate was promoted into the real source workspace. */
+  promoted?: boolean;
+  promotionManifestPath?: string;
 };
 
 export type SourceConflict = {
@@ -184,13 +259,24 @@ export type JudgeStageTrace = {
   /** Panels frozen into the judged subset / excluded as late. */
   usablePanelIndexes?: number[];
   excludedPanelIndexes?: number[];
+  /** Patch items the judge reported applying directly to the source workspace. */
+  appliedPatchItems?: Array<{ severity: "BLOCKER" | "MUST_FIX" | "SAFE_ADDITION"; title: string; status: "applied" | "skipped" | "failed" }>;
 };
 
-export type PatchStageTrace = {
-  required: boolean;
-  dispatchedAt?: string;
-  completedAt?: string;
-  status?: "completed" | "failed" | "skipped";
+export type MainPromotionTrace = {
+  /** Absolute path of the isolated main candidate workspace. */
+  candidateWorkspace: string;
+  /** Path of the written promotion manifest. */
+  manifestPath?: string;
+  promotedAt?: string;
+  status?: "pending" | "promoted" | "failed" | "skipped";
+  /** Relative paths promoted from the main candidate into the source workspace. */
+  promotedPaths?: string[];
+  /** Paths in the source workspace preserved (not overwritten) due to post-run user edits. */
+  preservedPaths?: string[];
+  /** Whether the source workspace was confirmed untouched before promotion. */
+  sourceUntouchedBeforePromotion?: boolean;
+  detail?: string;
 };
 
 export const SUPERVISOR_STATE_VERSION = 1;
@@ -199,25 +285,31 @@ export type SupervisorState = {
   version: number;
   runId: string;
   command: string;
-  strategy: "real_parallel_process_build";
+  strategy: "hybrid_external_main_native_panels";
   createdAt: string;
   updatedAt: string;
+  launchRequestedAt: string;
+  supervisorPid?: number;
   phase: SupervisorPhase;
 
-  /** Real user source workspace owned by the main builder. */
+  /** Real user source workspace; promoted-into after main candidate completes. */
   sourceWorkspace: string;
   /** Fingerprint of the source captured before main begins, to detect drift. */
   sourceFingerprint: string;
   /** Detached supervisor process lock. */
   runLock?: { pid: number; acquiredAt: string };
 
-  /** External staging root holding panel candidate workspaces. */
+  /** External staging root holding main + panel candidate workspaces. */
   stagingDir: string;
+  /** Immutable copy of the source captured before main mutations begin. */
+  sourceSnapshotWorkspacePath: string;
   /** Path of the immutable pre-main source snapshot manifest. */
   sourceSnapshotManifestPath: string;
+  /** Isolated main candidate workspace (external, never the source workspace). */
+  mainCandidateWorkspace: string;
   snapshot: SnapshotTrace;
 
-  /** Canonical task artifact shared byte-identically by all panels. */
+  /** Canonical task artifact shared byte-identically by main and all panels. */
   taskArtifactPath: string;
   taskArtifactHash: string;
 
@@ -226,9 +318,13 @@ export type SupervisorState = {
 
   workers: Record<string, WorkerRecord>;
 
+  /** Main candidate → source promotion record. */
+  mainPromotion: MainPromotionTrace;
   judge: JudgeStageTrace;
-  patch: PatchStageTrace;
   concurrency: SupervisorConcurrency;
+  externalMain?: ExternalMainWorkerTrace;
+  nativePanels?: NativePanelSessionTrace[];
+  nativeJudge?: NativeJudgeSessionTrace;
   conflicts: SourceConflict[];
 
   abortReason?: string;
@@ -242,8 +338,6 @@ export type SupervisorTimeouts = {
   panelHardTimeoutMs: number;
   judgeSoftSuspectMs: number;
   judgeHardTimeoutMs: number;
-  patchSoftSuspectMs: number;
-  patchHardTimeoutMs: number;
 };
 
 export const DEFAULT_SUPERVISOR_TIMEOUTS: SupervisorTimeouts = {
@@ -251,8 +345,6 @@ export const DEFAULT_SUPERVISOR_TIMEOUTS: SupervisorTimeouts = {
   mainHardTimeoutMs: 25 * 60_000,
   panelSoftSuspectMs: 8 * 60_000,
   panelHardTimeoutMs: 25 * 60_000,
-  judgeSoftSuspectMs: 5 * 60_000,
-  judgeHardTimeoutMs: 15 * 60_000,
-  patchSoftSuspectMs: 5 * 60_000,
-  patchHardTimeoutMs: 15 * 60_000,
+  judgeSoftSuspectMs: 8 * 60_000,
+  judgeHardTimeoutMs: 25 * 60_000,
 };

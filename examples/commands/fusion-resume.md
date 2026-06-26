@@ -21,7 +21,31 @@ Use only the `fusion_native` tool for deterministic discovery, validation, run-s
 
 It does **not** revive an invalid empty run ID directly. It does **not** ask the main agent to rebuild the original task from scratch when the main baseline is valid.
 
-## Step 1 — Resume discovery and validation
+## Step 1 — Determine the run type
+
+First, check whether the run is a `hybrid_external_main_native_panels` supervisor run.
+Look for `supervisor-state.json` under `.opencode/fusion-runs/<runId>/`.
+
+If `supervisor-state.json` exists, resume the detached supervisor instead of the
+legacy native-subagent flow:
+
+```json
+{ "stage": "resume", "runId": "<runId>" }
+```
+
+via the `fusion_supervisor` tool. Supervisor resume inspects live worker PIDs,
+recovers completed worker result artifacts, reuses completed valid workers
+(it never reruns a valid completed main implementation or valid completed
+panel), promotes a completed main candidate if not yet promoted, and resumes the
+judge stage when prerequisites are already met.
+The supervisor state alone is sufficient to continue after OpenCode restart,
+plugin reload, or parent chat closure. Use `{ "stage": "status", "runId": "<runId>" }`
+first to inspect live PIDs and the concurrency verdict.
+
+Only if no `supervisor-state.json` exists (an actual legacy run), proceed to the
+legacy native-subagent resume below.
+
+## Step 2 — Legacy resume discovery and validation
 
 Call `fusion_native` with stage `resume`:
 
@@ -57,7 +81,7 @@ Read the resume result. It returns at minimum:
 
 If resume throws `FUSION_RESUME_NOT_FOUND` or `FUSION_RESUME_AMBIGUOUS`, stop and report the error. Do not guess.
 
-## Step 2 — Rerun only missing/invalid panel slots (if needed)
+## Step 3 — Rerun only missing/invalid panel slots (if needed)
 
 If `panelsToRerun` is non-empty:
 
@@ -73,7 +97,7 @@ When reruns finish, call `fusion_native` stage `collect` with the **recovered `r
 
 Also pass `mainBaseline` from the resume result (already reused).
 
-## Step 3 — Judge when quorum is ready
+## Step 4 — Judge when quorum is ready
 
 When `judgeEligible` is true (or collect returns `shouldProceed: true`):
 
@@ -85,27 +109,10 @@ When `judgeEligible` is true (or collect returns `shouldProceed: true`):
 
 ## Hard rules
 
+- Prefer `fusion_supervisor` resume for any run that has `supervisor-state.json`.
 - Never use `.` or the source workspace itself as the trace artifact directory.
 - Never call collect/finalize with an empty run ID.
 - Never treat orphan root artifacts as a valid normal run without resume validation.
 - Preserve visible native panel/judge behavior, external candidate staging, Contract Gate, Council Comparison Dossier, Merge Patch Contract, Correctness Coverage Gate, post-build audit, and one-fix-cycle semantics.
 
 Final response must include: recovered run ID, trace artifact path, recovery metadata, main baseline reuse status, recovered vs invalid panel indexes, quorum, judge eligibility, and verification results.
-
-## real_parallel_process_build supervisor recovery
-
-If the orphaned run is a `real_parallel_process_build` run (it has a
-`supervisor-state.json` under `.opencode/fusion-runs/<runId>/`), resume the
-detached supervisor instead of the native-subagent flow:
-
-```json
-{ "stage": "resume", "runId": "<runId>" }
-```
-
-via the `fusion_supervisor` tool. Supervisor resume inspects live worker PIDs,
-recovers completed worker result artifacts, reuses completed valid workers
-(it never reruns a valid completed main implementation or valid completed
-panel), and resumes the judge or patch stage when prerequisites are already met.
-The supervisor state alone is sufficient to continue after OpenCode restart,
-plugin reload, or parent chat closure. Use `{ "stage": "status", "runId": "<runId>" }`
-first to inspect live PIDs and the concurrency verdict.

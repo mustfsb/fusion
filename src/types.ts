@@ -11,22 +11,26 @@ export type PanelMode = "advisory" | "candidate_build";
 /**
  * Internal build strategy for `/fusion-build`.
  *
- * - `real_parallel_process_build`: the DEFAULT strategy. A detached Node
- *   supervisor spawns four real concurrent OpenCode CLI worker processes
- *   (fusion-main-builder + fusion-panel-1/2/3) immediately after a minimal
- *   immutable source snapshot, monitors them as independent processes, then
- *   runs a visible judge process and an optional patch worker. Concurrency is
- *   real OS-level process overlap, not prompt wording.
+ * - `hybrid_external_main_native_panels`: the DEFAULT strategy. A detached Node
+ *   supervisor spawns ONE external OpenCode CLI main builder in an isolated
+ *   main candidate workspace and dispatches THREE visible native panel
+ *   subagents concurrently, all derived from the same immutable pre-main source
+ *   snapshot. When the main builder succeeds, its candidate is promoted
+ *   snapshot-relatively into the real source workspace (panels may still run).
+ *   Then a visible native judge subagent runs against the promoted source,
+ *   writes a Merge Patch Contract, and applies targeted fixes itself. There is
+ *   no second external patch worker. Concurrency is real OS-level process
+ *   overlap plus native subagent dispatch, not prompt wording.
  * - `speculative_parallel_build`: legacy native-subagent compatibility fallback.
  *   Panels build competing candidates in isolated workspaces driven by the
  *   parent orchestrator's advance loop. Retained only as a non-default fallback.
  *
  * `/fusion-no-build` does not set a build strategy (it remains planning-only).
  */
-export type BuildStrategy = "real_parallel_process_build" | "speculative_parallel_build";
+export type BuildStrategy = "hybrid_external_main_native_panels" | "speculative_parallel_build";
 
 /** The default `/fusion-build` strategy. */
-export const DEFAULT_BUILD_STRATEGY: BuildStrategy = "real_parallel_process_build";
+export const DEFAULT_BUILD_STRATEGY: BuildStrategy = "hybrid_external_main_native_panels";
 
 export type PromptVerbosity = "compact" | "standard" | "detailed";
 
@@ -845,6 +849,7 @@ export type SpeculativePathResolutionTrace = {
   sourceWorkspace: string;
   sourceArtifactDir: string;
   externalCandidateStagingDir: string;
+  mainWorkspacePath?: string;
   panelWorkspacePaths: string[];
   resolverVersion: "external_staging_v1";
   runtimeModulePath?: string;

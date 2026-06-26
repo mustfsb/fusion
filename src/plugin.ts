@@ -33,8 +33,13 @@ import {
   nativeRecordMainBaseline,
 } from "./native/nativeCouncil.js";
 import { nativeResume } from "./native/fusionResume.js";
-import { launchRealParallelBuild, reportSupervisorStatus } from "./native/supervisorLaunch.js";
+import {
+  launchRealParallelBuild,
+  loadLatestSupervisorTrace,
+  reportSupervisorStatus,
+} from "./native/supervisorLaunch.js";
 import { superviseRun } from "./native/fusionSupervisor.js";
+import { renderSupervisorTrace } from "./native/supervisorTrace.js";
 import { assertValidFusionRunId } from "./native/runLocator.js";
 import type { FusionTraceOptions, NativePanelResult } from "./types.js";
 
@@ -137,7 +142,18 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
           traceDir: tool.schema.string().optional().describe("Override trace artifact root directory."),
         },
         async execute(args, context) {
-          const trace = await loadLatestRunTrace(context.directory, args.traceDir ?? pluginSettings.traceDir);
+          const traceDir = args.traceDir ?? pluginSettings.traceDir;
+
+          // Prefer a hybrid_external_main_native_panels supervisor trace.
+          const supervisor = await loadLatestSupervisorTrace(context.directory, traceDir);
+          if (supervisor) {
+            if (supervisor.kind === "supervisor") {
+              return renderSupervisorTrace(supervisor.state);
+            }
+            return `Fusion supervisor run ${supervisor.runId} initialization failed: ${supervisor.error}`;
+          }
+
+          const trace = await loadLatestRunTrace(context.directory, traceDir);
           if (!trace) {
             return "No Fusion run trace found yet. Run `/fusion-build` or `/fusion-no-build` first.";
           }
@@ -441,7 +457,7 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
 
       fusion_supervisor: tool({
         description:
-          "Default /fusion-build engine: real_parallel_process_build. Launches a detached Node supervisor that spawns four real concurrent OpenCode CLI worker processes (fusion-main-builder + fusion-panel-1/2/3), then a visible judge and optional patch worker. Stages: launch (minimal bootstrap + detached supervisor), status (live worker/concurrency report), resume (reattach + continue without rerunning completed workers). Uses child_process.spawn of the installed opencode CLI; never calls model APIs or hidden SDK runners.",
+          "Default /fusion-build engine: hybrid_external_main_native_panels. Launches a detached Node supervisor that spawns ONE external OpenCode CLI main builder in an isolated main candidate workspace and dispatches THREE visible native panel subagents concurrently, promotes the main candidate into the real source workspace on success, then dispatches a visible native judge that writes a Merge Patch Contract and applies targeted fixes itself to the real source workspace. Stages: launch (minimal bootstrap + detached supervisor), status (live worker/concurrency report), resume (reattach + continue without rerunning completed workers). Uses child_process.spawn of the installed opencode CLI for the main builder; never calls model APIs or hidden SDK runners.",
         args: {
           stage: tool.schema.enum(["launch", "status", "resume"]).describe("Supervisor stage."),
           task: tool.schema.string().optional().describe("Original user task text (required for launch)."),

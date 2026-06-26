@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
+import { buildOrchestratorAgentFile } from "../src/native/agentTemplates.js";
 
 const defaultModels = [
   "opencode-go/kimi-k2.7-code",
@@ -22,81 +23,71 @@ describe("docs and examples", () => {
   test("fusion-build command documents speculative parallel build workflow", async () => {
     const readme = await readFile("README.md", "utf8");
     const command = await readFile("examples/commands/fusion-build.md", "utf8");
+    const orchestrator = buildOrchestratorAgentFile().content;
 
     expect(readme).toContain("/fusion-build");
     expect(readme).toContain("/fusion-trace");
     expect(readme).toContain(".opencode/fusion-runs");
     expect(command).toContain("agent: fusion-orchestrator");
-    expect(command).toContain("fusion_native");
-    expect(command).toContain('"stage": "prepare"');
-    expect(command).toContain('"panelMode": "candidate_build"');
-    expect(command).toContain('"buildStrategy": "speculative_parallel_build"');
-    expect(command).toContain('"mode": "build_prompt"');
-    expect(command).toContain('"command": "fusion-build"');
-    expect(command).toContain('"requireAllPanels": false');
-    expect(command).toContain('"minSuccessfulPanels": 2');
-    expect(command).toContain('"allowDegradedJudge": true');
-    expect(command).toContain('"parallelExecutionSupported": true');
-    expect(command).toContain('"stage": "advance"');
-    expect(command).toContain("nextAction");
-    expect(command).toContain('"mainBaselineStartedAt"');
-    expect(command).toContain('"judgeDispatched"');
-    expect(command).toContain("fusion-panel-1");
-    expect(command).toContain("fusion-panel-2");
-    expect(command).toContain("fusion-panel-3");
-    expect(command).toContain("fusion-judge");
-    expect(command).toContain("staggered cascade");
-    expect(command).toContain("45 seconds");
-    expect(command).toContain("scheduled_delay");
-    expect(command).toContain("recovery_rerun");
-    expect(command).toContain("fusion-panel-4");
-    expect(command).toContain("panelResults");
-    expect(command).toContain("shared panel prompt hash");
-    expect(command).toContain("record_main_baseline");
-    expect(command).toContain("main baseline");
-    expect(command).toContain("judgeTransportPrompt");
-    expect(command).toContain("audit_prepare");
-    expect(command).toContain("audit_finalize");
-    expect(command).toContain("native_subagents");
-    expect(command).toContain("todowrite");
-    expect(command).toContain("Contract Gate");
-    expect(command).toContain("Merge Patch Contract");
     expect(command).toContain("speculative_parallel_build");
-    expect(command).toContain("isolated candidate workspaces");
-    expect(command).toContain("Start the Main Baseline Immediately");
-    expect(command).toContain("before any panel staging or dispatch");
-    expect(command).toContain("real source workspace");
-    expect(command).toContain("overlap");
-    expect(command).toContain("call_collect");
-    expect(command).toContain("canonicalTaskPath");
-    expect(command).toContain("Run post-build contract audit");
-    expect(command).toContain("Correctness Coverage Gate");
-    expect(command).toContain("Apply only approved targeted patches");
+    expect(command).toContain("non-default compatibility fallback");
     expect(command).toContain("Never add `/fusion-spec-build`");
-    expect(command).toContain("npm run typecheck");
-    expect(command).toContain("artifact path");
+    expect(command).toContain("native_subagents");
+    expect(command).toContain("Merge Patch Contract");
+    expect(command).toContain("isolated candidate workspaces");
+    expect(command).toContain("real source workspace");
     expect(command).toContain("/fusion-trace");
-    expect(command).toContain("3 panel subagents");
-    expect(command).toContain("build strategy `speculative_parallel_build`");
-    expect(command).toContain("Pass the exact user task text");
-    expect(command).toContain("$ARGUMENTS");
-    expect(command).toContain("Do NOT use the legacy all-in-one `fusion_council` tool");
+
+    // The detailed legacy speculative_parallel_build workflow is documented in
+    // the fusion-orchestrator agent prompt (the runtime driver for that flow).
+    expect(orchestrator).toContain("fusion_native");
+    expect(orchestrator).toContain("(stage: prepare)");
+    expect(orchestrator).toContain("panelMode: \"candidate_build\"");
+    expect(orchestrator).toContain("buildStrategy: \"speculative_parallel_build\"");
+    expect(orchestrator).toContain("mode: \"build_prompt\"");
+    expect(orchestrator).toContain("command: \"fusion-build\"");
+    expect(orchestrator).toContain("(stage: advance)");
+    expect(orchestrator).toContain("nextAction");
+    expect(orchestrator).toContain("mainBaselineStartedAt");
+    expect(orchestrator).toContain("judgeDispatched");
+    expect(orchestrator).toContain("fusion-panel-1");
+    expect(orchestrator).toContain("fusion-panel-2");
+    expect(orchestrator).toContain("fusion-panel-3");
+    expect(orchestrator).toContain("fusion-judge");
+    expect(orchestrator).toContain("Staggered panel cascade");
+    expect(orchestrator).toContain("~45s");
+    expect(orchestrator).toContain("scheduled_delay");
+    expect(orchestrator).toContain("recovery_rerun");
+    expect(orchestrator).toContain("fusion-panel-4");
+    expect(orchestrator).toContain("panelResults");
+    expect(orchestrator).toContain("record_main_baseline");
+    expect(orchestrator).toContain("main baseline");
+    expect(orchestrator).toContain("judgeTransportPrompt");
+    expect(orchestrator).toContain("audit_prepare");
+    expect(orchestrator).toContain("audit_finalize");
+    expect(orchestrator).toContain("native_subagents");
+    expect(orchestrator).toContain("todowrite");
+    expect(orchestrator).toContain("Merge Patch Contract");
+    expect(orchestrator).toContain("speculative_parallel_build");
+    expect(orchestrator).toContain("candidate workspaces");
+    expect(orchestrator).toContain("call_collect");
+    expect(orchestrator).toContain("Apply ONLY approved targeted patches");
   });
 
-  test("fusion-build documents the default real_parallel_process_build supervisor", async () => {
+  test("fusion-build documents the default hybrid_external_main_native_panels supervisor", async () => {
     const command = await readFile("examples/commands/fusion-build.md", "utf8");
-    expect(command).toContain("real_parallel_process_build");
+    expect(command).toContain("hybrid_external_main_native_panels");
     expect(command).toContain("fusion_supervisor");
     expect(command).toContain('"stage": "launch"');
     expect(command).toContain("fusion-main-builder");
-    expect(command).toContain("detached Node process supervisor");
-    expect(command).toContain("REAL_PARALLEL_EXECUTION_CONFIRMED");
+    expect(command).toContain("detached Node supervisor");
+    expect(command).toContain("HYBRID_PARALLEL_LAUNCH_CONFIRMED");
     expect(command).toContain("non-default compatibility fallback");
   });
 
   test("fusion-resume documents supervisor recovery", async () => {
     const command = await readFile("examples/commands/fusion-resume.md", "utf8");
-    expect(command).toContain("real_parallel_process_build");
+    expect(command).toContain("hybrid_external_main_native_panels");
     expect(command).toContain("supervisor-state.json");
     expect(command).toContain("fusion_supervisor");
     expect(command).toContain('"stage": "resume"');

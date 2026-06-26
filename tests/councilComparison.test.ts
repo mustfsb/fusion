@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { buildCouncilComparison, renderCouncilComparisonMarkdown } from "../src/council/councilComparison.js";
+import { DEFAULT_PANEL_MODELS, DEFAULT_JUDGE_MODEL } from "../src/config.js";
 import {
   buildCorrectnessCoverageGate,
   parseRequirementDecisionMatrixFromJudgeOutput,
@@ -1243,11 +1244,11 @@ describe("Regression: native architecture and installer safety", () => {
     expect(installer.SUPPORTED_COMMANDS).not.toContain("fusion-status.md");
     expect(installer.SUPPORTED_COMMANDS).toContain("fusion-build.md");
     expect(installer.SUPPORTED_COMMANDS).toContain("fusion-no-build.md");
-    expect(installer.DEFAULT_PANEL_MODELS).toEqual([
+    expect(DEFAULT_PANEL_MODELS).toEqual([
       "opencode-go/kimi-k2.7-code",
       "opencode-go/qwen3.7-max",
       "opencode-go/minimax-m3",
     ]);
-    expect(installer.DEFAULT_JUDGE_MODEL).toBe("openai/gpt-5.5");
+    expect(DEFAULT_JUDGE_MODEL).toBe("openai/gpt-5.5");
   });
 });

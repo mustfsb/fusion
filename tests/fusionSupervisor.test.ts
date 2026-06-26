@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, readFile, writeFile, rm, access } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +24,8 @@ import {
   type SpawnedWorkerHandle,
   type WorkerSpawnSpec,
 } from "../src/native/workerRunner.js";
+import { createFakeNativeSubagentDispatcher } from "../src/native/nativeSubagentDispatch.js";
+import type { WorkerRecord } from "../src/native/supervisorTypes.js";
 
 const FAKE = fileURLToPath(new URL("./fixtures/fakeOpencode.mjs", import.meta.url));
 
@@ -31,6 +34,7 @@ let traceRoot: string;
 let stagingRoot: string;
 let behaviorPath: string;
 let runCounter = 0;
+let workersRef: Record<string, WorkerRecord> = {};
 
 function freshRunId(): string {
   runCounter += 1;
@@ -67,7 +71,17 @@ function deps(runner: WorkerRunner, extra?: Partial<SupervisorDeps>): Supervisor
     cwd: sourceRoot,
     traceDir: traceRoot,
     runner,
+    skipNativeAgentValidation: true,
+    syncWorkers: (workers) => {
+      workersRef = workers;
+    },
+    nativeDispatcher: createFakeNativeSubagentDispatcher({
+      behavior: () => JSON.parse(readFileSync(behaviorPath, "utf8")),
+      getWorkers: () => workersRef,
+      skipAgentValidation: true,
+    }),
     pollIntervalMs: 15,
+    autoConfirmReady: true,
     timeouts: {
       mainSoftSuspectMs: 9_000,
       mainHardTimeoutMs: 9_000,
@@ -75,11 +89,18 @@ function deps(runner: WorkerRunner, extra?: Partial<SupervisorDeps>): Supervisor
       panelHardTimeoutMs: 9_000,
       judgeSoftSuspectMs: 9_000,
       judgeHardTimeoutMs: 9_000,
-      patchSoftSuspectMs: 9_000,
-      patchHardTimeoutMs: 9_000,
     },
     ...extra,
   };
+}
+
+async function bootstrapAndRun(runId: string, runner: WorkerRunner, extra?: Partial<SupervisorDeps>) {
+  await bootstrapRealParallelBuild(baseInput(runId), deps(runner, extra));
+  const bootState = await loadSupervisorState(sourceRoot, runId, traceRoot);
+  if (bootState) workersRef = bootState.workers;
+  const state = await superviseRun(runId, deps(runner, extra));
+  workersRef = state.workers;
+  return state;
 }
 
 const allCompleteBehavior = (extra?: Record<string, unknown>) => ({
@@ -88,11 +109,11 @@ const allCompleteBehavior = (extra?: Record<string, unknown>) => ({
   [WORKER_ID.panel(2)]: { sleepMs: 200, changedFile: "src/panel2-impl.ts" },
   [WORKER_ID.panel(3)]: { sleepMs: 200, changedFile: "src/panel3-impl.ts" },
   [WORKER_ID.judge]: { sleepMs: 60, decision: "NO_PATCH_REQUIRED", writeContract: true },
-  [WORKER_ID.patch]: { sleepMs: 60 },
   ...extra,
 });
 
 beforeEach(async () => {
+  workersRef = {};
   sourceRoot = await mkdtemp(path.join(tmpdir(), "fusion-sup-src-"));
   traceRoot = await mkdtemp(path.join(tmpdir(), "fusion-sup-trace-"));
   stagingRoot = await mkdtemp(path.join(tmpdir(), "fusion-sup-stage-"));
@@ -120,74 +141,97 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
-describe("real_parallel_process_build supervisor", () => {
+describe("hybrid_external_main_native_panels supervisor", () => {
   test("spawns main + 3 panels concurrently before any finishes; judge after all terminal; paths not inlined (props 1,5,7,8,16)", async () => {
-    await writeBehavior(allCompleteBehavior({ [WORKER_ID.judge]: { sleepMs: 60, decision: "PATCH_REQUIRED", writeContract: true }, [WORKER_ID.patch]: { sleepMs: 60 } }));
+    await writeBehavior({
+      [WORKER_ID.main]: { sleepMs: 600, changedFile: "src/main-impl.ts" },
+      [WORKER_ID.panel(1)]: { sleepMs: 600, changedFile: "src/panel1-impl.ts" },
+      [WORKER_ID.panel(2)]: { sleepMs: 600, changedFile: "src/panel2-impl.ts" },
+      [WORKER_ID.panel(3)]: { sleepMs: 600, changedFile: "src/panel3-impl.ts" },
+      [WORKER_ID.judge]: { sleepMs: 60, decision: "PATCH_REQUIRED", writeContract: true, changedFile: "src/judge-fix.ts" },
+    });
     const runId = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
-    const state = await superviseRun(runId, deps(fakeRunner()));
+    const state = await bootstrapAndRun(runId, fakeRunner());
 
     const primary = [WORKER_ID.main, WORKER_ID.panel(1), WORKER_ID.panel(2), WORKER_ID.panel(3)].map((id) => state.workers[id]);
-    // Property 1: all four spawned before any one finished.
-    const maxSpawn = Math.max(...primary.map((w) => new Date(w.spawnedAt!).getTime()));
+    const mainLaunch = new Date(state.workers[WORKER_ID.main].spawnedAt!).getTime();
+    const panelLaunches = [1, 2, 3].map((i) => new Date(state.workers[WORKER_ID.panel(i)].dispatchedAt!).getTime());
     const minEnd = Math.min(...primary.map((w) => new Date(w.endedAt!).getTime()));
-    expect(maxSpawn).toBeLessThanOrEqual(minEnd);
+    expect(Math.max(mainLaunch, ...panelLaunches)).toBeLessThanOrEqual(minEnd);
     for (const w of primary) expect(w.status).toBe("completed");
 
-    // Property 5: all panels share the exact canonical task hash.
     const hashes = new Set([WORKER_ID.panel(1), WORKER_ID.panel(2), WORKER_ID.panel(3)].map((id) => state.workers[id].taskArtifactHash));
     expect(hashes.size).toBe(1);
     expect([...hashes][0]).toBe(state.taskArtifactHash);
+    // Main shares the same canonical task hash too.
+    expect(state.workers[WORKER_ID.main].taskArtifactHash).toBe(state.taskArtifactHash);
 
-    // Property 16: real overlap → confirmed.
-    expect(state.concurrency.verdict).toBe("REAL_PARALLEL_EXECUTION_CONFIRMED");
-    expect(state.concurrency.panelsOverlappingMain).toBeGreaterThanOrEqual(2);
+    expect(state.concurrency.verdict).toBe("HYBRID_PARALLEL_LAUNCH_CONFIRMED");
+    expect(state.concurrency.panelsLaunched).toBe(3);
+    expect(state.concurrency.noPanelViaExternalCli).toBe(true);
+    expect(state.concurrency.mainModelMatched).toBe(true);
 
-    // Property 7: judge dispatched only after every primary worker terminal.
     const judge = state.workers[WORKER_ID.judge];
-    expect(judge.spawnedAt).toBeDefined();
-    const judgeStart = new Date(judge.spawnedAt!).getTime();
+    expect(judge.dispatchedAt).toBeDefined();
+    const judgeStart = new Date(judge.dispatchedAt!).getTime();
     for (const w of primary) expect(new Date(w.endedAt!).getTime()).toBeLessThanOrEqual(judgeStart);
 
-    // Property 8: judge manifest references artifact PATHS, never inlined trees.
     const manifest = JSON.parse(await readFile(state.judge.manifestPath!, "utf8"));
     expect(manifest.panels[0].resultArtifactPath).toContain("fusion-panel-1-result.json");
     const manifestText = JSON.stringify(manifest);
-    expect(manifestText).not.toContain("export const base"); // no source contents inlined
-    expect(manifestText.length).toBeLessThan(4000);
+    expect(manifestText).not.toContain("export const base");
+    expect(manifestText.length).toBeLessThan(6000);
 
-    expect(renderSupervisorTrace(state)).toContain("REAL_PARALLEL_EXECUTION_CONFIRMED");
+    expect(renderSupervisorTrace(state)).toContain("HYBRID_PARALLEL_LAUNCH_CONFIRMED");
+    expect(renderSupervisorTrace(state)).toContain("Build strategy: hybrid_external_main_native_panels");
+    expect(renderSupervisorTrace(state)).toContain("execution: external_opencode_cli");
+    expect(renderSupervisorTrace(state)).toContain("execution: native_visible_subagent");
   });
 
-  test("main writes only to source; panels write only to their candidate workspaces (props 3,4)", async () => {
+  test("main works in isolated main workspace, never source before promotion; panels isolated (props 3,4,5,11,12)", async () => {
     await writeBehavior(allCompleteBehavior());
     const runId = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
-    const state = await superviseRun(runId, deps(fakeRunner()));
+    const state = await bootstrapAndRun(runId, fakeRunner());
 
-    // Main wrote into the real source workspace.
+    const mainWs = state.workers[WORKER_ID.main].workspacePath;
+    // Main workspace is external, not the source workspace.
+    expect(mainWs.startsWith(path.resolve(sourceRoot))).toBe(false);
+    expect(state.mainCandidateWorkspace).toBe(mainWs);
+    // Main wrote into its isolated candidate workspace.
+    expect(await exists(path.join(mainWs, "src", "main-impl.ts"))).toBe(true);
+    // Promotion copied main's change into the real source workspace.
     expect(await exists(path.join(sourceRoot, "src", "main-impl.ts"))).toBe(true);
+    expect(state.mainPromotion.status).toBe("promoted");
+    expect(state.mainPromotion.promotedPaths).toContain("src/main-impl.ts");
+    expect(state.mainPromotion.sourceUntouchedBeforePromotion).toBe(true);
     // Panel files are NOT in source workspace.
     expect(await exists(path.join(sourceRoot, "src", "panel1-impl.ts"))).toBe(false);
     expect(await exists(path.join(sourceRoot, "src", "panel2-impl.ts"))).toBe(false);
     expect(await exists(path.join(sourceRoot, "src", "panel3-impl.ts"))).toBe(false);
-    // Each panel file lives in its own candidate workspace.
-    for (let i = 1; i <= 3; i += 1) {
-      const ws = state.workers[WORKER_ID.panel(i)].workspacePath;
-      expect(ws.startsWith(path.resolve(sourceRoot))).toBe(false);
-      expect(await exists(path.join(ws, "src", `panel${i}-impl.ts`))).toBe(true);
+    // Each panel file lives in its own distinct candidate workspace.
+    const panelWs = [1, 2, 3].map((i) => state.workers[WORKER_ID.panel(i)].workspacePath);
+    for (let i = 0; i < 3; i += 1) {
+      expect(panelWs[i].startsWith(path.resolve(sourceRoot))).toBe(false);
+      expect(await exists(path.join(panelWs[i], "src", `panel${i + 1}-impl.ts`))).toBe(true);
     }
+    const distinctWs = new Set(panelWs);
+    expect(distinctWs.size).toBe(3);
   });
 
-  test("all launch calls happen before any worker exit resolves (prop 2)", async () => {
-    await writeBehavior(allCompleteBehavior());
+  test("launch phase spawns only one external main worker before any exit (prop 2)", async () => {
+    await writeBehavior(allCompleteBehavior({
+      [WORKER_ID.main]: { sleepMs: 600, changedFile: "src/main-impl.ts" },
+      [WORKER_ID.panel(1)]: { sleepMs: 600, changedFile: "src/panel1-impl.ts" },
+      [WORKER_ID.panel(2)]: { sleepMs: 600, changedFile: "src/panel2-impl.ts" },
+      [WORKER_ID.panel(3)]: { sleepMs: 600, changedFile: "src/panel3-impl.ts" },
+    }));
     const base = fakeRunner();
-    const spawnCallTimes: number[] = [];
+    const spawnedWorkerIds: string[] = [];
     let firstExitAt: number | undefined;
     const spy: WorkerRunner = {
       transport: base.transport,
       async spawn(spec: WorkerSpawnSpec): Promise<SpawnedWorkerHandle> {
-        spawnCallTimes.push(Date.now());
+        spawnedWorkerIds.push(spec.workerId);
         const handle = await base.spawn(spec);
         void handle.exited.then(() => {
           if (firstExitAt === undefined) firstExitAt = Date.now();
@@ -196,66 +240,66 @@ describe("real_parallel_process_build supervisor", () => {
       },
     };
     const runId = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId), deps(spy));
-    await superviseRun(runId, deps(spy));
-    // The four primary launch calls all precede the first worker exit.
-    expect(spawnCallTimes.length).toBeGreaterThanOrEqual(4);
+    const state = await bootstrapAndRun(runId, spy);
+    expect(spawnedWorkerIds).toEqual([WORKER_ID.main]);
     expect(firstExitAt).toBeDefined();
-    const fourthLaunch = spawnCallTimes.slice(0, 4).sort((a, b) => a - b)[3];
-    expect(fourthLaunch).toBeLessThanOrEqual(firstExitAt!);
+    expect(state.concurrency.verdict).toBe("HYBRID_PARALLEL_LAUNCH_CONFIRMED");
+    for (let i = 1; i <= 3; i += 1) {
+      expect(state.workers[WORKER_ID.panel(i)].sessionId).toMatch(/^native-session-/);
+      expect(state.workers[WORKER_ID.panel(i)].executionKind).toBe("native_subagent");
+    }
   });
 
   test("concise panel result with no prose stays usable when workspace + verification evidence exist (prop 6)", async () => {
     await writeBehavior(allCompleteBehavior());
     const runId = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
-    const state = await superviseRun(runId, deps(fakeRunner()));
+    const state = await bootstrapAndRun(runId, fakeRunner());
     for (let i = 1; i <= 3; i += 1) {
       expect(state.workers[WORKER_ID.panel(i)].candidate?.classification).toBe("usable");
     }
   });
 
-  test("patch worker runs only on valid PATCH_REQUIRED; skipped on NO_PATCH_REQUIRED (props 9,10)", async () => {
-    // NO_PATCH_REQUIRED → no patch worker.
+  test("judge applies targeted patches itself; no external patch worker exists (props 14,15,17)", async () => {
+    // NO_PATCH_REQUIRED: no patch items, no patch worker.
     await writeBehavior(allCompleteBehavior());
     const runId1 = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId1), deps(fakeRunner()));
-    const noPatch = await superviseRun(runId1, deps(fakeRunner()));
+    const noPatch = await bootstrapAndRun(runId1, fakeRunner());
     expect(noPatch.judge.decision).toBe("NO_PATCH_REQUIRED");
-    expect(noPatch.workers[WORKER_ID.patch]).toBeUndefined();
-    expect(noPatch.patch.status).toBe("skipped");
+    expect(noPatch.workers[WORKER_ID.judge]).toBeDefined();
+    expect(noPatch.workers["fusion-main-patch-worker"]).toBeUndefined();
+    expect(noPatch.mainPromotion.status).toBe("promoted");
 
-    // PATCH_REQUIRED → patch worker spawned.
-    await writeBehavior(allCompleteBehavior({ [WORKER_ID.judge]: { sleepMs: 60, decision: "PATCH_REQUIRED", writeContract: true } }));
+    // PATCH_REQUIRED: judge self-patches the real source workspace directly.
+    await writeBehavior(allCompleteBehavior({
+      [WORKER_ID.judge]: { sleepMs: 60, decision: "PATCH_REQUIRED", writeContract: true, changedFile: "src/judge-fix.ts" },
+    }));
     const runId2 = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId2), deps(fakeRunner()));
-    const patched = await superviseRun(runId2, deps(fakeRunner()));
+    const patched = await bootstrapAndRun(runId2, fakeRunner());
     expect(patched.judge.decision).toBe("PATCH_REQUIRED");
-    expect(patched.workers[WORKER_ID.patch]?.status).toBe("completed");
-    expect(patched.patch.required).toBe(true);
+    expect(patched.workers["fusion-main-patch-worker"]).toBeUndefined();
+    // The judge (running against the real source workspace) applied the fix itself.
+    expect(await exists(path.join(sourceRoot, "src", "judge-fix.ts"))).toBe(true);
+    expect(patched.judge.appliedPatchItems).toBeDefined();
+    expect(patched.judge.appliedPatchItems!.length).toBeGreaterThan(0);
+    expect(patched.nativeJudge?.appliedPatchSummary).toBeDefined();
   });
 
   test("NO_PATCH_REQUIRED cannot exist without judge success (prop 10)", async () => {
     await writeBehavior(allCompleteBehavior({ [WORKER_ID.judge]: { sleepMs: 40, outcome: "fail" } }));
     const runId = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
-    const state = await superviseRun(runId, deps(fakeRunner()));
+    const state = await bootstrapAndRun(runId, fakeRunner());
     expect(state.workers[WORKER_ID.judge].status).toBe("failed");
     expect(state.judge.decision).toBeUndefined();
     expect(state.phase).toBe("aborted");
-    expect(state.workers[WORKER_ID.patch]).toBeUndefined();
+    expect(state.workers["fusion-main-patch-worker"]).toBeUndefined();
   });
 
   test("a hung panel times out without blocking the judge stage forever (prop 11)", async () => {
     await writeBehavior(allCompleteBehavior({ [WORKER_ID.panel(2)]: { outcome: "hang", changedFile: "src/panel2-impl.ts" } }));
     const runId = freshRunId();
-    // Hard timeouts are baked into worker records at bootstrap, so the short
-    // panel timeout must be supplied to bootstrap (not just supervise).
-    const shortTimeouts = { panelHardTimeoutMs: 400, panelSoftSuspectMs: 300, mainHardTimeoutMs: 9000, judgeHardTimeoutMs: 9000, patchHardTimeoutMs: 9000, mainSoftSuspectMs: 9000, judgeSoftSuspectMs: 9000, patchSoftSuspectMs: 9000 };
-    await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner(), { timeouts: shortTimeouts }));
-    const state = await superviseRun(runId, deps(fakeRunner(), { timeouts: shortTimeouts }));
+    const shortTimeouts = { panelHardTimeoutMs: 400, panelSoftSuspectMs: 300, mainHardTimeoutMs: 9000, judgeHardTimeoutMs: 9000, mainSoftSuspectMs: 9000, judgeSoftSuspectMs: 9000 };
+    const state = await bootstrapAndRun(runId, fakeRunner(), { timeouts: shortTimeouts });
     expect(state.workers[WORKER_ID.panel(2)].status).toBe("timed_out");
-    // Judge still ran because main + panels 1/3 are usable and panel 2 is terminal.
     expect(state.judge.dispatchedAt).toBeDefined();
     expect(state.judge.excludedPanelIndexes).toContain(2);
   });
@@ -263,10 +307,8 @@ describe("real_parallel_process_build supervisor", () => {
   test("resume reuses completed workers and does not rerun valid panels (prop 12)", async () => {
     await writeBehavior(allCompleteBehavior());
     const runId = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
-    await superviseRun(runId, deps(fakeRunner()));
+    await bootstrapAndRun(runId, fakeRunner());
 
-    // Second supervise pass with a spy runner: nothing should be re-spawned.
     const base = fakeRunner();
     const respawned: string[] = [];
     const spy: WorkerRunner = {
@@ -276,6 +318,7 @@ describe("real_parallel_process_build supervisor", () => {
         return base.spawn(spec);
       },
     };
+    workersRef = (await loadSupervisorState(sourceRoot, runId, traceRoot))!.workers;
     const resumed = await superviseRun(runId, deps(spy));
     expect(respawned).toEqual([]);
     expect(resumed.phase).toBe("done");
@@ -285,20 +328,18 @@ describe("real_parallel_process_build supervisor", () => {
   test("supervisor progresses standalone after bootstrap with no parent driver (prop 13)", async () => {
     await writeBehavior(allCompleteBehavior());
     const runId = freshRunId();
-    // Bootstrap returns immediately; no workers launched yet.
     const booted = await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
     expect(booted.phase).toBe("bootstrapping");
     for (const id of [WORKER_ID.main, WORKER_ID.panel(1)]) {
       expect(booted.workers[id].status).toBe("queued");
     }
-    // A completely separate supervise call (simulating the detached process)
-    // drives the run to completion without any parent advance loop.
+    workersRef = booted.workers;
     const state = await superviseRun(runId, deps(fakeRunner()));
     expect(state.phase).toBe("done");
     expect(state.runLock?.pid).toBe(process.pid);
   });
 
-  test("/fusion-no-build produces no supervisor state, so no worker can spawn (prop 14)", async () => {
+  test("/fusion-no-build produces no supervisor state, so no worker can spawn (prop 20)", async () => {
     const runId = freshRunId();
     // No bootstrap was performed (planning-only path never creates state).
     const state = await loadSupervisorState(sourceRoot, runId, traceRoot);
@@ -329,28 +370,39 @@ describe("real_parallel_process_build supervisor", () => {
     expect(runnerSrc).toMatch(/\bspawn\b/);
   });
 
-  test("trace accurately reports overlap and not-confirmed when serialized (prop 16 negative)", async () => {
-    // Force main to finish before panels start by giving main 0 sleep and a
-    // spy runner that serializes spawns. We simulate non-overlap by checking
-    // the verdict logic directly against a serialized timeline.
+  test("trace launch verdict reflects recorded hybrid launch evidence (prop 18,19)", async () => {
     await writeBehavior(allCompleteBehavior());
     const runId = freshRunId();
-    await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
+    const state = await bootstrapAndRun(runId, fakeRunner());
+    expect(state.concurrency.allLaunchTimestampsRecorded).toBe(true);
+    expect(state.concurrency.parallelPanelDispatchIssued).toBe(true);
+    expect(state.concurrency.verdict).toBe("HYBRID_PARALLEL_LAUNCH_CONFIRMED");
+    const trace = renderSupervisorTrace(state);
+    expect(trace).toContain("Main builder:");
+    expect(trace).toContain("Panel 1:");
+    expect(trace).toContain("Panel 2:");
+    expect(trace).toContain("Panel 3:");
+    expect(trace).toContain("Judge:");
+    expect(trace).toContain("Promotion:");
+    expect(trace).toContain("execution: external_opencode_cli");
+    expect(trace).toContain("execution: native_visible_subagent");
+  });
+
+  test("main model mismatch fails with FUSION_MAIN_MODEL_MISMATCH (prop 4)", async () => {
+    await writeBehavior({
+      ...allCompleteBehavior(),
+      [WORKER_ID.main]: { sleepMs: 200, changedFile: "src/main-impl.ts", observedModel: "lmstudio/vibethinker-3b" },
+    });
+    const runId = freshRunId();
+    const input = baseInput(runId);
+    input.mainModel = { modelId: "opencode-go/deepseek-v4-pro" };
+    await bootstrapRealParallelBuild(input, deps(fakeRunner()));
+    workersRef = (await loadSupervisorState(sourceRoot, runId, traceRoot))!.workers;
     const state = await superviseRun(runId, deps(fakeRunner()));
-    // In the normal concurrent run overlap is real; verify the verdict matches
-    // the recorded intervals rather than being hardcoded.
-    const main = state.workers[WORKER_ID.main];
-    const overlaps = [1, 2, 3].filter((i) => {
-      const p = state.workers[WORKER_ID.panel(i)];
-      const a = new Date(main.spawnedAt!).getTime();
-      const b = new Date(main.endedAt!).getTime();
-      const c = new Date(p.spawnedAt!).getTime();
-      const d = new Date(p.endedAt!).getTime();
-      return Math.min(b, d) - Math.max(a, c) > 0;
-    }).length;
-    expect(state.concurrency.panelsOverlappingMain).toBe(overlaps);
-    expect(state.concurrency.verdict).toBe(
-      overlaps >= 2 ? "REAL_PARALLEL_EXECUTION_CONFIRMED" : "REAL_PARALLEL_EXECUTION_NOT_CONFIRMED",
-    );
+    expect(state.workers[WORKER_ID.main].status).toBe("failed");
+    expect(state.workers[WORKER_ID.main].observedModelId).toBe("lmstudio/vibethinker-3b");
+    expect(state.mainPromotion.status).toBe("failed");
+    expect(state.concurrency.mainModelMatched).toBe(false);
+    expect(state.concurrency.verdict).toBe("HYBRID_PARALLEL_LAUNCH_NOT_CONFIRMED");
   });
 });

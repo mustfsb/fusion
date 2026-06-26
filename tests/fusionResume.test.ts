@@ -2,6 +2,11 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+// These tests perform real filesystem workspace copies and can lag under a
+// saturated parallel test run, so use a generous timeout to avoid load-induced
+// flakiness.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 import fusionCouncilPlugin from "../src/plugin.js";
 import { collectContext } from "../src/context/collectContext.js";
 import { extractContractGate } from "../src/council/contractGate.js";

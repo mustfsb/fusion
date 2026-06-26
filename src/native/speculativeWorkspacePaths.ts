@@ -24,6 +24,8 @@ export type SpeculativeWorkspacePaths = {
   sourceWorkspace: string;
   sourceArtifactDir: string;
   externalStagingDir: string;
+  /** Isolated main candidate workspace (external, never the source workspace). Optional for legacy speculative flow. */
+  mainWorkspacePath?: string;
   panelWorkspacePaths: [string, string, string];
 };
 
@@ -92,6 +94,10 @@ export function buildPanelWorkspacePaths(
   return paths as [string, string, string];
 }
 
+export function buildMainWorkspacePath(externalStagingDir: string): string {
+  return path.join(externalStagingDir, "main-workspace");
+}
+
 export function buildSpeculativeWorkspacePaths(input: {
   sourceWorkspace: string;
   sourceArtifactDir: string;
@@ -109,6 +115,7 @@ export function buildSpeculativeWorkspacePaths(input: {
     sourceWorkspace,
     sourceArtifactDir,
     externalStagingDir,
+    mainWorkspacePath: buildMainWorkspacePath(externalStagingDir),
     panelWorkspacePaths: buildPanelWorkspacePaths(externalStagingDir, input.panelCount),
   };
 }
@@ -126,6 +133,7 @@ export function buildSpeculativePathResolutionTrace(input: {
     sourceWorkspace: input.paths.sourceWorkspace,
     sourceArtifactDir: input.paths.sourceArtifactDir,
     externalCandidateStagingDir: input.paths.externalStagingDir,
+    mainWorkspacePath: input.paths.mainWorkspacePath,
     panelWorkspacePaths: [...input.paths.panelWorkspacePaths],
     resolverVersion: SPECULATIVE_RESOLVER_VERSION,
     runtimeModulePath: input.runtimeModulePath,
@@ -142,6 +150,7 @@ export function assertPanelWorkspacesExternal(input: {
   sourceWorkspace: string;
   sourceArtifactDir: string;
   externalStagingDir: string;
+  mainWorkspacePath?: string;
   panelWorkspacePaths: string[];
   resolverVersion?: string;
 }): void {
@@ -164,6 +173,9 @@ export function assertPanelWorkspacesExternal(input: {
 
   if (isPathContainedWithin(input.externalStagingDir, source)) {
     fail(input.externalStagingDir, "external candidate staging directory");
+  }
+  if (input.mainWorkspacePath && isPathContainedWithin(input.mainWorkspacePath, source)) {
+    fail(input.mainWorkspacePath, "main candidate workspace");
   }
   for (const panel of input.panelWorkspacePaths) {
     if (isPathContainedWithin(panel, source)) {

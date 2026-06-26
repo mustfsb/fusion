@@ -38,6 +38,12 @@ const outcome = behavior.outcome ?? "complete"; // complete | fail | hang
 const verification = behavior.verification ?? { typecheck: "pass", test: "pass", build: "pass" };
 
 process.stdout.write(`[fake-opencode] ${workerId} role=${role} starting in ${workspace}\n`);
+const observedModel =
+  behavior.observedModel ??
+  process.env.FUSION_REQUESTED_MODEL ??
+  process.env.FUSION_MAIN_MODEL ??
+  "unknown/unknown";
+process.stdout.write(`[fake-opencode] ${workerId} observedModel=${observedModel}\n`);
 
 // Simulate candidate source changes inside the worker's own workspace.
 if (behavior.changedFile) {

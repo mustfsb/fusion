@@ -67,6 +67,14 @@ export type CandidateWorkspacePreflightResult = {
   diagnostic?: string;
 };
 
+export type ImmutableSourceSnapshotResult = {
+  sourceSnapshotWorkspacePath: string;
+  sourceSnapshotManifestPath: string;
+  sourceBaselineSummaryPath: string;
+  sourceFingerprint: string;
+  fileCount: number;
+};
+
 type ResolvedSpeculativePaths = {
   sourceWorkspace: string;
   sourceArtifactDir: string;
@@ -173,6 +181,128 @@ export async function createCandidateWorkspaces(
     baselineManifestPath,
     baselineSummaryPath,
     isolationCapability: honestIsolationCapability({ hardLinkSafe: true, symlinkSafe: true }),
+  };
+}
+
+export async function createImmutableSourceSnapshot(input: {
+  sourceWorkspace: string;
+  sourceArtifactDir: string;
+  sourceSnapshotWorkspacePath: string;
+  externalStagingDir: string;
+  now?: () => Date;
+}): Promise<ImmutableSourceSnapshotResult> {
+  const now = input.now ?? (() => new Date());
+  const copyExclusions = [path.resolve(input.sourceArtifactDir), path.resolve(input.externalStagingDir)];
+  const sourceWalk = await walkSourceTree(path.resolve(input.sourceWorkspace), copyExclusions);
+  if (sourceWalk.blockedSymlinks.length > 0) {
+    throw new Error(
+      `Unsafe symlink(s) in source workspace resolve outside the source root: ${sourceWalk.blockedSymlinks.join(", ")}`,
+    );
+  }
+
+  const baselineManifestPath = path.join(path.resolve(input.sourceArtifactDir), "baseline-manifest.json");
+  const baselineSummaryPath = path.join(path.resolve(input.sourceArtifactDir), "baseline-summary.md");
+  const baselineManifest = buildBaselineManifest(sourceWalk.files, path.resolve(input.sourceWorkspace), now());
+  const sourceFingerprint = createHash("sha256")
+    .update(JSON.stringify(baselineManifest.files), "utf8")
+    .digest("hex");
+
+  await fs.mkdir(path.resolve(input.sourceArtifactDir), { recursive: true });
+  await fs.writeFile(baselineManifestPath, `${JSON.stringify(baselineManifest, null, 2)}\n`, "utf8");
+  await fs.writeFile(baselineSummaryPath, renderBaselineSummary(baselineManifest, path.resolve(input.sourceWorkspace)), "utf8");
+
+  const snapshotWorkspacePath = path.resolve(input.sourceSnapshotWorkspacePath);
+  await fs.rm(snapshotWorkspacePath, { recursive: true, force: true });
+  await fs.mkdir(snapshotWorkspacePath, { recursive: true });
+
+  const copyResult = await copySourceTree(path.resolve(input.sourceWorkspace), snapshotWorkspacePath, sourceWalk.files);
+  if (copyResult.unsafeSymlinks.length > 0) {
+    throw new Error(
+      `Unsafe symlink(s) encountered while creating immutable source snapshot: ${copyResult.unsafeSymlinks.join(", ")}`,
+    );
+  }
+
+  const inodeCheck = verifyNoSharedWritableInodes(
+    path.resolve(input.sourceWorkspace),
+    snapshotWorkspacePath,
+    copyResult.copiedRelPaths,
+  );
+  if (inodeCheck.sharedInodes.length > 0) {
+    throw new Error(
+      `Immutable source snapshot shares writable inode identity with source for: ${inodeCheck.sharedInodes.slice(0, 5).join(", ")}`,
+    );
+  }
+
+  return {
+    sourceSnapshotWorkspacePath: snapshotWorkspacePath,
+    sourceSnapshotManifestPath: baselineManifestPath,
+    sourceBaselineSummaryPath: baselineSummaryPath,
+    sourceFingerprint,
+    fileCount: baselineManifest.fileCount,
+  };
+}
+
+export async function materializeCandidateWorkspaceFromSnapshot(input: {
+  logicalPanelIndex: number;
+  sourceSnapshotWorkspacePath: string;
+  sourceSnapshotManifestPath: string;
+  candidateWorkspacePath: string;
+  candidateManifestPath: string;
+  sourceArtifactDir: string;
+  gitExec?: (args: string[], cwd: string) => Promise<string | undefined>;
+  now?: () => Date;
+}): Promise<CandidateWorkspaceInfo> {
+  const now = input.now ?? (() => new Date());
+  const baseline = await loadBaselineManifest(input.sourceSnapshotManifestPath);
+  if (!baseline) {
+    throw new Error(`Unreadable immutable source snapshot manifest: ${input.sourceSnapshotManifestPath}`);
+  }
+
+  const workspacePath = path.resolve(input.candidateWorkspacePath);
+  await fs.rm(workspacePath, { recursive: true, force: true });
+  await fs.mkdir(workspacePath, { recursive: true });
+
+  const sourceFiles = baseline.files.map((file) => ({
+    relPath: file.relPath,
+    absolutePath: path.join(path.resolve(input.sourceSnapshotWorkspacePath), file.relPath),
+  }));
+  const copyResult = await copySourceTree(path.resolve(input.sourceSnapshotWorkspacePath), workspacePath, sourceFiles);
+  if (copyResult.unsafeSymlinks.length > 0) {
+    throw new Error(
+      `Unsafe symlink(s) encountered while materializing panel-${input.logicalPanelIndex}: ${copyResult.unsafeSymlinks.join(", ")}`,
+    );
+  }
+
+  const inodeCheck = verifyNoSharedWritableInodes(
+    path.resolve(input.sourceSnapshotWorkspacePath),
+    workspacePath,
+    copyResult.copiedRelPaths,
+  );
+  if (inodeCheck.sharedInodes.length > 0) {
+    throw new Error(
+      `Candidate workspace panel-${input.logicalPanelIndex} shares writable inode identity with immutable snapshot for: ${inodeCheck.sharedInodes.slice(0, 5).join(", ")}`,
+    );
+  }
+
+  const gitInitialized = await initCandidateGitBaseline(workspacePath, input.gitExec);
+  const candidateManifest = buildBaselineManifest(
+    copyResult.copiedRelPaths.map((rel) => ({ relPath: rel, absolutePath: path.join(workspacePath, rel) })),
+    workspacePath,
+    now(),
+  );
+  await fs.writeFile(path.resolve(input.candidateManifestPath), `${JSON.stringify(candidateManifest, null, 2)}\n`, "utf8");
+
+  const candidateOutput = candidatePanelOutputPaths(workspacePath);
+  return {
+    logicalPanelIndex: input.logicalPanelIndex,
+    workspacePath,
+    manifestPath: path.resolve(input.candidateManifestPath),
+    reportPath: path.join(path.resolve(input.sourceArtifactDir), `panel-${input.logicalPanelIndex}-report.md`),
+    patchPath: path.join(path.resolve(input.sourceArtifactDir), `panel-${input.logicalPanelIndex}.patch`),
+    gitInitialized,
+    candidateOutputDir: candidateOutput.outputDir,
+    candidateReportPath: candidateOutput.reportPath,
+    candidateNotesPath: candidateOutput.notesPath,
   };
 }
 

@@ -23,6 +23,8 @@ export function supervisorRunDir(cwd: string, runId: string, traceDir?: string):
   return path.join(resolveTraceRoot(cwd, traceDir), runId);
 }
 
+let stateWriteCounter = 0;
+
 export async function writeSupervisorState(
   state: SupervisorState,
   cwd: string,
@@ -31,7 +33,11 @@ export async function writeSupervisorState(
   const filePath = supervisorStatePath(cwd, state.runId, traceDir);
   await mkdir(path.dirname(filePath), { recursive: true });
   state.updatedAt = new Date().toISOString();
-  const tmp = `${filePath}.${process.pid}.tmp`;
+  // Unique temp suffix so concurrent writes from the same supervisor process
+  // (main pipeline + panel pipeline run in parallel) never collide on the same
+  // temp filename.
+  stateWriteCounter += 1;
+  const tmp = `${filePath}.${process.pid}.${stateWriteCounter}.${Math.random().toString(36).slice(2)}.tmp`;
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
   await rename(tmp, filePath);
   return filePath;

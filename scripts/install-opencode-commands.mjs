@@ -1,8 +1,37 @@
 #!/usr/bin/env node
-import { copyFile, mkdir, readdir } from "node:fs/promises";
+import { copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+const FUSION_RUNTIME_MANIFEST_VERSION = 1;
+const FUSION_PLUGIN_BUILD_ID = "fusion-council-hybrid-v2";
+const FUSION_BUILD_COMMAND_TEMPLATE_VERSION = "fusion-build-hybrid-v2";
+const FUSION_ORCHESTRATOR_TEMPLATE_VERSION = "fusion-orchestrator-hybrid-v2";
+const FUSION_RUNTIME_MANIFEST_FILENAME = "fusion-runtime-manifest.json";
+
+function buildRuntimeManifest() {
+  return {
+    version: FUSION_RUNTIME_MANIFEST_VERSION,
+    pluginBuildId: FUSION_PLUGIN_BUILD_ID,
+    defaultBuildStrategy: "hybrid_external_main_native_panels",
+    supportedTools: {
+      fusionSupervisorStages: ["launch", "status", "resume"],
+      fusionNativeStages: [
+        "prepare",
+        "advance",
+        "collect",
+        "record_main_baseline",
+        "finalize",
+        "audit_prepare",
+        "audit_finalize",
+        "resume",
+      ],
+    },
+    expectedCommandTemplateVersion: FUSION_BUILD_COMMAND_TEMPLATE_VERSION,
+    expectedOrchestratorTemplateVersion: FUSION_ORCHESTRATOR_TEMPLATE_VERSION,
+  };
+}
 
 /**
  * Cross-platform installer for OpenCode Fusion Council slash-command files.
@@ -48,6 +77,10 @@ async function main() {
     await copyFile(sourcePath, destPath);
     console.log(`Installed ${destPath}`);
   }
+
+  const manifestPath = join(commandsDir, "..", FUSION_RUNTIME_MANIFEST_FILENAME);
+  await writeFile(manifestPath, `${JSON.stringify(buildRuntimeManifest(), null, 2)}\n`, "utf8");
+  console.log(`Installed ${manifestPath}`);
 
   console.log(`\nAll ${SUPPORTED_COMMANDS.length} Fusion Council commands installed to:`);
   console.log(commandsDir);
