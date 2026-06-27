@@ -84,8 +84,7 @@ describe("fusion_native.prepare real entrypoint", () => {
         buildStrategy: "speculative_parallel_build",
         command: "fusion-build",
         runId,
-        // Keep source-side artifacts directly under the workspace so the run dir
-        // is <sourceWorkspace>/fusion-test-run (mirrors the reported failure).
+        // Canonical supervisor runs live under .opencode/fusion-runs/<runId>.
         traceDir: ".",
         panelModels: ["test/panel-a", "test/panel-b", "test/panel-c"],
         judgeModel: "test/judge",
@@ -105,7 +104,7 @@ describe("fusion_native.prepare real entrypoint", () => {
     );
     const advanced = JSON.parse(typeof advancedRaw === "string" ? advancedRaw : (advancedRaw as { output: string }).output);
 
-    const sourceArtifactDir = path.join(sourceWorkspace, runId);
+    const sourceArtifactDir = path.join(sourceWorkspace, ".opencode", "fusion-runs", runId);
     const expectedStaging = path.join(cacheRoot, "speculative-runs", runId);
     const forbiddenSpeculativeDir = path.join(sourceArtifactDir, "speculative");
 

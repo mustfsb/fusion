@@ -24,6 +24,8 @@ const role = env.FUSION_WORKER_ROLE ?? "unknown";
 const workspace = env.FUSION_WORKSPACE ?? process.cwd();
 const resultPath = env.FUSION_RESULT_ARTIFACT;
 const statusPath = env.FUSION_STATUS_ARTIFACT;
+const taskPath = env.FUSION_TASK_ARTIFACT;
+const verificationPath = env.FUSION_VERIFICATION_ARTIFACT;
 
 let behavior = {};
 try {
@@ -44,6 +46,14 @@ const observedModel =
   process.env.FUSION_MAIN_MODEL ??
   "unknown/unknown";
 process.stdout.write(`[fake-opencode] ${workerId} observedModel=${observedModel}\n`);
+
+if (behavior.requireLocalCanonicalTask) {
+  const taskText = readFileSync(taskPath, "utf8");
+  if (!taskPath.startsWith(path.join(workspace, ".fusion-worker")) || !taskText.includes("# Fusion Canonical Task")) {
+    process.stderr.write(`[fake-opencode] ${workerId} could not read local canonical task\n`);
+    process.exit(2);
+  }
+}
 
 // Simulate candidate source changes inside the worker's own workspace.
 if (behavior.changedFile) {
@@ -82,7 +92,11 @@ function finish() {
     mergePatchDecision: role === "judge" ? behavior.decision ?? "NO_PATCH_REQUIRED" : undefined,
     contractPath,
   };
-  if (resultPath) {
+  if (verificationPath) {
+    mkdirSync(path.dirname(verificationPath), { recursive: true });
+    writeFileSync(verificationPath, JSON.stringify(verification, null, 2), "utf8");
+  }
+  if (resultPath && !behavior.noResult) {
     mkdirSync(path.dirname(resultPath), { recursive: true });
     writeFileSync(resultPath, JSON.stringify(result, null, 2), "utf8");
   }

@@ -74,15 +74,32 @@ describe("docs and examples", () => {
     expect(orchestrator).toContain("Apply ONLY approved targeted patches");
   });
 
-  test("fusion-build documents the default hybrid_external_main_native_panels supervisor", async () => {
+  test("fusion-build documents the default foreground hybrid_external_main_native_panels flow", async () => {
     const command = await readFile("examples/commands/fusion-build.md", "utf8");
+    const orchestrator = buildOrchestratorAgentFile().content;
     expect(command).toContain("hybrid_external_main_native_panels");
     expect(command).toContain("fusion_supervisor");
     expect(command).toContain('"stage": "launch"');
     expect(command).toContain("fusion-main-builder");
-    expect(command).toContain("detached Node supervisor");
-    expect(command).toContain("HYBRID_PARALLEL_LAUNCH_CONFIRMED");
+    // Foreground, model-driven flow — NOT a detached background supervisor.
+    expect(command).not.toContain("detached Node supervisor");
+    expect(command).toContain("confirm_launch");
+    // Production reconciliation contract: the parent submits panelOutcomes after
+    // the parallel Task wave, and a missing batch is recoverable, not fatal.
+    expect(command).toContain("panelOutcomes");
+    // Self-healing confirm contract: degraded continue + await-completion, both recoverable.
+    expect(command).toContain("LAUNCH_CONFIRMED");
+    expect(command).toContain("collect");
+    expect(command).toContain("panel-evidence");
+    expect(command).toContain("ONE independent external `opencode run` process");
+    expect(command).toContain("native OpenCode Task subagents");
+    expect(command).toContain("must not report success");
+    expect(command).toContain("FUSION_FOREGROUND_PROTOCOL_VERSION: 6");
     expect(command).toContain("non-default compatibility fallback");
+    expect(orchestrator).toContain("panelOutcomes");
+    expect(orchestrator).toContain("LAUNCH_CONFIRMED");
+    expect(orchestrator).toContain("IMMEDIATELY call `collect`");
+    expect(orchestrator).toContain("never gates panel evidence");
   });
 
   test("fusion-resume documents supervisor recovery", async () => {

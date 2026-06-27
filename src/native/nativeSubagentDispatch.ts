@@ -1,7 +1,11 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { FusionModelSpec } from "../modelSpec.js";
-import { defaultAgentDir } from "./agentSync.js";
+import {
+  defaultAgentDir,
+  readInstalledAgentModels,
+  syncNativeAgents,
+} from "./agentSync.js";
 import { FUSION_AGENT_NAMES, FUSION_PANEL_AGENT_NAMES } from "./agentTemplates.js";
 import type { WorkerRecord } from "./supervisorTypes.js";
 
@@ -97,6 +101,139 @@ export function formatNativePanelDispatchFailure(error: FusionNativePanelDispatc
   return parts.join(": ");
 }
 
+/**
+ * Raised when stale native agent files were repaired from canonical config but
+ * OpenCode must restart before workers can launch with the updated definitions.
+ */
+export class FusionRestartRequiredAfterAgentResyncError extends Error {
+  constructor(
+    readonly details: {
+      configFingerprint: string;
+      repairedAgents: string[];
+    },
+  ) {
+    super(formatRestartRequiredAfterAgentResync(details));
+    this.name = "FusionRestartRequiredAfterAgentResyncError";
+  }
+}
+
+export function formatRestartRequiredAfterAgentResync(details: {
+  configFingerprint: string;
+  repairedAgents: string[];
+}): string {
+  return [
+    "FUSION_RESTART_REQUIRED_AFTER_AGENT_RESYNC",
+    "Installed native agent files disagreed with the persisted /fusion-model configuration.",
+    "Agent files were repaired from the canonical Fusion model config; the config was NOT modified.",
+    `Config fingerprint: ${details.configFingerprint}`,
+    `Repaired agents: ${details.repairedAgents.join(", ")}`,
+    "Restart OpenCode, then rerun /fusion-build.",
+  ].join("\n");
+}
+
+/** @deprecated Stale agent recovery now uses FUSION_RESTART_REQUIRED_AFTER_AGENT_RESYNC. */
+export class FusionNativeAgentConfigMismatchError extends Error {
+  constructor(
+    readonly details: { agentId: string; configuredModel: string; agentFileModel: string },
+  ) {
+    super(formatNativeAgentConfigMismatch(details));
+    this.name = "FusionNativeAgentConfigMismatchError";
+  }
+}
+
+/** @deprecated */
+export function formatNativeAgentConfigMismatch(details: {
+  agentId: string;
+  configuredModel: string;
+  agentFileModel: string;
+}): string {
+  return [
+    "FUSION_NATIVE_AGENT_CONFIG_MISMATCH",
+    `agent "${details.agentId}": persisted Fusion model config = ${details.configuredModel}, ` +
+      `installed agent file model = ${details.agentFileModel}`,
+  ].join("\n");
+}
+
+export type NativeAgentReconcileResult = {
+  synchronized: boolean;
+  configFingerprint: string;
+  installedAgentFingerprint?: string;
+  installedAgentModels: {
+    panelModels: string[];
+    judgeModel: string;
+  };
+};
+
+export async function reconcileNativeAgentsAtLaunch(input: {
+  panelModels: FusionModelSpec[];
+  judgeModel: FusionModelSpec;
+  configFingerprint: string;
+  agentDir?: string;
+}): Promise<NativeAgentReconcileResult> {
+  const agentDir = input.agentDir ?? defaultAgentDir();
+  const installed = await readInstalledAgentModels(agentDir);
+  const expectedPanels = input.panelModels.map((spec) => spec.modelId);
+  const expectedJudge = input.judgeModel.modelId;
+  const modelsMatch =
+    expectedPanels.every((modelId, index) => installed.panelModels[index] === modelId) &&
+    installed.judgeModel === expectedJudge;
+  const fingerprintMatch =
+    installed.fingerprint != null && installed.fingerprint === input.configFingerprint;
+
+  if (modelsMatch && fingerprintMatch) {
+    return {
+      synchronized: true,
+      configFingerprint: input.configFingerprint,
+      installedAgentFingerprint: installed.fingerprint,
+      installedAgentModels: {
+        panelModels: expectedPanels,
+        judgeModel: expectedJudge,
+      },
+    };
+  }
+
+  await syncNativeAgents(
+    {
+      panelModels: input.panelModels,
+      judgeModel: input.judgeModel,
+      configFingerprint: input.configFingerprint,
+    },
+    agentDir,
+  );
+
+  throw new FusionRestartRequiredAfterAgentResyncError({
+    configFingerprint: input.configFingerprint,
+    repairedAgents: [...FUSION_PANEL_AGENT_NAMES, FUSION_AGENT_NAMES.judge],
+  });
+}
+
+export function assertJudgeDispatchModelConsistency(input: {
+  configuredJudgeModelId: string;
+  agentFileJudgeModelId: string;
+  dispatchJudgeModelId: string;
+}): void {
+  const { configuredJudgeModelId, agentFileJudgeModelId, dispatchJudgeModelId } = input;
+  if (
+    configuredJudgeModelId !== agentFileJudgeModelId ||
+    configuredJudgeModelId !== dispatchJudgeModelId ||
+    agentFileJudgeModelId !== dispatchJudgeModelId
+  ) {
+    throw new Error(
+      [
+        "FUSION_JUDGE_MODEL_CONFIG_MISMATCH",
+        `configured judge model = ${configuredJudgeModelId}`,
+        `native fusion-judge agent-file model = ${agentFileJudgeModelId}`,
+        `recorded judge dispatch model = ${dispatchJudgeModelId}`,
+      ].join("\n"),
+    );
+  }
+}
+
+export async function readNativeJudgeAgentModel(agentDir: string = defaultAgentDir()): Promise<string | undefined> {
+  const frontmatter = await readAgentFrontmatter(agentDir, FUSION_AGENT_NAMES.judge);
+  return frontmatter?.model;
+}
+
 type ParsedAgentFrontmatter = {
   mode?: string;
   model?: string;
@@ -177,16 +314,11 @@ export async function validateNativePanelAgents(
       });
     }
     if (frontmatter.model !== configuredModel) {
-      throw new FusionNativePanelDispatchError(formatNativePanelDispatchFailure(new FusionNativePanelDispatchError("", {
+      // Persisted config is the source of truth: fail loudly, never rewrite it.
+      throw new FusionNativeAgentConfigMismatchError({
         agentId,
         configuredModel,
-        dispatchMechanism: NATIVE_TASK_DISPATCH_MECHANISM,
-        cause: `agent "${agentId}" model mismatch: configured=${configuredModel}, agentFile=${frontmatter.model}`,
-      })), {
-        agentId,
-        configuredModel,
-        dispatchMechanism: NATIVE_TASK_DISPATCH_MECHANISM,
-        cause: `agent "${agentId}" model mismatch: configured=${configuredModel}, agentFile=${frontmatter.model}`,
+        agentFileModel: frontmatter.model,
       });
     }
   }
@@ -205,23 +337,30 @@ export async function validateNativeJudgeAgent(
     );
   }
   if (frontmatter.model !== judgeModel.modelId) {
-    throw new Error(
-      `FUSION_NATIVE_PANEL_DISPATCH_FAILED: agentId=${agentId}; configuredModel=${judgeModel.modelId}; ` +
-        `dispatchMechanism=${NATIVE_TASK_DISPATCH_MECHANISM}; failure=judge model mismatch (agentFile=${frontmatter.model})`,
-    );
+    throw new FusionNativeAgentConfigMismatchError({
+      agentId,
+      configuredModel: judgeModel.modelId,
+      agentFileModel: frontmatter.model,
+    });
   }
 }
 
 export function buildHybridPanelDispatchPrompt(input: {
+  runId: string;
   logicalPanelIndex: 1 | 2 | 3;
+  agentId: string;
+  canonicalTaskHash: string;
   candidateWorkspace: string;
   prohibitedSourceWorkspace: string;
   taskArtifactPath: string;
   executionContextPath: string;
   resultArtifactPath: string;
+  receiptArtifactPath: string;
+  panelResultArtifactPath: string;
+  verificationArtifactPath: string;
 }): string {
   return [
-    `You are an independent implementation worker (fusion-panel-${input.logicalPanelIndex}).`,
+    `You are an independent implementation worker (${input.agentId}).`,
     `Your candidate workspace is: ${input.candidateWorkspace}`,
     `The source workspace is prohibited: ${input.prohibitedSourceWorkspace}`,
     "Before modifying anything, verify your candidate workspace.",
@@ -235,7 +374,13 @@ export function buildHybridPanelDispatchPrompt(input: {
     "Do NOT wait for another panel or the main builder.",
     "Run typecheck/test/build inside the candidate workspace.",
     "",
-    `When finished, write your machine-readable result JSON to: ${input.resultArtifactPath} ` +
+    "When finished, write these deterministic artifacts ONLY inside your candidate workspace:",
+    `1) Receipt JSON: ${input.receiptArtifactPath}`,
+    "   Required fields: runId, panelId, agentId, canonicalTaskHash, candidateWorkspace, status[completed|failed], completedAt, summary.",
+    `   Use runId=${input.runId}, panelId=${input.agentId}, agentId=${input.agentId}, canonicalTaskHash=${input.canonicalTaskHash}, candidateWorkspace=${input.candidateWorkspace}.`,
+    `2) Panel result JSON: ${input.panelResultArtifactPath}`,
+    `3) Verification JSON: ${input.verificationArtifactPath}`,
+    `4) Supervisor result JSON: ${input.resultArtifactPath} ` +
       "(fields: workerId, role, status[completed|failed], changedFiles, verification, errorSummary, completedAt).",
   ].join("\n");
 }

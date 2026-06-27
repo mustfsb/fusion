@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
+import { saveSavedModelConfig } from "../src/modelConfig.js";
+import { syncNativeAgentsFromCanonicalConfig } from "../src/native/agentSync.js";
 import fusionCouncilPlugin from "../src/plugin.js";
 import {
   buildDetachedSupervisorArgv,
@@ -193,6 +195,7 @@ describe("detached supervisor launch contract", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       supervisorNodeCandidates: [FAKE_NODE_THEN_HELP],
       deps: hybridDeps(fakeRunner()),
@@ -206,6 +209,7 @@ describe("detached supervisor launch contract", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       supervisorNodeCandidates: [FAKE_INVALID_NODE],
       deps: hybridDeps(fakeRunner()),
@@ -247,6 +251,7 @@ describe("detached supervisor launch contract", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       deps: hybridDeps(fakeRunner()),
       startupTimeoutMs: 15000,
@@ -319,6 +324,7 @@ describe("detached supervisor launch contract", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       deps: hybridDeps(fakeRunner()),
       startupTimeoutMs: 15000,
@@ -342,6 +348,7 @@ describe("detached supervisor launch contract", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       deps: hybridDeps(fakeRunner()),
       startupTimeoutMs: 15000,
@@ -374,6 +381,7 @@ describe("detached supervisor launch contract", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       deps: hybridDeps(fakeRunner()),
       startupTimeoutMs: 15000,
@@ -403,6 +411,7 @@ describe("detached supervisor launch contract", () => {
         mainModel: { modelId: "prov/main-model" },
         panelModels: [{ modelId: "prov/panel-1" }, { modelId: "prov/panel-2" }, { modelId: "prov/panel-3" }],
         judgeModel: { modelId: "prov/judge-model" },
+        modelConfigFingerprint: "test-config-fingerprint",
         sourceWorkspace: sourceRoot,
       },
       { cwd: sourceRoot, traceDir: traceRoot, runner: brokenRunner, autoConfirmReady: true, skipNativeAgentValidation: true, nativeDispatcher: createFakeNativeSubagentDispatcher({ behavior: () => JSON.parse(readFileSync(behaviorPath, "utf8")), getWorkers: () => workersRef, skipAgentValidation: true }) },
@@ -418,42 +427,70 @@ describe("detached supervisor launch contract", () => {
 });
 
 describe("fusion_supervisor runtime route", () => {
-  test("plugin launch stage uses hybrid_external_main_native_panels, not legacy fusion_native", async () => {
+  test("plugin launch stage runs the foreground hybrid flow with a real main PID + 3 panel specs", async () => {
     await writeBehavior(allCompleteBehavior());
     const configDir = await mkdtemp(path.join(tmpdir(), "fusion-plugin-config-"));
     process.env.FUSION_OPENCODE_CONFIG_DIR = configDir;
+    // Route the tool's default OpenCode process runner through the fake binary.
+    process.env.FUSION_OPENCODE_BIN = process.execPath;
+    process.env.FUSION_OPENCODE_TEST_ENTRY = FAKE;
     await mkdir(path.join(configDir, "commands"), { recursive: true });
     await mkdir(path.join(configDir, "agent"), { recursive: true });
     await writeFile(
       path.join(configDir, "fusion-runtime-manifest.json"),
       JSON.stringify({
         version: 1,
-        pluginBuildId: "fusion-council-hybrid-v2",
+        foregroundProtocolVersion: 6,
+        pluginBuildId: "fusion-council-hybrid-v6",
         defaultBuildStrategy: "hybrid_external_main_native_panels",
         supportedTools: {
-          fusionSupervisorStages: ["launch", "status", "resume"],
+          fusionSupervisorStages: ["launch", "begin_native_wave", "confirm_launch", "collect", "finalize", "cancel", "status", "resume"],
           fusionNativeStages: ["prepare", "advance", "collect", "record_main_baseline", "finalize", "audit_prepare", "audit_finalize", "resume"],
         },
-        expectedCommandTemplateVersion: "fusion-build-hybrid-v2",
-        expectedOrchestratorTemplateVersion: "fusion-orchestrator-hybrid-v2",
+        expectedCommandTemplateVersion: "fusion-build-hybrid-v6",
+        expectedOrchestratorTemplateVersion: "fusion-orchestrator-hybrid-v6",
       }),
       "utf8",
     );
     await writeFile(
       path.join(configDir, "commands", "fusion-build.md"),
-      "FUSION_COMMAND_TEMPLATE_VERSION: fusion-build-hybrid-v2\nfusion_supervisor\n\"stage\": \"launch\"",
+      "FUSION_COMMAND_TEMPLATE_VERSION: fusion-build-hybrid-v6\nFUSION_FOREGROUND_PROTOCOL_VERSION: 6\nfusion_supervisor\n\"stage\": \"launch\"",
       "utf8",
     );
     await writeFile(
       path.join(configDir, "agent", "fusion-orchestrator.md"),
-      "FUSION_ORCHESTRATOR_TEMPLATE_VERSION: fusion-orchestrator-hybrid-v2\nhybrid_external_main_native_panels\nfusion_supervisor",
+      "FUSION_ORCHESTRATOR_TEMPLATE_VERSION: fusion-orchestrator-hybrid-v6\nFUSION_FOREGROUND_PROTOCOL_VERSION: 6\nhybrid_external_main_native_panels\nfusion_supervisor",
       "utf8",
     );
+
+    const modelsPath = path.join(configDir, "fusion-council-models.json");
+    await saveSavedModelConfig(
+      {
+        panelModels: [
+          { modelId: "prov/panel-1" },
+          { modelId: "prov/panel-2" },
+          { modelId: "prov/panel-3" },
+        ],
+        judgeModel: { modelId: "prov/judge-model" },
+      },
+      modelsPath,
+    );
+    await syncNativeAgentsFromCanonicalConfig(modelsPath, path.join(configDir, "agent"));
 
     const plugin = await fusionCouncilPlugin({ client: {} as never } as never, {
       saveRunArtifacts: true,
       traceDir: traceRoot,
     } as never);
+    await plugin["chat.params"]?.(
+      {
+        sessionID: "test",
+        agent: "test",
+        model: { providerID: "prov", id: "active-main" },
+        provider: {} as never,
+        message: {} as never,
+      } as never,
+      { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as never,
+    );
     const fusionSupervisor = plugin.tool?.fusion_supervisor;
     expect(fusionSupervisor).toBeDefined();
     const raw = await fusionSupervisor!.execute(
@@ -461,7 +498,6 @@ describe("fusion_supervisor runtime route", () => {
         stage: "launch",
         task: "Add a feature flag.",
         command: "fusion-build",
-        inline: false,
         traceDir: traceRoot,
       } as never,
       {
@@ -477,9 +513,14 @@ describe("fusion_supervisor runtime route", () => {
     );
     const result = JSON.parse(typeof raw === "string" ? raw : (raw as { output: string }).output);
     expect(result.strategy).toBe("hybrid_external_main_native_panels");
-    expect(result.readyAt).toBeTruthy();
-    expect(result.detached).toBe(false);
+    expect(result.main.pid).toBeGreaterThan(0);
+    expect(result.main.requestedModelId).toBe("prov/active-main");
+    expect(result.main.executionKind).toBe("external_process");
+    expect(result.panelDispatchSpecs).toHaveLength(3);
+    expect(result.judge.status).toBe("pending");
     delete process.env.FUSION_OPENCODE_CONFIG_DIR;
+    delete process.env.FUSION_OPENCODE_BIN;
+    delete process.env.FUSION_OPENCODE_TEST_ENTRY;
     await rm(configDir, { recursive: true, force: true });
   });
 });

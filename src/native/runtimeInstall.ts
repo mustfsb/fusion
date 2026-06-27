@@ -1,10 +1,12 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import {
   buildRuntimeManifest,
+  FUSION_FOREGROUND_PROTOCOL_VERSION,
   FUSION_RUNTIME_MANIFEST_FILENAME,
   fusionBuildCommandTemplateMarker,
+  fusionForegroundProtocolMarker,
   fusionOrchestratorTemplateMarker,
   type FusionRuntimeManifest,
 } from "../runtimeManifest.js";
@@ -43,83 +45,83 @@ async function loadInstalledManifest(configDir: string): Promise<FusionRuntimeMa
   }
 }
 
-function mismatchError(details: string[]): Error {
-  const detailBlock = details.length ? `${details.map((entry) => `- ${entry}`).join("\n")}\n` : "";
-  return new Error(
-    [
-      "FUSION_RUNTIME_INSTALL_MISMATCH",
-      detailBlock.trimEnd(),
-      "npm run build",
-      "npm run install:opencode-agents",
-      "npm run install:opencode-commands",
-      "restart OpenCode",
-    ].filter(Boolean).join("\n"),
-  );
+function protocolMismatchError(stalePath: string, detail: string): Error {
+  return new Error(`FUSION_RUNTIME_PROTOCOL_MISMATCH: ${detail}\nstale file: ${stalePath}`);
 }
 
-export async function assertFreshBuildRuntimeCompatible(): Promise<void> {
+/**
+ * Verify the installed command, orchestrator, and runtime manifest all advertise
+ * the active foreground protocol version before any worker launch begins.
+ */
+export async function assertForegroundProtocolCompatible(): Promise<void> {
   const expected = buildRuntimeManifest();
   const configDir = resolveOpenCodeConfigDir();
+  const commandPath = installedFusionBuildCommandPath(configDir);
+  const orchestratorPath = installedFusionOrchestratorPath(configDir);
+  const manifestPath = installedRuntimeManifestPath(configDir);
   const [manifest, commandText, orchestratorText] = await Promise.all([
     loadInstalledManifest(configDir),
-    readUtf8(installedFusionBuildCommandPath(configDir)),
-    readUtf8(installedFusionOrchestratorPath(configDir)),
+    readUtf8(commandPath),
+    readUtf8(orchestratorPath),
   ]);
 
-  const problems: string[] = [];
   if (!manifest) {
-    problems.push(`missing or unreadable ${installedRuntimeManifestPath(configDir)}`);
-  } else {
-    if (manifest.pluginBuildId !== expected.pluginBuildId) {
-      problems.push(`plugin build ID mismatch (${manifest.pluginBuildId} != ${expected.pluginBuildId})`);
-    }
-    if (manifest.defaultBuildStrategy !== expected.defaultBuildStrategy) {
-      problems.push(`default build strategy mismatch (${manifest.defaultBuildStrategy} != ${expected.defaultBuildStrategy})`);
-    }
-    if (!manifest.supportedTools?.fusionSupervisorStages?.includes("launch")) {
-      problems.push("installed manifest does not advertise fusion_supervisor launch");
-    }
-    if (manifest.expectedCommandTemplateVersion !== expected.expectedCommandTemplateVersion) {
-      problems.push(
-        `fusion-build command template version mismatch (${manifest.expectedCommandTemplateVersion} != ${expected.expectedCommandTemplateVersion})`,
-      );
-    }
-    if (manifest.expectedOrchestratorTemplateVersion !== expected.expectedOrchestratorTemplateVersion) {
-      problems.push(
-        `fusion-orchestrator template version mismatch (${manifest.expectedOrchestratorTemplateVersion} != ${expected.expectedOrchestratorTemplateVersion})`,
-      );
-    }
+    throw protocolMismatchError(manifestPath, "missing or unreadable runtime manifest");
+  }
+  if ((manifest.foregroundProtocolVersion ?? 0) !== FUSION_FOREGROUND_PROTOCOL_VERSION) {
+    throw protocolMismatchError(
+      manifestPath,
+      `runtime manifest foregroundProtocolVersion=${manifest.foregroundProtocolVersion ?? "missing"} expected ${FUSION_FOREGROUND_PROTOCOL_VERSION}`,
+    );
+  }
+  if (manifest.expectedCommandTemplateVersion !== expected.expectedCommandTemplateVersion) {
+    throw protocolMismatchError(
+      manifestPath,
+      `command template version mismatch (${manifest.expectedCommandTemplateVersion} != ${expected.expectedCommandTemplateVersion})`,
+    );
+  }
+  if (manifest.expectedOrchestratorTemplateVersion !== expected.expectedOrchestratorTemplateVersion) {
+    throw protocolMismatchError(
+      manifestPath,
+      `orchestrator template version mismatch (${manifest.expectedOrchestratorTemplateVersion} != ${expected.expectedOrchestratorTemplateVersion})`,
+    );
+  }
+  if (manifest.pluginBuildId !== expected.pluginBuildId) {
+    throw protocolMismatchError(manifestPath, `plugin build ID mismatch (${manifest.pluginBuildId} != ${expected.pluginBuildId})`);
   }
 
   if (!commandText) {
-    problems.push(`missing ${installedFusionBuildCommandPath(configDir)}`);
-  } else {
-    if (!commandText.includes(fusionBuildCommandTemplateMarker())) {
-      problems.push("installed fusion-build command marker is stale");
-    }
-    if (!commandText.includes("fusion_supervisor")) {
-      problems.push("installed fusion-build command does not route through fusion_supervisor");
-    }
-    if (!commandText.includes('"stage": "launch"')) {
-      problems.push("installed fusion-build command does not call fusion_supervisor launch");
-    }
+    throw protocolMismatchError(commandPath, "missing fusion-build command");
+  }
+  if (!commandText.includes(fusionBuildCommandTemplateMarker())) {
+    throw protocolMismatchError(commandPath, "fusion-build command template marker is stale");
+  }
+  if (!commandText.includes(fusionForegroundProtocolMarker())) {
+    throw protocolMismatchError(commandPath, "fusion-build command missing foreground protocol marker");
   }
 
   if (!orchestratorText) {
-    problems.push(`missing ${installedFusionOrchestratorPath(configDir)}`);
-  } else {
-    if (!orchestratorText.includes(fusionOrchestratorTemplateMarker())) {
-      problems.push("installed fusion-orchestrator marker is stale");
-    }
-    if (!orchestratorText.includes("hybrid_external_main_native_panels")) {
-      problems.push("installed fusion-orchestrator does not describe hybrid_external_main_native_panels");
-    }
-    if (!orchestratorText.includes("fusion_supervisor")) {
-      problems.push("installed fusion-orchestrator does not route /fusion-build through fusion_supervisor");
-    }
+    throw protocolMismatchError(orchestratorPath, "missing fusion-orchestrator agent");
   }
+  if (!orchestratorText.includes(fusionOrchestratorTemplateMarker())) {
+    throw protocolMismatchError(orchestratorPath, "fusion-orchestrator template marker is stale");
+  }
+  if (!orchestratorText.includes(fusionForegroundProtocolMarker())) {
+    throw protocolMismatchError(orchestratorPath, "fusion-orchestrator missing foreground protocol marker");
+  }
+}
 
-  if (problems.length > 0) {
-    throw mismatchError(problems);
-  }
+/** @deprecated use assertForegroundProtocolCompatible */
+export async function assertFreshBuildRuntimeCompatible(): Promise<void> {
+  await assertForegroundProtocolCompatible();
+}
+
+export async function writeInstalledRuntimeManifest(
+  modelConfigFingerprint?: string,
+  configDir = resolveOpenCodeConfigDir(),
+): Promise<string> {
+  const manifestPath = installedRuntimeManifestPath(configDir);
+  await mkdir(configDir, { recursive: true });
+  await writeFile(manifestPath, `${JSON.stringify(buildRuntimeManifest(modelConfigFingerprint), null, 2)}\n`, "utf8");
+  return manifestPath;
 }

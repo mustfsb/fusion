@@ -185,7 +185,7 @@ describe("model config persistence", () => {
     expect(loaded!.judgeModel).toEqual({ modelId: "g/h" });
   });
 
-  test("reset clears effort and restores defaults", async () => {
+  test("reset writes defaults to canonical config", async () => {
     await saveSavedModelConfig(
       {
         panelModels: [{ modelId: "a/b", reasoningEffort: "high" }, { modelId: "c/d" }, { modelId: "e/f" }],
@@ -195,14 +195,15 @@ describe("model config persistence", () => {
     );
     await resetSavedModelConfig(tmpConfigPath);
     const result = await resolveModels(undefined, tmpConfigPath);
-    expect(result.source).toBe("default");
+    expect(result.source).toBe("saved");
     expect(result.panelModels).toEqual(DEFAULT_PANEL_MODELS.map((modelId) => ({ modelId })));
     expect(result.judgeModel).toEqual({ modelId: DEFAULT_JUDGE_MODEL });
+    expect(result.fingerprint).toMatch(/^[a-f0-9]{16}$/);
   });
 });
 
 describe("resolveModels", () => {
-  test("explicit args with effort override saved config", async () => {
+  test("launch arguments do not override saved canonical config", async () => {
     await saveSavedModelConfig(
       {
         panelModels: [{ modelId: "saved/p1" }, { modelId: "saved/p2" }, { modelId: "saved/p3" }],
@@ -217,13 +218,9 @@ describe("resolveModels", () => {
       },
       tmpConfigPath,
     );
-    expect(result.source).toBe("explicit");
-    expect(result.panelModels[1].reasoningEffort).toBe("medium");
-    expect(result.judgeModel).toEqual({
-      modelId: "explicit/judge",
-      reasoningEffort: "high",
-      raw: "explicit/judge/high",
-    });
+    expect(result.source).toBe("saved");
+    expect(result.panelModels.map((spec) => spec.modelId)).toEqual(["saved/p1", "saved/p2", "saved/p3"]);
+    expect(result.judgeModel.modelId).toBe("saved/judge");
   });
 
   test("saved config with effort beats defaults", async () => {
@@ -245,14 +242,18 @@ describe("model config markdown", () => {
     const markdown = formatUpdatedModelConfigMarkdown({
       panelModels: [{ modelId: "a/b" }, { modelId: "c/d" }, { modelId: "e/f" }],
       judgeModel: { modelId: "g/h" },
+      fingerprint: "abc123",
     });
     expect(markdown).toContain("not registry-validated");
   });
 
   test("set output displays exact saved provider/model IDs", () => {
-    const markdown = formatUpdatedModelConfigMarkdown(parseModelArgs(
-      "opencode-go/qwen3.7-max, opencode-go/kimi-k2.7-code, opencode-go/minimax-m3, openai/gpt-5.4/high",
-    ));
+    const markdown = formatUpdatedModelConfigMarkdown({
+      ...parseModelArgs(
+        "opencode-go/qwen3.7-max, opencode-go/kimi-k2.7-code, opencode-go/minimax-m3, openai/gpt-5.4/high",
+      ),
+      fingerprint: "abc123",
+    });
     expect(markdown).toContain("Saved Fusion models:");
     expect(markdown).toContain("Panel 1: opencode-go/qwen3.7-max");
     expect(markdown).toContain("Panel 2: opencode-go/kimi-k2.7-code");
@@ -267,6 +268,8 @@ describe("model config markdown", () => {
     );
     const markdown = formatSavedModelConfigMarkdown({
       ...parsed,
+      version: 1,
+      fingerprint: "abc123",
       updatedAt: "2026-01-01T00:00:00.000Z",
     }, "Custom (saved)");
     expect(markdown).toContain("Panel 1: opencode-go/qwen3.7-max");
@@ -276,9 +279,12 @@ describe("model config markdown", () => {
   });
 
   test("suspicious openai qwen model produces a warning", () => {
-    const markdown = formatUpdatedModelConfigMarkdown(parseModelArgs(
-      "openai/qwen3.7-max, opencode-go/kimi-k2.7-code, opencode-go/minimax-m3, openai/gpt-5.4/high",
-    ));
+    const markdown = formatUpdatedModelConfigMarkdown({
+      ...parseModelArgs(
+        "openai/qwen3.7-max, opencode-go/kimi-k2.7-code, opencode-go/minimax-m3, openai/gpt-5.4/high",
+      ),
+      fingerprint: "abc123",
+    });
     expect(markdown).toContain("Suspicious model ID: openai/qwen3.7-max. Did you mean opencode-go/qwen3.7-max?");
   });
 });

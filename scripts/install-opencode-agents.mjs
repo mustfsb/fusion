@@ -5,10 +5,8 @@
  *
  * - Copies supported command markdown files from examples/commands/ into
  *   ~/.config/opencode/commands/ on macOS, Linux, and Windows.
- * - Generates the fusion-orchestrator primary agent and the default
- *   fusion-panel-1/2/3 and fusion-judge subagent agent files into
- *   ~/.config/opencode/agent/ via the compiled agent templates (no duplicated
- *   prompt text, so installed agents never drift from src/native/agentTemplates.ts).
+ * - Generates fusion-orchestrator and panel/judge subagent files from the
+ *   canonical persisted /fusion-model config (never hardcoded defaults).
  * - Writes the fusion-runtime-manifest.json via the compiled runtime manifest.
  *
  * Node's os.homedir() resolves correctly on macOS, Linux, and Windows.
@@ -45,9 +43,9 @@ const agentDir = join(opencodeDir, "agent");
 
 async function loadDistModules() {
   const agentSyncPath = join(projectRoot, "dist", "native", "agentSync.js");
-  const runtimeManifestPath = join(projectRoot, "dist", "runtimeManifest.js");
+  const runtimeInstallPath = join(projectRoot, "dist", "native", "runtimeInstall.js");
   let agentSyncModule;
-  let runtimeManifestModule;
+  let runtimeInstallModule;
   try {
     agentSyncModule = await import(agentSyncPath);
   } catch (error) {
@@ -56,13 +54,13 @@ async function loadDistModules() {
     );
   }
   try {
-    runtimeManifestModule = await import(runtimeManifestPath);
+    runtimeInstallModule = await import(runtimeInstallPath);
   } catch (error) {
     throw new Error(
-      `Cannot load compiled runtime manifest from ${runtimeManifestPath}. Run \`npm run build\` first.\n${error instanceof Error ? error.message : String(error)}`,
+      `Cannot load compiled runtime install module from ${runtimeInstallPath}. Run \`npm run build\` first.\n${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  return { agentSyncModule, runtimeManifestModule };
+  return { agentSyncModule, runtimeInstallModule };
 }
 
 async function main() {
@@ -74,12 +72,12 @@ async function main() {
     );
   }
 
-  const { agentSyncModule, runtimeManifestModule } = await loadDistModules();
-  if (typeof agentSyncModule.syncDefaultNativeAgents !== "function") {
-    throw new Error("dist/native/agentSync.js does not export syncDefaultNativeAgents. Run `npm run build`.");
+  const { agentSyncModule, runtimeInstallModule } = await loadDistModules();
+  if (typeof agentSyncModule.syncNativeAgentsFromCanonicalConfig !== "function") {
+    throw new Error("dist/native/agentSync.js does not export syncNativeAgentsFromCanonicalConfig. Run `npm run build`.");
   }
-  if (typeof runtimeManifestModule.buildRuntimeManifest !== "function") {
-    throw new Error("dist/runtimeManifest.js does not export buildRuntimeManifest. Run `npm run build`.");
+  if (typeof runtimeInstallModule.writeInstalledRuntimeManifest !== "function") {
+    throw new Error("dist/native/runtimeInstall.js does not export writeInstalledRuntimeManifest. Run `npm run build`.");
   }
 
   await mkdir(commandsDir, { recursive: true });
@@ -91,12 +89,10 @@ async function main() {
     installed.push(dest);
   }
 
-  const sync = await agentSyncModule.syncDefaultNativeAgents(agentDir);
-  // sync.wrote entries already include the .md extension (e.g. "fusion-judge.md").
+  const sync = await agentSyncModule.syncNativeAgentsFromCanonicalConfig(undefined, agentDir);
   installed.push(...sync.wrote.map((name) => join(agentDir, name)));
 
-  const manifestPath = join(opencodeDir, FUSION_RUNTIME_MANIFEST_FILENAME);
-  await writeFile(manifestPath, `${JSON.stringify(runtimeManifestModule.buildRuntimeManifest(), null, 2)}\n`, "utf8");
+  const manifestPath = await runtimeInstallModule.writeInstalledRuntimeManifest(sync.configFingerprint, opencodeDir);
   installed.push(manifestPath);
 
   console.log("Installed Fusion commands into:", commandsDir);
@@ -104,11 +100,12 @@ async function main() {
   console.log("\nFiles:");
   for (const file of installed) console.log(`  ${file}`);
 
-  console.log("\nDefault panel models:");
+  console.log("\nPanel/judge models from canonical /fusion-model config:");
   sync.panelAgents.forEach((panel) => console.log(`  fusion-panel-${panel.panelIndex} -> ${panel.modelId}`));
   console.log(`  fusion-judge -> ${sync.judgeAgent.modelId}`);
+  console.log(`  config fingerprint: ${sync.configFingerprint}`);
   console.log("\nRestart OpenCode so the new agent definitions and commands take effect.");
-  console.log("Run `/fusion-model set ...` to change panel/judge models and regenerate agent files.");
+  console.log("Use `/fusion-model` to change panel/judge models and regenerate agent files.");
 }
 
 const isMain = (() => {

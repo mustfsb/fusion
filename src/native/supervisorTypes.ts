@@ -37,8 +37,11 @@ export const WORKER_ID = {
  */
 export type WorkerStatus =
   | "queued"
+  | "preparing"
+  | "launching"
   | "spawning"
   | "running"
+  | "retrying"
   | "suspected_stalled"
   | "timed_out"
   | "completed"
@@ -61,6 +64,23 @@ export type WorkerStatusTransition = {
   at: string;
   reason?: string;
 };
+
+/**
+ * Truthful native-wave trace for a panel/judge dispatched as a visible Task
+ * subagent. These distinguish what the host actually exposed at each point:
+ * - `dispatch_requested`: the parent has been told to dispatch (begin_native_wave)
+ *   but no host-observable running/terminal evidence exists yet. Never implies a
+ *   fake session ID or fake running state.
+ * - `native_task_running_when_observable`: the host exposed a real native session
+ *   ID (or equivalent running evidence) for the Task subagent.
+ * - `completed` / `failed` / `timed_out`: a real terminal result was observed.
+ */
+export type NativeWaveStage =
+  | "dispatch_requested"
+  | "native_task_running_when_observable"
+  | "completed"
+  | "failed"
+  | "timed_out";
 
 export type WorkerVerification = {
   typecheck?: "pass" | "fail" | "not_run";
@@ -116,6 +136,8 @@ export type WorkerRecord = {
   agentId?: string;
   sessionId?: string;
   dispatchMechanism?: string;
+  /** Truthful native-wave trace stage for native_subagent workers. */
+  nativeWaveStage?: NativeWaveStage;
   dispatchRequestedAt?: string;
   dispatchedAt?: string;
   terminalAt?: string;
@@ -129,6 +151,10 @@ export type WorkerRecord = {
   /** Deterministic machine-readable output + status artifact paths. */
   resultArtifactPath: string;
   statusArtifactPath: string;
+  /** Optional local worker-control artifacts, used by the external main worker. */
+  workerContextArtifactPath?: string;
+  verificationArtifactPath?: string;
+  workspaceContractValidated?: boolean;
   stdoutPath: string;
   stderrPath: string;
   sessionTitle: string;
@@ -154,16 +180,23 @@ export type WorkerRecord = {
   statusTransitions: WorkerStatusTransition[];
   result?: WorkerResultArtifact;
   candidate?: WorkerCandidateEvidence;
+  /** Multi-source native panel evidence reconciled at confirm_launch. */
+  runtimeEvidence?: NativePanelRuntimeEvidence;
 };
 
 export type SupervisorPhase =
+  | "initializing"
   | "bootstrapping"
+  | "preparing"
+  | "launching"
   | "running"
   | "workers_running"
   | "promotion"
   | "judge"
   | "done"
-  | "aborted";
+  | "aborted"
+  | "cancelled"
+  | "timed_out";
 
 export type ConcurrencyVerdict =
   | "HYBRID_PARALLEL_LAUNCH_CONFIRMED"
@@ -186,6 +219,49 @@ export type SupervisorConcurrency = {
   blockingReason?: string;
 };
 
+export type NativePanelReconciledStatus =
+  | "no_dispatch_evidence"
+  | "dispatched_pending_completion"
+  | "completed_with_session"
+  | "completed_with_receipt"
+  | "completed_with_task"
+  /**
+   * The panel visibly ran and mutated its REGISTERED candidate workspace
+   * (snapshot-relative meaningful source change) but the parent supplied no
+   * native session ID, no valid receipt, and no panelOutcomes entry. This is a
+   * self-healed, usable-degraded candidate — never a fatal/awaiting one.
+   */
+  | "completed_degraded"
+  | "completed_invalid_receipt"
+  | "failed";
+
+/** Final accept/reject/await verdict for one native panel's reconciled evidence. */
+export type NativePanelEvidenceAcceptance = "accepted" | "rejected" | "awaiting";
+
+/** Multi-source runtime evidence reconciled at confirm_launch for one native panel. */
+export type NativePanelRuntimeEvidence = {
+  agentId: string;
+  nativeSessionIdAvailable: boolean;
+  sessionId?: string;
+  taskId?: string;
+  taskCompletionEvidence: boolean;
+  taskCompletionSummary?: string;
+  receiptArtifactPath?: string;
+  receiptValidity: "valid" | "invalid" | "missing";
+  receiptValidationErrors?: string[];
+  candidateMutationEvidence: boolean;
+  reconciledStatus: NativePanelReconciledStatus;
+  /**
+   * Whether the parent supplied an explicit panelOutcomes entry for this panel
+   * (vs the supervisor reconstructing evidence purely from on-disk artifacts).
+   */
+  parentOutcomeProvided?: boolean;
+  /** Spoof/mismatch errors found in the parent-supplied panelOutcomes entry. */
+  contractMismatchErrors?: string[];
+  /** Accept/reject/await classification computed at confirm_launch. */
+  acceptance?: NativePanelEvidenceAcceptance;
+};
+
 export type NativePanelSessionTrace = {
   panelNumber: 1 | 2 | 3;
   sessionId?: string;
@@ -196,7 +272,9 @@ export type NativePanelSessionTrace = {
   dispatchedAt?: string;
   terminalAt?: string;
   status: WorkerStatus;
+  nativeWaveStage?: NativeWaveStage;
   resultArtifactPath: string;
+  runtimeEvidence?: NativePanelRuntimeEvidence;
 };
 
 export type NativeJudgeSessionTrace = {
@@ -213,12 +291,15 @@ export type NativeJudgeSessionTrace = {
 
 export type ExternalMainWorkerTrace = {
   pid?: number;
+  invokingSessionModelId?: string;
   requestedModelId?: string;
   configuredModelId?: string;
   observedProviderId?: string;
   observedModelId?: string;
   /** Isolated main candidate workspace (never the source workspace pre-promotion). */
   workspace: string;
+  localCanonicalTaskPath?: string;
+  workspaceContractValidated?: boolean;
   status: WorkerStatus;
   stdoutPath: string;
   stderrPath: string;
@@ -229,6 +310,7 @@ export type ExternalMainWorkerTrace = {
   /** Whether the main candidate was promoted into the real source workspace. */
   promoted?: boolean;
   promotionManifestPath?: string;
+  failureReason?: string;
 };
 
 export type SourceConflict = {
@@ -279,6 +361,56 @@ export type MainPromotionTrace = {
   detail?: string;
 };
 
+/**
+ * Run-level timing config, persisted at launch and reused by every later stage.
+ * These are intentionally SEPARATE concepts so a long native panel execution can
+ * never be mistaken for a slow startup:
+ * - `externalMainStartupDeadlineMs`: short guard that only verifies the external
+ *   main process obtained a real PID at launch (or fails loudly).
+ * - `nativeDispatchRegistrationDeadlineMs`: guards only the time from main spawn
+ *   to the parent calling `begin_native_wave` (registering the dispatch). It does
+ *   NOT bound how long the panels run.
+ * - `nativePanelExecutionTimeoutMs`: the real long-running panel execution
+ *   timeout, applied while monitoring/collecting, never at launch confirmation.
+ */
+export type FusionRunTiming = {
+  externalMainStartupDeadlineMs: number;
+  nativeDispatchRegistrationDeadlineMs: number;
+  nativePanelExecutionTimeoutMs: number;
+};
+
+/** Native panel dispatch-wave registration trace recorded by begin_native_wave. */
+export type NativeWaveTrace = {
+  registrationDeadlineMs: number;
+  /** ISO time the parent declared it is about to dispatch the panel wave. */
+  dispatchRequestedAt?: string;
+  /** ISO time begin_native_wave was accepted. */
+  registeredAt?: string;
+  /** main-spawn -> begin_native_wave elapsed at registration time. */
+  registrationElapsedMs?: number;
+  /** Whether registration was explicit (begin_native_wave) or implied at confirm. */
+  registeredVia?: "begin_native_wave" | "confirm_launch_implicit";
+  expectedPanelAgentIds: string[];
+  /** ISO time the parent returned from the blocking native Task wave. */
+  waveReturnedAt?: string;
+  /** True once confirm_launch records the parent wave return. */
+  parentWaveReturned?: boolean;
+  /** Number of panelOutcomes entries the most recent confirm_launch received. */
+  confirmPanelOutcomesReceived?: number;
+  /** ISO time of the last confirm_launch acknowledgement. */
+  lastConfirmAt?: string;
+};
+
+/** Cancellation / failure cleanup record (duplicate-run + orphan safety). */
+export type SupervisorCancellation = {
+  reason: string;
+  at: string;
+  /** What happened to the external main process during cleanup. */
+  mainProcessOutcome: "terminated" | "already_exited" | "no_handle" | "left_running";
+  mainPid?: number;
+  cleanedUp: boolean;
+};
+
 export const SUPERVISOR_STATE_VERSION = 1;
 
 export type SupervisorState = {
@@ -315,6 +447,15 @@ export type SupervisorState = {
 
   judgeModelId: string;
   mainModelId: string;
+  invokingSessionModelId?: string;
+  modelConfigFingerprint?: string;
+
+  /** Persisted run-level timing config; written at launch, reused everywhere. */
+  runTiming?: FusionRunTiming;
+  /** Native panel dispatch-wave registration trace (begin_native_wave). */
+  nativeWave?: NativeWaveTrace;
+  /** Cancellation / failure cleanup record. */
+  cancellation?: SupervisorCancellation;
 
   workers: Record<string, WorkerRecord>;
 

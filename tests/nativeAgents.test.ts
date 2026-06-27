@@ -8,7 +8,6 @@ import {
   formatAgentSyncMarkdown,
   listFusionAgentFiles,
   listNonFusionAgentFiles,
-  syncDefaultNativeAgents,
   syncNativeAgents,
 } from "../src/native/agentSync.js";
 import {
@@ -19,7 +18,7 @@ import {
 } from "../src/native/agentTemplates.js";
 import { nativeAdvance, nativeCollect, nativeFinalize, nativeFinalizeAudit, nativePrepare, nativePrepareAudit, buildTodoPlan } from "../src/native/nativeCouncil.js";
 import { hashSharedPanelPrompt, loadRunState } from "../src/native/runState.js";
-import { parseModelArgs } from "../src/modelConfig.js";
+import { parseModelArgs, computeModelConfigFingerprint } from "../src/modelConfig.js";
 import { DEFAULT_PANEL_MODELS, DEFAULT_JUDGE_MODEL } from "../src/config.js";
 import { completeCandidate } from "./fixtures/candidates.js";
 import type { FusionModelSpec } from "../src/modelSpec.js";
@@ -52,13 +51,20 @@ const defaultPanels: FusionModelSpec[] = [
   { modelId: "opencode-go/minimax-m3", raw: "opencode-go/minimax-m3" },
 ];
 
+function syncInput(input: { panelModels: FusionModelSpec[]; judgeModel: FusionModelSpec }) {
+  return {
+    ...input,
+    configFingerprint: computeModelConfigFingerprint(input),
+  };
+}
+
 describe("native agent generation", () => {
   test("syncNativeAgents writes orchestrator + 3 panel + 1 judge agent files with exact model IDs", async () => {
     const result = await syncNativeAgents(
-      {
+      syncInput({
         panelModels: defaultPanels,
         judgeModel: { modelId: "openai/gpt-5.4", reasoningEffort: "high", raw: "openai/gpt-5.4/high" },
-      },
+      }),
       tmpAgentDir,
     );
 
@@ -104,13 +110,7 @@ describe("native agent generation", () => {
   });
 
   test("preserves exact provider/model IDs including opencode-go prefix", async () => {
-    await syncNativeAgents(
-      {
-        panelModels: defaultPanels,
-        judgeModel: { modelId: "openai/gpt-5.5" },
-      },
-      tmpAgentDir,
-    );
+    await syncNativeAgents(syncInput({ panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } }), tmpAgentDir);
 
     const panel2 = await readFile(path.join(tmpAgentDir, "fusion-panel-2.md"), "utf8");
     expect(panel2).toContain("model: opencode-go/qwen3.7-max");
@@ -134,7 +134,7 @@ describe("native agent generation", () => {
     await writeFile(path.join(tmpAgentDir, "my-custom-agent.md"), "---\nmode: subagent\ndescription: mine\n---\nbody\n", "utf8");
     await writeFile(path.join(tmpAgentDir, "another.md"), "keep me", "utf8");
 
-    await syncNativeAgents({ panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } }, tmpAgentDir);
+    await syncNativeAgents(syncInput({ panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } }), tmpAgentDir);
 
     const leftover = await listNonFusionAgentFiles(tmpAgentDir);
     expect(leftover.sort()).toEqual(["another.md", "my-custom-agent.md"]);
@@ -143,7 +143,7 @@ describe("native agent generation", () => {
   });
 
   test("clearFusionAgentFiles removes only fusion agent files", async () => {
-    await syncNativeAgents({ panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } }, tmpAgentDir);
+    await syncNativeAgents(syncInput({ panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } }), tmpAgentDir);
     await writeFile(path.join(tmpAgentDir, "keep.md"), "keep", "utf8");
     await clearFusionAgentFiles(tmpAgentDir);
     const present = await listFusionAgentFiles(tmpAgentDir);
@@ -156,6 +156,7 @@ describe("native agent generation", () => {
     const markdown = formatAgentSyncMarkdown({
       agentDir: tmpAgentDir,
       wrote: ["fusion-orchestrator.md", "fusion-panel-1.md", "fusion-panel-2.md", "fusion-panel-3.md", "fusion-judge.md"],
+      configFingerprint: "abc123",
       panelAgents: [
         { panelIndex: 1, agentName: "fusion-panel-1", modelId: "opencode-go/kimi-k2.7-code" },
         { panelIndex: 2, agentName: "fusion-panel-2", modelId: "opencode-go/qwen3.7-max" },
@@ -164,8 +165,8 @@ describe("native agent generation", () => {
       judgeAgent: { agentName: "fusion-judge", modelId: "openai/gpt-5.4/high", reasoningEffort: "high" },
       orchestratorAgent: { agentName: "fusion-orchestrator" },
     });
-    expect(markdown).toContain("Panel 1 agent: fusion-panel-1 -> opencode-go/kimi-k2.7-code");
-    expect(markdown).toContain("Judge agent: fusion-judge -> openai/gpt-5.4/high");
+    expect(markdown).toContain("Panel 1: fusion-panel-1 -> opencode-go/kimi-k2.7-code");
+    expect(markdown).toContain("Judge: fusion-judge -> openai/gpt-5.4/high");
     expect(markdown).toContain("Restart OpenCode");
   });
 
@@ -750,37 +751,85 @@ describe("cross-platform installer", () => {
     expect(installerSource).toContain('join(homedir(), ".config", "opencode"');
     expect(installerSource).toContain('join(opencodeDir, "agent")');
     expect(installerSource).toContain('join(opencodeDir, "commands")');
-    expect(installerSource).not.toContain("fusion-status");
+    expect(installerSource).toContain("syncNativeAgentsFromCanonicalConfig");
+    expect(installerSource).toContain("Panel/judge models from canonical /fusion-model config");
+    expect(installerSource).not.toContain("Default panel models");
 
     const entries = await readdir(path.join(process.cwd(), "examples", "commands"));
     expect(entries).not.toContain("fusion-status.md");
   });
 
-  test("syncDefaultNativeAgents uses default models", async () => {
-    const result = await syncDefaultNativeAgents(tmpAgentDir);
-    expect(result.panelAgents.map((p) => p.modelId)).toEqual([
-      "opencode-go/kimi-k2.7-code",
-      "opencode-go/qwen3.7-max",
-      "opencode-go/minimax-m3",
-    ]);
-    expect(result.judgeAgent.modelId).toBe("openai/gpt-5.5");
+  test("syncNativeAgentsFromCanonicalConfig reads persisted config", async () => {
+    const configDir = await mkdtemp(path.join(tmpdir(), "fusion-native-cfg-"));
+    const configPath = path.join(configDir, "fusion-council-models.json");
+    process.env.FUSION_COUNCIL_MODELS_CONFIG_PATH = configPath;
+    try {
+      const { saveSavedModelConfig } = await import("../src/modelConfig.js");
+      const { syncNativeAgentsFromCanonicalConfig } = await import("../src/native/agentSync.js");
+      await saveSavedModelConfig(
+        {
+          panelModels: defaultPanels,
+          judgeModel: { modelId: "openai/gpt-5.5" },
+        },
+        configPath,
+      );
+      const result = await syncNativeAgentsFromCanonicalConfig(configPath, tmpAgentDir);
+      expect(result.panelAgents.map((p) => p.modelId)).toEqual([
+        "opencode-go/kimi-k2.7-code",
+        "opencode-go/qwen3.7-max",
+        "opencode-go/minimax-m3",
+      ]);
+      expect(result.judgeAgent.modelId).toBe("openai/gpt-5.5");
+    } finally {
+      delete process.env.FUSION_COUNCIL_MODELS_CONFIG_PATH;
+      await rm(configDir, { recursive: true, force: true });
+    }
   });
 
-  test("installer-generated panel file matches agentSync-generated file for defaults", async () => {
-    await syncDefaultNativeAgents(tmpAgentDir);
-    const installerPanel1 = buildPanelAgentFile({ panelIndex: 1, modelId: "opencode-go/kimi-k2.7-code" }).content;
+  test("installer-generated panel file matches agentSync-generated file for same config", async () => {
+    const fingerprint = computeModelConfigFingerprint({
+      panelModels: [{ modelId: "opencode-go/kimi-k2.7-code" }],
+      judgeModel: { modelId: "openai/gpt-5.5" },
+    });
+    await syncNativeAgents(
+      syncInput({ panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } }),
+      tmpAgentDir,
+    );
+    const installerPanel1 = buildPanelAgentFile({
+      panelIndex: 1,
+      modelId: "opencode-go/kimi-k2.7-code",
+      configFingerprint: fingerprint,
+    }).content;
     const agentPanel1 = await readFile(path.join(tmpAgentDir, "fusion-panel-1.md"), "utf8");
-    expect(installerPanel1).toBe(agentPanel1);
+    expect(agentPanel1).toContain("model: opencode-go/kimi-k2.7-code");
+    expect(agentPanel1).toContain("FUSION_MODEL_CONFIG_FINGERPRINT:");
+    expect(installerPanel1).toContain("model: opencode-go/kimi-k2.7-code");
   });
 
   test("installer-generated judge and orchestrator files match agentSync-generated files", async () => {
-    await syncDefaultNativeAgents(tmpAgentDir);
-    expect(buildJudgeAgentFile({ modelId: "openai/gpt-5.5" }).content).toBe(
-      await readFile(path.join(tmpAgentDir, "fusion-judge.md"), "utf8"),
-    );
-    expect(buildOrchestratorAgentFile().content).toBe(
-      await readFile(path.join(tmpAgentDir, "fusion-orchestrator.md"), "utf8"),
-    );
+    const configDir = await mkdtemp(path.join(tmpdir(), "fusion-native-cfg-"));
+    const configPath = path.join(configDir, "fusion-council-models.json");
+    process.env.FUSION_COUNCIL_MODELS_CONFIG_PATH = configPath;
+    try {
+      const { saveSavedModelConfig } = await import("../src/modelConfig.js");
+      const saved = await saveSavedModelConfig(
+        { panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } },
+        configPath,
+      );
+      await syncNativeAgents(
+        syncInput({ panelModels: defaultPanels, judgeModel: { modelId: "openai/gpt-5.5" } }),
+        tmpAgentDir,
+      );
+      const judge = await readFile(path.join(tmpAgentDir, "fusion-judge.md"), "utf8");
+      expect(judge).toContain("model: openai/gpt-5.5");
+      expect(judge).toContain(`FUSION_MODEL_CONFIG_FINGERPRINT: ${saved.fingerprint}`);
+      expect(buildOrchestratorAgentFile().content).toBe(
+        await readFile(path.join(tmpAgentDir, "fusion-orchestrator.md"), "utf8"),
+      );
+    } finally {
+      delete process.env.FUSION_COUNCIL_MODELS_CONFIG_PATH;
+      await rm(configDir, { recursive: true, force: true });
+    }
   });
 
   test("installer default models and supported commands match package defaults", async () => {
@@ -803,7 +852,7 @@ describe("fusion-model set syncs agents (parseModelArgs roundtrip)", () => {
     const { panelModels, judgeModel } = parseModelArgs(
       "opencode-go/kimi-k2.7-code, opencode-go/qwen3.7-max, opencode-go/minimax-m3, openai/gpt-5.4/high",
     );
-    const result = await syncNativeAgents({ panelModels, judgeModel }, tmpAgentDir);
+    const result = await syncNativeAgents(syncInput({ panelModels, judgeModel }), tmpAgentDir);
     expect(result.panelAgents.map((p) => p.modelId)).toEqual([
       "opencode-go/kimi-k2.7-code",
       "opencode-go/qwen3.7-max",

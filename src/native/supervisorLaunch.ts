@@ -5,10 +5,18 @@ import path from "node:path";
 import type { FusionModelSpec } from "../modelSpec.js";
 import { resolveModels } from "../modelConfig.js";
 import { createRunId, resolveTraceRoot } from "../trace/runTrace.js";
-import { bootstrapRealParallelBuild, liveWorkerSummary, type SupervisorDeps } from "./fusionSupervisor.js";
+import {
+  bootstrapRealParallelBuild,
+  hybridLaunch,
+  liveWorkerSummary,
+  type HybridLaunchPlan,
+  type SupervisorDeps,
+} from "./fusionSupervisor.js";
 import { loadSupervisorState, supervisorRunDir } from "./supervisorState.js";
+import { latestRunFromRegistry, resolveRunFromRegistry } from "./runRegistry.js";
+import { isPidAlive } from "./workerRunner.js";
 import { renderSupervisorTrace } from "./supervisorTrace.js";
-import { assertFreshBuildRuntimeCompatible } from "./runtimeInstall.js";
+import { assertForegroundProtocolCompatible } from "./runtimeInstall.js";
 import {
   confirmSupervisorReady,
   formatSupervisorStartupFailure,
@@ -34,15 +42,15 @@ export {
 };
 
 /**
- * Resolve the main builder / patch worker model. Fusion's saved config only
- * carries panel + judge models, so the main model is sourced (in order) from an
- * explicit override, the `FUSION_MAIN_MODEL` env, then the first panel model.
- * No provider is ever hardcoded.
+ * Resolve the main builder model. Fresh /fusion-build must use the active
+ * invoking OpenCode session model unless the caller deliberately supplies an
+ * explicit manual override. Panel config and FUSION_MAIN_MODEL are never silent
+ * defaults for main.
  */
-export function resolveMainModelSpec(panelModels: FusionModelSpec[], explicit?: string): FusionModelSpec {
-  if (explicit) return { modelId: explicit };
-  if (process.env.FUSION_MAIN_MODEL) return { modelId: process.env.FUSION_MAIN_MODEL };
-  return panelModels[0];
+export function resolveMainModelSpec(input: { explicit?: string; invokingSessionModelId?: string }): FusionModelSpec {
+  if (input.explicit) return { modelId: input.explicit };
+  if (input.invokingSessionModelId) return { modelId: input.invokingSessionModelId };
+  throw new Error("FUSION_MAIN_MODEL_UNRESOLVED: active invoking session model was not available and no explicit main model override was supplied");
 }
 
 export type LaunchInput = {
@@ -54,6 +62,7 @@ export type LaunchInput = {
   panelModels?: string[];
   judgeModel?: string;
   mainModel?: string;
+  invokingSessionModelId?: string;
   /** When true, run the supervisor inline instead of spawning a detached process (tests). */
   inline?: boolean;
   /** Skip the installed-command/runtime-manifest compatibility check (tests). */
@@ -258,10 +267,10 @@ async function spawnDetachedSupervisor(input: {
 export async function launchRealParallelBuild(input: LaunchInput): Promise<LaunchResult> {
   if (!input.skipRuntimeCheck) {
     try {
-      await assertFreshBuildRuntimeCompatible();
+      await assertForegroundProtocolCompatible();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("FUSION_RUNTIME_INSTALL_MISMATCH")) {
+      if (message.includes("FUSION_RUNTIME_PROTOCOL_MISMATCH")) {
         throw error;
       }
       throw new Error(`FUSION_SUPERVISOR_LAUNCH_FAILED: ${message}`);
@@ -273,7 +282,7 @@ export async function launchRealParallelBuild(input: LaunchInput): Promise<Launc
   }
 
   const resolved = await resolveModels({ panelModels: input.panelModels, judgeModel: input.judgeModel });
-  const mainModel = resolveMainModelSpec(resolved.panelModels, input.mainModel);
+  const mainModel = resolveMainModelSpec({ explicit: input.mainModel, invokingSessionModelId: input.invokingSessionModelId });
   const runId = createRunId();
   const projectCwd = path.resolve(input.cwd);
   const sourceWorkspace = path.resolve(input.sourceWorkspace ?? input.cwd);
@@ -292,8 +301,10 @@ export async function launchRealParallelBuild(input: LaunchInput): Promise<Launc
         task: input.task,
         command: input.command ?? "fusion-build",
         mainModel,
+        invokingSessionModelId: input.invokingSessionModelId,
         panelModels: resolved.panelModels,
         judgeModel: resolved.judgeModel,
+        modelConfigFingerprint: resolved.fingerprint,
         sourceWorkspace,
       },
       deps,
@@ -383,6 +394,125 @@ export async function launchRealParallelBuild(input: LaunchInput): Promise<Launc
   };
 }
 
+export type ForegroundLaunchInput = {
+  task: string;
+  cwd: string;
+  traceDir?: string;
+  command?: string;
+  sourceWorkspace?: string;
+  panelModels?: string[];
+  judgeModel?: string;
+  mainModel?: string;
+  invokingSessionModelId?: string;
+  /** Skip the installed-command/runtime-manifest compatibility check (tests). */
+  skipRuntimeCheck?: boolean;
+  /** Legacy single launch override (ms); seeds external-main + registration deadlines. */
+  startupDeadlineMs?: number;
+  /** Short external-main PID startup guard (ms). */
+  externalMainStartupDeadlineMs?: number;
+  /** begin_native_wave registration deadline (ms). */
+  nativeDispatchRegistrationDeadlineMs?: number;
+  /** Real long-running native panel execution timeout (ms). */
+  nativePanelExecutionTimeoutMs?: number;
+  /** Skip the duplicate-active-run guard (tests). */
+  skipDuplicateRunGuard?: boolean;
+  deps?: Partial<SupervisorDeps>;
+};
+
+/**
+ * Foreground, model-driven hybrid launch. Performs the safe bootstrap, spawns
+ * the external main builder to a real PID, and prepares the three native panel
+ * dispatch specs for the parent model to launch as visible Task subagents in a
+ * single wave. Unlike the legacy detached path, this NEVER returns an early
+ * "ready/running" receipt with workers still queued: it returns the real main
+ * PID plus ready panel dispatch specs, or fails loudly within the startup
+ * deadline.
+ */
+export async function launchForegroundHybrid(input: ForegroundLaunchInput): Promise<HybridLaunchPlan> {
+  if (!input.skipRuntimeCheck) {
+    try {
+      await assertForegroundProtocolCompatible();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("FUSION_RUNTIME_PROTOCOL_MISMATCH")) throw error;
+      throw new Error(`FUSION_SUPERVISOR_LAUNCH_FAILED: ${message}`);
+    }
+  }
+  if (input.command === "fusion-no-build") {
+    throw new Error("FUSION_SUPERVISOR_LAUNCH_FAILED: /fusion-no-build must not launch a supervisor or worker process");
+  }
+
+  const resolved = await resolveModels({ panelModels: input.panelModels, judgeModel: input.judgeModel });
+  const mainModel = resolveMainModelSpec({ explicit: input.mainModel, invokingSessionModelId: input.invokingSessionModelId });
+  const runId = createRunId();
+  const projectCwd = path.resolve(input.cwd);
+  const sourceWorkspace = path.resolve(input.sourceWorkspace ?? input.cwd);
+
+  // Duplicate-run safety: do not start a new run while an earlier run still owns
+  // an active external main builder in the same source workspace.
+  if (!input.skipDuplicateRunGuard) {
+    await assertNoActiveRunForWorkspace(projectCwd, input.traceDir, sourceWorkspace);
+  }
+
+  const deps: SupervisorDeps = {
+    cwd: projectCwd,
+    traceDir: input.traceDir,
+    startupDeadlineMs: input.startupDeadlineMs,
+    externalMainStartupDeadlineMs: input.externalMainStartupDeadlineMs,
+    nativeDispatchRegistrationDeadlineMs: input.nativeDispatchRegistrationDeadlineMs,
+    nativePanelExecutionTimeoutMs: input.nativePanelExecutionTimeoutMs,
+    ...input.deps,
+  };
+
+  return hybridLaunch(
+    {
+      runId,
+      task: input.task,
+      command: input.command ?? "fusion-build",
+      mainModel,
+      invokingSessionModelId: input.invokingSessionModelId,
+      panelModels: resolved.panelModels,
+      judgeModel: resolved.judgeModel,
+      modelConfigFingerprint: resolved.fingerprint,
+      sourceWorkspace,
+    },
+    deps,
+  );
+}
+
+const ACTIVE_RUN_TERMINAL_PHASES: ReadonlySet<SupervisorState["phase"]> = new Set([
+  "done",
+  "aborted",
+  "cancelled",
+  "timed_out",
+]);
+
+/**
+ * Duplicate-run safety: refuse to start a new run while the most recent run in
+ * the same source workspace is still non-terminal AND still owns a live external
+ * main builder PID. The user must explicitly cancel/resolve it first. This never
+ * auto-cancels and never auto-launches a replacement.
+ */
+export async function assertNoActiveRunForWorkspace(
+  cwd: string,
+  traceDir: string | undefined,
+  sourceWorkspace: string,
+): Promise<void> {
+  const latest = await loadLatestSupervisorTrace(cwd, traceDir);
+  if (!latest || latest.kind !== "supervisor") return;
+  const state = latest.state;
+  if (path.resolve(state.sourceWorkspace) !== path.resolve(sourceWorkspace)) return;
+  if (ACTIVE_RUN_TERMINAL_PHASES.has(state.phase)) return;
+  const mainPid = state.workers[WORKER_ID.main]?.pid ?? state.externalMain?.pid;
+  if (mainPid === undefined || !isPidAlive(mainPid)) return;
+  throw new Error(
+    `FUSION_DUPLICATE_ACTIVE_RUN: run ${state.runId} still owns an active main builder ` +
+      `(pid ${mainPid}, phase ${state.phase}) in this source workspace. ` +
+      `Cancel it first with fusion_supervisor stage "cancel" (runId ${state.runId}) or resume it, ` +
+      "then retry. A new Fusion run is NOT started automatically.",
+  );
+}
+
 export type SupervisorStatusReport = {
   found: boolean;
   runId?: string;
@@ -440,9 +570,57 @@ export async function loadLatestSupervisorTrace(
     return undefined;
   }
 
-  const state = await loadSupervisorState(cwd, runId, traceDir);
+  let state = await loadSupervisorState(cwd, runId, traceDir);
+  if (!state) {
+    // The cwd-relative pointer named a run we cannot read from this directory.
+    // Fall back to the durable registry before giving up.
+    const resolved = await loadSupervisorStateByRunId(runId, cwd, traceDir);
+    if (resolved) state = resolved.state;
+  }
   if (!state) {
     return { kind: "initialization_failure", runId, error: `supervisor-state.json missing for run ${runId}` };
+  }
+  return { kind: "supervisor", state };
+}
+
+/**
+ * Resolve a supervisor run by ID regardless of the current working directory or
+ * active agent directory. Tries the cwd-relative trace root first, then the
+ * durable workspace-independent run registry (registry entry → its own
+ * cwd/traceDir → state). Returns the located state plus where it was found.
+ */
+export async function loadSupervisorStateByRunId(
+  runId: string,
+  cwd: string,
+  traceDir?: string,
+): Promise<{ state: SupervisorState; cwd: string; traceDir?: string; runDir: string } | undefined> {
+  const direct = await loadSupervisorState(cwd, runId, traceDir);
+  if (direct) {
+    return { state: direct, cwd, traceDir, runDir: supervisorRunDir(cwd, runId, traceDir) };
+  }
+  const entry = await resolveRunFromRegistry(runId);
+  if (!entry) return undefined;
+  const fromRegistry = await loadSupervisorState(entry.cwd, runId, entry.traceDir);
+  if (!fromRegistry) return undefined;
+  return {
+    state: fromRegistry,
+    cwd: entry.cwd,
+    traceDir: entry.traceDir,
+    runDir: entry.runDir,
+  };
+}
+
+/**
+ * Latest supervisor run resolved through the durable registry (not cwd). Used by
+ * /fusion-trace as a final fallback so a known active run is never reported as
+ * "no trace found" just because the active directory changed.
+ */
+export async function loadLatestSupervisorTraceFromRegistry(): Promise<LatestSupervisorTraceResult> {
+  const entry = await latestRunFromRegistry();
+  if (!entry) return undefined;
+  const state = await loadSupervisorState(entry.cwd, entry.runId, entry.traceDir);
+  if (!state) {
+    return { kind: "initialization_failure", runId: entry.runId, error: `supervisor-state.json missing for run ${entry.runId}` };
   }
   return { kind: "supervisor", state };
 }

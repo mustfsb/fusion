@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { launchRealParallelBuild, loadLatestSupervisorTrace } from "../src/native/supervisorLaunch.js";
+import { launchForegroundHybrid, launchRealParallelBuild, loadLatestSupervisorTrace } from "../src/native/supervisorLaunch.js";
 import { loadSupervisorState } from "../src/native/supervisorState.js";
-import { assertFreshBuildRuntimeCompatible } from "../src/native/runtimeInstall.js";
+import { assertForegroundProtocolCompatible } from "../src/native/runtimeInstall.js";
 import { createFakeNativeSubagentDispatcher } from "../src/native/nativeSubagentDispatch.js";
 import { WORKER_ID, type WorkerRecord } from "../src/native/supervisorTypes.js";
 import {
@@ -110,6 +110,7 @@ describe("launchRealParallelBuild", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       inline: true,
       deps: hybridDeps(fakeRunner()),
@@ -118,6 +119,20 @@ describe("launchRealParallelBuild", () => {
     expect(result.runId).toMatch(/^fusion-/);
     expect(result.supervisorPid).toBe(process.pid);
     expect(await exists(path.join(result.runDir, "supervisor-state.json"))).toBe(true);
+  });
+
+  test("missing active session model fails without silent fallback", async () => {
+    await writeBehavior(allCompleteBehavior());
+    await expect(
+      launchRealParallelBuild({
+        task: "Add a feature flag.",
+        cwd: sourceRoot,
+        traceDir: traceRoot,
+        skipRuntimeCheck: true,
+        inline: true,
+        deps: hybridDeps(fakeRunner()),
+      }),
+    ).rejects.toThrow(/FUSION_MAIN_MODEL_UNRESOLVED/);
   });
 
   test("creates supervisor state, trace stub, launch receipt, and logs before any worker spawn", async () => {
@@ -142,6 +157,7 @@ describe("launchRealParallelBuild", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       inline: true,
       deps: hybridDeps(spy, { pollIntervalMs: 15 }),
@@ -165,6 +181,7 @@ describe("launchRealParallelBuild", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       inline: true,
       deps: hybridDeps(spy, {
@@ -186,6 +203,7 @@ describe("launchRealParallelBuild", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       inline: true,
       deps: hybridDeps(fakeRunner(), {
@@ -201,15 +219,27 @@ describe("launchRealParallelBuild", () => {
   });
 
   test("supervisor failure returns FUSION_SUPERVISOR_LAUNCH_FAILED and does not fall back", async () => {
+    const brokenRunner: WorkerRunner = {
+      transport: "test",
+      async spawn() {
+        throw new Error("intentional spawn failure");
+      },
+    };
+    await writeBehavior(allCompleteBehavior());
     await expect(
-      launchRealParallelBuild({
+      launchForegroundHybrid({
         task: "Add a feature flag.",
         cwd: sourceRoot,
         traceDir: traceRoot,
+        invokingSessionModelId: "prov/active-main",
         skipRuntimeCheck: true,
-        inline: true,
-        panelModels: ["prov/one-panel"], // bootstrap requires 3 panel models
-        deps: hybridDeps(fakeRunner()),
+        skipDuplicateRunGuard: true,
+        deps: {
+          cwd: sourceRoot,
+          traceDir: traceRoot,
+          runner: brokenRunner,
+          skipNativeAgentValidation: true,
+        },
       }),
     ).rejects.toThrow(/FUSION_SUPERVISOR_LAUNCH_FAILED/);
   });
@@ -220,6 +250,7 @@ describe("launchRealParallelBuild", () => {
         task: "Plan only.",
         cwd: sourceRoot,
         traceDir: traceRoot,
+        invokingSessionModelId: "prov/active-main",
         skipRuntimeCheck: true,
         inline: true,
         command: "fusion-no-build",
@@ -234,6 +265,7 @@ describe("launchRealParallelBuild", () => {
       task: "Add a feature flag.",
       cwd: sourceRoot,
       traceDir: traceRoot,
+      invokingSessionModelId: "prov/active-main",
       skipRuntimeCheck: true,
       inline: true,
       deps: hybridDeps(fakeRunner()),
@@ -250,14 +282,15 @@ describe("runtime install mismatch protection", () => {
   async function writeGoodFiles() {
     const manifest = {
       version: 1,
-      pluginBuildId: "fusion-council-hybrid-v2",
+      foregroundProtocolVersion: 6,
+      pluginBuildId: "fusion-council-hybrid-v6",
       defaultBuildStrategy: "hybrid_external_main_native_panels",
       supportedTools: {
-        fusionSupervisorStages: ["launch", "status", "resume"],
+        fusionSupervisorStages: ["launch", "begin_native_wave", "confirm_launch", "collect", "finalize", "cancel", "status", "resume"],
         fusionNativeStages: ["prepare", "advance", "collect", "record_main_baseline", "finalize", "audit_prepare", "audit_finalize", "resume"],
       },
-      expectedCommandTemplateVersion: "fusion-build-hybrid-v2",
-      expectedOrchestratorTemplateVersion: "fusion-orchestrator-hybrid-v2",
+      expectedCommandTemplateVersion: "fusion-build-hybrid-v6",
+      expectedOrchestratorTemplateVersion: "fusion-orchestrator-hybrid-v6",
     };
     await mkdir(path.join(configDir, "commands"), { recursive: true });
     await mkdir(path.join(configDir, "agent"), { recursive: true });
@@ -268,17 +301,17 @@ describe("runtime install mismatch protection", () => {
     );
     await writeFile(
       path.join(configDir, "commands", "fusion-build.md"),
-      "FUSION_COMMAND_TEMPLATE_VERSION: fusion-build-hybrid-v2\nfusion_supervisor\n\"stage\": \"launch\"",
+      "FUSION_COMMAND_TEMPLATE_VERSION: fusion-build-hybrid-v6\nFUSION_FOREGROUND_PROTOCOL_VERSION: 6\nfusion_supervisor\n\"stage\": \"launch\"",
       "utf8",
     );
     await writeFile(
       path.join(configDir, "agent", "fusion-orchestrator.md"),
-      "FUSION_ORCHESTRATOR_TEMPLATE_VERSION: fusion-orchestrator-hybrid-v2\nhybrid_external_main_native_panels\nfusion_supervisor",
+      "FUSION_ORCHESTRATOR_TEMPLATE_VERSION: fusion-orchestrator-hybrid-v6\nFUSION_FOREGROUND_PROTOCOL_VERSION: 6\nhybrid_external_main_native_panels\nfusion_supervisor",
       "utf8",
     );
   }
 
-  test("returns FUSION_RUNTIME_INSTALL_MISMATCH when installed files are stale", async () => {
+  test("returns FUSION_RUNTIME_PROTOCOL_MISMATCH when installed files are stale", async () => {
     process.env.FUSION_OPENCODE_CONFIG_DIR = configDir;
     await mkdir(path.join(configDir, "commands"), { recursive: true });
     await mkdir(path.join(configDir, "agent"), { recursive: true });
@@ -289,25 +322,22 @@ describe("runtime install mismatch protection", () => {
     );
     await writeFile(path.join(configDir, "commands", "fusion-build.md"), "old", "utf8");
     await writeFile(path.join(configDir, "agent", "fusion-orchestrator.md"), "old", "utf8");
-    await expect(assertFreshBuildRuntimeCompatible()).rejects.toThrow(/FUSION_RUNTIME_INSTALL_MISMATCH/);
+    await expect(assertForegroundProtocolCompatible()).rejects.toThrow(/FUSION_RUNTIME_PROTOCOL_MISMATCH/);
     try {
-      await assertFreshBuildRuntimeCompatible();
+      await assertForegroundProtocolCompatible();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      expect(message).toContain("npm run build");
-      expect(message).toContain("npm run install:opencode-agents");
-      expect(message).toContain("npm run install:opencode-commands");
-      expect(message).toContain("restart OpenCode");
+      expect(message).toContain("stale file:");
     }
   });
 
   test("passes when installed command, orchestrator, and manifest are current", async () => {
     process.env.FUSION_OPENCODE_CONFIG_DIR = configDir;
     await writeGoodFiles();
-    await expect(assertFreshBuildRuntimeCompatible()).resolves.toBeUndefined();
+    await expect(assertForegroundProtocolCompatible()).resolves.toBeUndefined();
   });
 
-  test("fresh launch surfaces FUSION_RUNTIME_INSTALL_MISMATCH when runtime is stale", async () => {
+  test("fresh launch surfaces FUSION_RUNTIME_PROTOCOL_MISMATCH when runtime is stale", async () => {
     process.env.FUSION_OPENCODE_CONFIG_DIR = configDir;
     await mkdir(path.join(configDir, "commands"), { recursive: true });
     await mkdir(path.join(configDir, "agent"), { recursive: true });
@@ -323,9 +353,10 @@ describe("runtime install mismatch protection", () => {
         task: "Add a feature flag.",
         cwd: sourceRoot,
         traceDir: traceRoot,
+        invokingSessionModelId: "prov/active-main",
         inline: true,
         deps: hybridDeps(fakeRunner()),
       }),
-    ).rejects.toThrow(/FUSION_RUNTIME_INSTALL_MISMATCH/);
+    ).rejects.toThrow(/FUSION_RUNTIME_PROTOCOL_MISMATCH/);
   });
 });

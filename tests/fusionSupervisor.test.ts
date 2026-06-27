@@ -15,7 +15,7 @@ import {
   type BootstrapInput,
   type SupervisorDeps,
 } from "../src/native/fusionSupervisor.js";
-import { loadSupervisorState } from "../src/native/supervisorState.js";
+import { loadSupervisorState, writeSupervisorState } from "../src/native/supervisorState.js";
 import { renderSupervisorTrace } from "../src/native/supervisorTrace.js";
 import { WORKER_ID } from "../src/native/supervisorTypes.js";
 import {
@@ -62,6 +62,7 @@ function baseInput(runId: string): BootstrapInput {
     mainModel: { modelId: "prov/main-model" },
     panelModels: [{ modelId: "prov/panel-1" }, { modelId: "prov/panel-2" }, { modelId: "prov/panel-3" }],
     judgeModel: { modelId: "prov/judge-model" },
+    modelConfigFingerprint: "test-config-fingerprint",
     sourceWorkspace: sourceRoot,
   };
 }
@@ -216,6 +217,92 @@ describe("hybrid_external_main_native_panels supervisor", () => {
     }
     const distinctWs = new Set(panelWs);
     expect(distinctWs.size).toBe(3);
+  });
+
+  test("main worker control task, instruction, result, status, context, and verification paths stay inside candidate workspace", async () => {
+    const runId = freshRunId();
+    const state = await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
+    const main = state.workers[WORKER_ID.main];
+    const mainRoot = path.resolve(main.workspacePath);
+    for (const candidatePath of [
+      main.taskArtifactPath,
+      main.instructionArtifactPath,
+      main.resultArtifactPath,
+      main.statusArtifactPath,
+      main.workerContextArtifactPath,
+      main.verificationArtifactPath,
+    ]) {
+      expect(candidatePath).toBeTruthy();
+      expect(path.resolve(candidatePath!).startsWith(`${mainRoot}${path.sep}`)).toBe(true);
+    }
+    expect(main.taskArtifactPath).toContain(`${path.sep}.fusion-worker${path.sep}canonical-task.md`);
+    expect(main.instructionArtifactPath).toContain(`${path.sep}.fusion-worker${path.sep}main-instructions.md`);
+    expect(main.resultArtifactPath).toContain(`${path.sep}.fusion-worker${path.sep}result.json`);
+  });
+
+  test("external main spawn arguments do not reference source .opencode/fusion-runs artifacts", async () => {
+    await writeBehavior(allCompleteBehavior());
+    const base = fakeRunner();
+    const forbidden = path.join(sourceRoot, ".opencode", "fusion-runs");
+    const spy: WorkerRunner = {
+      transport: base.transport,
+      async spawn(spec: WorkerSpawnSpec): Promise<SpawnedWorkerHandle> {
+        expect(spec.workerId).toBe(WORKER_ID.main);
+        expect(spec.promptText).not.toContain(forbidden);
+        for (const value of Object.values(spec.env)) expect(value).not.toContain(forbidden);
+        return base.spawn(spec);
+      },
+    };
+    const runId = freshRunId();
+    const state = await bootstrapAndRun(runId, spy);
+    expect(state.workers[WORKER_ID.main].workspaceContractValidated).toBe(true);
+  });
+
+  test("main workspace preflight rejects external artifact paths before spawning", async () => {
+    await writeBehavior(allCompleteBehavior());
+    const runId = freshRunId();
+    const booted = await bootstrapRealParallelBuild(baseInput(runId), deps(fakeRunner()));
+    const main = booted.workers[WORKER_ID.main];
+    main.resultArtifactPath = path.join(sourceRoot, ".opencode", "fusion-runs", runId, "result.json");
+    await writeSupervisorState(booted, sourceRoot, traceRoot);
+    workersRef = booted.workers;
+    let spawned = false;
+    const spy: WorkerRunner = {
+      transport: "spy",
+      async spawn(): Promise<SpawnedWorkerHandle> {
+        spawned = true;
+        throw new Error("should not spawn");
+      },
+    };
+    const state = await superviseRun(runId, deps(spy));
+    expect(spawned).toBe(false);
+    expect(state.workers[WORKER_ID.main].status).toBe("failed");
+    expect(state.workers[WORKER_ID.main].statusTransitions.at(-1)?.reason).toContain("FUSION_MAIN_WORKSPACE_CONTRACT_INVALID");
+    expect(state.mainPromotion.status).toBe("failed");
+  });
+
+  test("fake external main can read local canonical task and finish without external-directory access", async () => {
+    await writeBehavior(allCompleteBehavior({
+      [WORKER_ID.main]: { sleepMs: 200, changedFile: "src/main-impl.ts", requireLocalCanonicalTask: true },
+    }));
+    const runId = freshRunId();
+    const state = await bootstrapAndRun(runId, fakeRunner());
+    expect(state.workers[WORKER_ID.main].status).toBe("completed");
+    expect(state.mainPromotion.status).toBe("promoted");
+  });
+
+  test("main terminal evidence is derived from exit, diff, and verification without a model-authored report", async () => {
+    await writeBehavior(allCompleteBehavior({
+      [WORKER_ID.main]: { sleepMs: 200, changedFile: "src/main-impl.ts", noResult: true, verification: { typecheck: "pass", test: "not_run", build: "not_run", commandsRun: ["fake verify"] } },
+    }));
+    const runId = freshRunId();
+    const state = await bootstrapAndRun(runId, fakeRunner());
+    const main = state.workers[WORKER_ID.main];
+    expect(main.status).toBe("completed");
+    expect(main.result?.changedFiles).toContain("src/main-impl.ts");
+    expect(main.result?.verification?.commandsRun).toContain("fake verify");
+    expect(await exists(path.join(sourceRoot, "src", "main-impl.ts"))).toBe(true);
+    expect(state.mainPromotion.promotedPaths).toContain("src/main-impl.ts");
   });
 
   test("launch phase spawns only one external main worker before any exit (prop 2)", async () => {

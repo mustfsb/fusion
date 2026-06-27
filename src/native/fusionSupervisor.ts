@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { FusionModelSpec } from "../modelSpec.js";
+import { buildRuntimeIdentity } from "../runtimeManifest.js";
 import { assertValidFusionRunId } from "./runLocator.js";
 import { FUSION_AGENT_NAMES } from "./agentTemplates.js";
 import {
@@ -24,6 +25,12 @@ import {
   SUPERVISOR_STATE_VERSION,
   WORKER_ID,
   isTerminalWorkerStatus,
+  type FusionRunTiming,
+  type JudgeStageTrace,
+  type NativePanelEvidenceAcceptance,
+  type NativePanelRuntimeEvidence,
+  type NativeWaveStage,
+  type SupervisorCancellation,
   type SupervisorState,
   type SupervisorTimeouts,
   type WorkerRecord,
@@ -34,21 +41,35 @@ import {
   createOpenCodeProcessWorkerRunner,
   isPidAlive,
   type SpawnedWorkerHandle,
+  type WorkerProcessExit,
   type WorkerRunner,
   type WorkerSpawnSpec,
 } from "./workerRunner.js";
 import {
   buildHybridJudgeDispatchPrompt,
   buildHybridPanelDispatchPrompt,
+  assertJudgeDispatchModelConsistency,
   formatNativePanelDispatchFailure,
   FusionNativePanelDispatchError,
+  FusionRestartRequiredAfterAgentResyncError,
   NATIVE_TASK_DISPATCH_MECHANISM,
+  readNativeJudgeAgentModel,
+  reconcileNativeAgentsAtLaunch,
+  type NativeAgentReconcileResult,
   type NativeDispatchRequest,
   type NativeSubagentDispatcher,
-  validateNativeJudgeAgent,
-  validateNativePanelAgents,
 } from "./nativeSubagentDispatch.js";
 import { candidatePanelOutputPaths } from "./candidateWorkspace.js";
+import {
+  panelReceiptPaths,
+  readPanelReceipt,
+  validatePanelReceipt,
+} from "./panelReceipt.js";
+import {
+  detectMeaningfulPanelCandidateMutation,
+  harvestPanelEvidence,
+  type PanelEvidenceReport,
+} from "./panelEvidenceHarvest.js";
 import { buildPanelExecutionContext } from "./speculativeBuild.js";
 import { confirmSupervisorReady, supervisorMainEntry } from "./supervisorStartup.js";
 
@@ -60,10 +81,14 @@ export type BootstrapInput = {
   command?: string;
   /** Resolved main builder + patch worker model. */
   mainModel: FusionModelSpec;
+  /** Active parent OpenCode session model that requested this fresh build. */
+  invokingSessionModelId?: string;
   /** Resolved panel models (1..3). */
   panelModels: FusionModelSpec[];
   /** Resolved judge model. */
   judgeModel: FusionModelSpec;
+  /** Canonical /fusion-model config fingerprint at launch time. */
+  modelConfigFingerprint: string;
   /** Real user source workspace owned by the main builder. */
   sourceWorkspace: string;
 };
@@ -79,6 +104,19 @@ export type SupervisorDeps = {
   panelWorkspacePreparationDelayMs?: Partial<Record<1 | 2 | 3, number>>;
   /** Liveness poll interval. */
   pollIntervalMs?: number;
+  /**
+   * Legacy single launch-wave deadline override (ms). When set and a more
+   * specific timing override is absent, it seeds BOTH the external-main startup
+   * deadline and the native-dispatch registration deadline. Kept for backward
+   * compatibility; prefer the specific fields below.
+   */
+  startupDeadlineMs?: number;
+  /** Short guard verifying the external main process obtained a real PID (ms). */
+  externalMainStartupDeadlineMs?: number;
+  /** Guards only main-spawn -> begin_native_wave registration (ms). */
+  nativeDispatchRegistrationDeadlineMs?: number;
+  /** Real long-running native panel execution timeout (ms). */
+  nativePanelExecutionTimeoutMs?: number;
   /** Test helper: perform the ready handshake when phase is still bootstrapping. */
   autoConfirmReady?: boolean;
   timeouts?: Partial<SupervisorTimeouts>;
@@ -114,6 +152,24 @@ function workerArtifactPaths(runDir: string, workerId: string) {
   };
 }
 
+type WorkerArtifactPaths = ReturnType<typeof workerArtifactPaths> & {
+  workerContextArtifactPath?: string;
+  verificationArtifactPath?: string;
+};
+
+function mainWorkerControlPaths(mainWorkspacePath: string) {
+  const controlDir = path.join(mainWorkspacePath, ".fusion-worker");
+  return {
+    controlDir,
+    taskArtifactPath: path.join(controlDir, "canonical-task.md"),
+    instructionArtifactPath: path.join(controlDir, "main-instructions.md"),
+    workerContextArtifactPath: path.join(controlDir, "worker-context.json"),
+    resultArtifactPath: path.join(controlDir, "result.json"),
+    statusArtifactPath: path.join(controlDir, "status.json"),
+    verificationArtifactPath: path.join(controlDir, "verification.json"),
+  };
+}
+
 function buildTaskArtifact(task: string) {
   const taskContent = `# Fusion Canonical Task\n\n${task}\n`;
   return {
@@ -139,13 +195,11 @@ function buildWorkerPrompt(input: {
   if (input.role === "main") {
     lines.push("You are an independent implementation worker.");
     lines.push(`Your writable candidate workspace: ${input.workspacePath}`);
-    if (input.sourceWorkspaceProhibited) {
-      lines.push(`The source workspace is prohibited: ${input.sourceWorkspaceProhibited}`);
-      lines.push("Other candidate workspaces are prohibited.");
-    }
+    lines.push("Your candidate workspace is the only allowed workspace. Do not read or write any path outside it.");
+    lines.push("All worker-control files are inside .fusion-worker in your candidate workspace.");
     lines.push("Use only your candidate workspace for source reads, writes, tests, package commands, and Git commands.");
     lines.push("Before modifying files, verify the current directory is your candidate workspace.");
-    lines.push("Never modify the source workspace. Never copy code from another candidate workspace.");
+    lines.push("Never read or modify the source workspace. Never read or copy from another candidate workspace.");
     lines.push("Implement the task independently in THIS candidate workspace only.");
     lines.push("Do NOT wait for or read any panel candidate workspace, judge, or merge patch contract.");
     lines.push("Run typecheck/test/build inside your candidate workspace.");
@@ -181,12 +235,13 @@ function makeWorkerRecord(input: {
   taskArtifactPath: string;
   taskArtifactHash: string;
   runDir: string;
+  artifactPaths?: WorkerArtifactPaths;
   softMs: number;
   hardMs: number;
   logicalPanelIndex?: number;
   agentId?: string;
 }): WorkerRecord {
-  const paths = workerArtifactPaths(input.runDir, input.workerId);
+  const paths: WorkerArtifactPaths = input.artifactPaths ?? workerArtifactPaths(input.runDir, input.workerId);
   return {
     workerId: input.workerId,
     role: input.role,
@@ -203,6 +258,8 @@ function makeWorkerRecord(input: {
     instructionArtifactPath: paths.instructionArtifactPath,
     resultArtifactPath: paths.resultArtifactPath,
     statusArtifactPath: paths.statusArtifactPath,
+    workerContextArtifactPath: paths.workerContextArtifactPath,
+    verificationArtifactPath: paths.verificationArtifactPath,
     stdoutPath: paths.stdoutPath,
     stderrPath: paths.stderrPath,
     sessionTitle: `Fusion ${input.workerId}`,
@@ -255,15 +312,25 @@ export async function bootstrapRealParallelBuild(
   const launchRequestedAt = nowIso(now);
 
   const workers: Record<string, WorkerRecord> = {};
+  const mainControlPaths = mainWorkerControlPaths(mainWorkspacePath);
   const mainWorker = makeWorkerRecord({
     workerId: WORKER_ID.main,
     role: "main",
     executionKind: "external_process",
     modelSpec: input.mainModel,
     workspacePath: mainWorkspacePath,
-    taskArtifactPath,
+    taskArtifactPath: mainControlPaths.taskArtifactPath,
     taskArtifactHash,
     runDir,
+    artifactPaths: {
+      instructionArtifactPath: mainControlPaths.instructionArtifactPath,
+      resultArtifactPath: mainControlPaths.resultArtifactPath,
+      statusArtifactPath: mainControlPaths.statusArtifactPath,
+      stdoutPath: path.join(runDir, "logs", `${WORKER_ID.main}.stdout.log`),
+      stderrPath: path.join(runDir, "logs", `${WORKER_ID.main}.stderr.log`),
+      workerContextArtifactPath: mainControlPaths.workerContextArtifactPath,
+      verificationArtifactPath: mainControlPaths.verificationArtifactPath,
+    },
     softMs: timeouts.mainSoftSuspectMs,
     hardMs: timeouts.mainHardTimeoutMs,
   });
@@ -289,7 +356,7 @@ export async function bootstrapRealParallelBuild(
   }
 
   // Persist worker instruction artifacts.
-  for (const worker of Object.values(workers)) {
+  for (const worker of Object.values(workers).filter((worker) => worker.role !== "main")) {
     await writeFile(
       worker.instructionArtifactPath,
       buildWorkerPrompt({
@@ -328,7 +395,9 @@ export async function bootstrapRealParallelBuild(
     taskArtifactPath,
     taskArtifactHash,
     mainModelId: input.mainModel.modelId,
+    invokingSessionModelId: input.invokingSessionModelId,
     judgeModelId: input.judgeModel.modelId,
+    modelConfigFingerprint: input.modelConfigFingerprint,
     workers,
     mainPromotion: {
       candidateWorkspace: mainWorkspacePath,
@@ -383,13 +452,86 @@ export async function bootstrapRealParallelBuild(
   mainWorker.workspaceReadyAt = nowIso(now);
   state.mainCandidateWorkspace = mainCandidate.workspacePath;
   state.mainPromotion.candidateWorkspace = mainCandidate.workspacePath;
+  await materializeMainWorkerControlFiles({
+    state,
+    mainWorker,
+    taskContent,
+    sourceCanonicalTaskPath: taskArtifactPath,
+  });
   await writeSupervisorState(state, deps.cwd, deps.traceDir);
   return state;
+}
+
+async function materializeMainWorkerControlFiles(input: {
+  state: SupervisorState;
+  mainWorker: WorkerRecord;
+  taskContent: string;
+  sourceCanonicalTaskPath: string;
+}): Promise<void> {
+  const { state, mainWorker, taskContent } = input;
+  const controlDir = path.dirname(mainWorker.taskArtifactPath);
+  await mkdir(controlDir, { recursive: true });
+  await writeFile(mainWorker.taskArtifactPath, taskContent, "utf8");
+  const sourceCanonical = await readFile(input.sourceCanonicalTaskPath, "utf8");
+  if (sourceCanonical !== taskContent) {
+    throw new Error("main local canonical task does not match source canonical task bytes");
+  }
+  const prompt = buildWorkerPrompt({
+    role: "main",
+    workerId: mainWorker.workerId,
+    workspacePath: mainWorker.workspacePath,
+    taskArtifactPath: mainWorker.taskArtifactPath,
+    resultArtifactPath: mainWorker.resultArtifactPath,
+  });
+  await writeFile(mainWorker.instructionArtifactPath, prompt, "utf8");
+  if (mainWorker.workerContextArtifactPath) {
+    await writeFile(
+      mainWorker.workerContextArtifactPath,
+      `${JSON.stringify(
+        {
+          runId: state.runId,
+          workerId: mainWorker.workerId,
+          role: mainWorker.role,
+          workspacePath: mainWorker.workspacePath,
+          canonicalTaskPath: mainWorker.taskArtifactPath,
+          instructionPath: mainWorker.instructionArtifactPath,
+          resultPath: mainWorker.resultArtifactPath,
+          statusPath: mainWorker.statusArtifactPath,
+          verificationPath: mainWorker.verificationArtifactPath,
+          requestedModelId: mainWorker.requestedModelId,
+          taskHash: mainWorker.taskArtifactHash,
+          allowedWorkspaceOnly: true,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+  }
+}
+
+/** Best-effort durable write of a small JSON debug/evidence artifact into the run dir. */
+async function writeRunJsonArtifact(runDir: string, fileName: string, value: unknown): Promise<void> {
+  try {
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, fileName), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  } catch {
+    // Never let a debug-artifact write failure abort an otherwise valid run.
+  }
 }
 
 async function readResultArtifact(filePath: string): Promise<WorkerResultArtifact | undefined> {
   try {
     return JSON.parse(await readFile(filePath, "utf8")) as WorkerResultArtifact;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readVerificationArtifact(filePath: string | undefined): Promise<import("./supervisorTypes.js").WorkerVerification | undefined> {
+  if (!filePath) return undefined;
+  try {
+    return JSON.parse(await readFile(filePath, "utf8")) as import("./supervisorTypes.js").WorkerVerification;
   } catch {
     return undefined;
   }
@@ -412,6 +554,87 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+function isPathInside(root: string, candidate: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function mainContractError(offendingPath: string, expectedRoot: string, detail: string): Error {
+  return new Error(
+    `FUSION_MAIN_WORKSPACE_CONTRACT_INVALID: ${detail}; offending path=${offendingPath}; expected workspace root=${expectedRoot}`,
+  );
+}
+
+async function assertMainWorkspaceContract(state: SupervisorState, worker: WorkerRecord): Promise<void> {
+  const workspaceRoot = path.resolve(worker.workspacePath);
+  try {
+    const workspaceStat = await stat(workspaceRoot);
+    if (!workspaceStat.isDirectory()) {
+      throw mainContractError(workspaceRoot, workspaceRoot, "main workspace is not a directory");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("FUSION_MAIN_WORKSPACE_CONTRACT_INVALID")) throw error;
+    throw mainContractError(workspaceRoot, workspaceRoot, "main workspace does not exist");
+  }
+
+  const suppliedPaths = [
+    worker.taskArtifactPath,
+    worker.instructionArtifactPath,
+    worker.resultArtifactPath,
+    worker.statusArtifactPath,
+    worker.workerContextArtifactPath,
+    worker.verificationArtifactPath,
+  ].filter((value): value is string => Boolean(value));
+  for (const suppliedPath of suppliedPaths) {
+    if (!isPathInside(workspaceRoot, suppliedPath)) {
+      throw mainContractError(suppliedPath, workspaceRoot, "main worker path escapes candidate workspace");
+    }
+  }
+  for (const requiredPath of [worker.taskArtifactPath, worker.instructionArtifactPath]) {
+    if (!(await pathExists(requiredPath))) {
+      throw mainContractError(requiredPath, workspaceRoot, "required main worker local artifact is missing");
+    }
+  }
+  const sourceRunArtifacts = path.join(path.resolve(state.sourceWorkspace), ".opencode", "fusion-runs");
+  const checkedStrings = [
+    worker.taskArtifactPath,
+    worker.instructionArtifactPath,
+    worker.resultArtifactPath,
+    worker.statusArtifactPath,
+    worker.workerContextArtifactPath,
+    worker.verificationArtifactPath,
+    await readFile(worker.instructionArtifactPath, "utf8").catch(() => ""),
+  ].filter((value): value is string => Boolean(value));
+  for (const value of checkedStrings) {
+    if (value.includes(sourceRunArtifacts)) {
+      throw mainContractError(value, workspaceRoot, "main worker argument or context references source run artifacts");
+    }
+  }
+  worker.workspaceContractValidated = true;
+}
+
+function assertMainSpawnSpecContract(state: SupervisorState, worker: WorkerRecord, spec: WorkerSpawnSpec): void {
+  const workspaceRoot = path.resolve(worker.workspacePath);
+  const sourceRunArtifacts = path.join(path.resolve(state.sourceWorkspace), ".opencode", "fusion-runs");
+  const values = [
+    spec.workspacePath,
+    spec.promptText,
+    ...Object.values(spec.env),
+  ];
+  for (const value of values) {
+    if (value.includes(sourceRunArtifacts)) {
+      throw mainContractError(value, workspaceRoot, "main worker spawn argument references source run artifacts");
+    }
+  }
+  for (const value of [spec.workspacePath, spec.env.FUSION_WORKSPACE, spec.env.FUSION_TASK_ARTIFACT, spec.env.FUSION_INSTRUCTION_ARTIFACT, spec.env.FUSION_RESULT_ARTIFACT, spec.env.FUSION_STATUS_ARTIFACT, spec.env.FUSION_WORKER_CONTEXT, spec.env.FUSION_VERIFICATION_ARTIFACT]) {
+    if (value && path.isAbsolute(value) && !isPathInside(workspaceRoot, value)) {
+      throw mainContractError(value, workspaceRoot, "main worker spawn path escapes candidate workspace");
+    }
+  }
+}
+
 function workerEnv(state: SupervisorState, worker: WorkerRecord): Record<string, string> {
   return {
     FUSION_RUN_ID: state.runId,
@@ -423,6 +646,8 @@ function workerEnv(state: SupervisorState, worker: WorkerRecord): Record<string,
     FUSION_INSTRUCTION_ARTIFACT: worker.instructionArtifactPath,
     FUSION_RESULT_ARTIFACT: worker.resultArtifactPath,
     FUSION_STATUS_ARTIFACT: worker.statusArtifactPath,
+    ...(worker.workerContextArtifactPath ? { FUSION_WORKER_CONTEXT: worker.workerContextArtifactPath } : {}),
+    ...(worker.verificationArtifactPath ? { FUSION_VERIFICATION_ARTIFACT: worker.verificationArtifactPath } : {}),
     FUSION_REQUESTED_MODEL: worker.requestedModelId ?? worker.configuredModelId ?? worker.modelId,
   };
 }
@@ -471,23 +696,29 @@ async function spawnWorker(
   runner: WorkerRunner,
   now: () => number,
 ): Promise<SpawnedWorkerHandle> {
-  worker.launchRequestedAt = nowIso(now);
-  transitionWorker(worker, "spawning", worker.launchRequestedAt);
-  const promptText = await readFile(worker.instructionArtifactPath, "utf8").catch(() => worker.workerId);
-  const spec: WorkerSpawnSpec = {
-    workerId: worker.workerId,
-    role: worker.role,
-    modelId: worker.modelId,
-    variant: worker.variant,
-    agent: workerAgent(worker),
-    workspacePath: worker.workspacePath,
-    sessionTitle: worker.sessionTitle,
-    promptText,
-    env: workerEnv(state, worker),
-    stdoutPath: worker.stdoutPath,
-    stderrPath: worker.stderrPath,
-  };
   try {
+    if (worker.role === "main") {
+      await assertMainWorkspaceContract(state, worker);
+    }
+    worker.launchRequestedAt = nowIso(now);
+    transitionWorker(worker, "spawning", worker.launchRequestedAt);
+    const promptText = await readFile(worker.instructionArtifactPath, "utf8").catch(() => worker.workerId);
+    const spec: WorkerSpawnSpec = {
+      workerId: worker.workerId,
+      role: worker.role,
+      modelId: worker.modelId,
+      variant: worker.variant,
+      agent: workerAgent(worker),
+      workspacePath: worker.workspacePath,
+      sessionTitle: worker.sessionTitle,
+      promptText,
+      env: workerEnv(state, worker),
+      stdoutPath: worker.stdoutPath,
+      stderrPath: worker.stderrPath,
+    };
+    if (worker.role === "main") {
+      assertMainSpawnSpecContract(state, worker, spec);
+    }
     const handle = await runner.spawn(spec);
     if (handle.pid === undefined) {
       const reason = "spawn returned no PID";
@@ -499,7 +730,7 @@ async function spawnWorker(
     transitionWorker(worker, "running", worker.spawnedAt);
     return handle;
   } catch (error) {
-    if (worker.status === "spawning") {
+    if (worker.status === "spawning" || (worker.role === "main" && worker.status === "queued")) {
       const reason = error instanceof Error ? error.message : String(error);
       transitionWorker(worker, "failed", nowIso(now), reason);
     }
@@ -541,6 +772,7 @@ async function preparePanelWorkspace(
   worker.workspacePath = candidate.workspacePath;
   worker.workspaceReadyAt = nowIso(now);
   const outputs = candidatePanelOutputPaths(worker.workspacePath);
+  const receipts = panelReceiptPaths(worker.workspacePath);
   const executionContextPath = path.join(runDir, `panel-${logicalPanelIndex}-execution-context.full.md`);
   await writeFile(
     executionContextPath,
@@ -557,12 +789,18 @@ async function preparePanelWorkspace(
     "utf8",
   );
   const prompt = buildHybridPanelDispatchPrompt({
+    runId: state.runId,
     logicalPanelIndex,
+    agentId: worker.agentId ?? worker.workerId,
+    canonicalTaskHash: state.taskArtifactHash,
     candidateWorkspace: worker.workspacePath,
     prohibitedSourceWorkspace: state.sourceWorkspace,
     taskArtifactPath: state.taskArtifactPath,
     executionContextPath,
     resultArtifactPath: worker.resultArtifactPath,
+    receiptArtifactPath: receipts.receiptPath,
+    panelResultArtifactPath: receipts.resultPath,
+    verificationArtifactPath: receipts.verificationPath,
   });
   await writeFile(worker.instructionArtifactPath, prompt, "utf8");
   return worker;
@@ -656,13 +894,29 @@ async function validateHybridNativeAgents(
   deps: SupervisorDeps,
   panelModels: FusionModelSpec[],
   judgeModel: FusionModelSpec,
-): Promise<void> {
-  if (deps.skipNativeAgentValidation) return;
-  const agentDir = deps.agentDir;
+  configFingerprint: string,
+): Promise<NativeAgentReconcileResult> {
+  if (deps.skipNativeAgentValidation) {
+    return {
+      synchronized: true,
+      configFingerprint,
+      installedAgentModels: {
+        panelModels: panelModels.map((spec) => spec.modelId),
+        judgeModel: judgeModel.modelId,
+      },
+    };
+  }
   try {
-    await validateNativePanelAgents(panelModels, agentDir);
-    await validateNativeJudgeAgent(judgeModel, agentDir);
+    return await reconcileNativeAgentsAtLaunch({
+      panelModels,
+      judgeModel,
+      configFingerprint,
+      agentDir: deps.agentDir,
+    });
   } catch (error) {
+    if (error instanceof FusionRestartRequiredAfterAgentResyncError) {
+      throw error;
+    }
     if (error instanceof FusionNativePanelDispatchError) {
       throw new Error(formatNativePanelDispatchFailure(error));
     }
@@ -688,7 +942,13 @@ export async function superviseRun(runId: string, deps: SupervisorDeps): Promise
   const panelModels = [1, 2, 3].map((index) => ({
     modelId: state.workers[WORKER_ID.panel(index)].configuredModelId ?? state.workers[WORKER_ID.panel(index)].modelId,
   }));
-  await validateHybridNativeAgents(state, deps, panelModels, { modelId: state.judgeModelId });
+  await validateHybridNativeAgents(
+    state,
+    deps,
+    panelModels,
+    { modelId: state.judgeModelId },
+    state.modelConfigFingerprint ?? "",
+  );
 
   if (state.phase === "bootstrapping") {
     if (!deps.autoConfirmReady) {
@@ -725,17 +985,21 @@ export async function superviseRun(runId: string, deps: SupervisorDeps): Promise
 
   state.externalMain = {
     pid: mainWorker.pid,
+    invokingSessionModelId: state.invokingSessionModelId,
     requestedModelId: mainWorker.requestedModelId,
     configuredModelId: mainWorker.configuredModelId,
     observedProviderId: mainWorker.observedProviderId,
     observedModelId: mainWorker.observedModelId,
     workspace: mainWorker.workspacePath,
+    localCanonicalTaskPath: mainWorker.taskArtifactPath,
+    workspaceContractValidated: mainWorker.workspaceContractValidated,
     status: mainWorker.status,
     stdoutPath: mainWorker.stdoutPath,
     stderrPath: mainWorker.stderrPath,
     launchRequestedAt: mainWorker.launchRequestedAt,
     spawnedAt: mainWorker.spawnedAt,
     endedAt: mainWorker.endedAt,
+    failureReason: mainWorker.statusTransitions.at(-1)?.reason,
   };
 
   // Main pipeline: spawn external main in its isolated candidate workspace,
@@ -748,6 +1012,7 @@ export async function superviseRun(runId: string, deps: SupervisorDeps): Promise
         await monitorUntilTerminal([mainMonitor], state, deps, now, pollIntervalMs);
       }
     }
+    await deriveMainTerminalEvidence(state, mainWorker, now);
     await promoteMainCandidate(state, deps, now);
   })();
 
@@ -799,6 +1064,41 @@ export async function superviseRun(runId: string, deps: SupervisorDeps): Promise
   if (!isAbortedPhase(state)) state.phase = "done";
   await writeSupervisorState(state, deps.cwd, deps.traceDir);
   return state;
+}
+
+async function deriveMainTerminalEvidence(state: SupervisorState, main: WorkerRecord, now: () => number): Promise<void> {
+  if (!isTerminalWorkerStatus(main.status)) return;
+  const localReport = await readResultArtifact(main.resultArtifactPath);
+  if (localReport) {
+    main.result = localReport;
+    return;
+  }
+  const snapshotBaseline = await loadBaselineManifest(state.sourceSnapshotManifestPath);
+  const diff = snapshotBaseline ? await diffAgainstBaseline(main.workspacePath, snapshotBaseline) : undefined;
+  const changedFiles = diff
+    ? [...diff.changedFiles, ...diff.addedFiles, ...diff.removedFiles].filter((rel) => !isPromotionPreservedRelPath(rel))
+    : [];
+  const verification = await readVerificationArtifact(main.verificationArtifactPath);
+  const status = main.status === "completed" ? "completed" : "failed";
+  const result: WorkerResultArtifact = {
+    workerId: main.workerId,
+    role: "main",
+    runId: state.runId,
+    workspacePath: main.workspacePath,
+    taskHash: main.taskArtifactHash,
+    status,
+    changedFiles,
+    verification,
+    errorSummary: status === "failed" ? main.statusTransitions.at(-1)?.reason ?? "main worker failed without a local report" : undefined,
+    completedAt: main.endedAt ?? nowIso(now),
+  };
+  main.result = result;
+  try {
+    await mkdir(path.dirname(main.resultArtifactPath), { recursive: true });
+    await writeFile(main.resultArtifactPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  } catch {
+    // State still carries the derived evidence even if the local report cannot be materialized.
+  }
 }
 
 async function monitorUntilTerminal(
@@ -981,17 +1281,19 @@ function computeLaunchVerdict(state: SupervisorState, panelWorkers: WorkerRecord
     const spread = Math.max(...dispatchRequestedTimes) - Math.min(...dispatchRequestedTimes);
     parallelPanelDispatchIssued = spread <= 5;
   }
-  let allPanelsHaveSessionId = true;
+  // A panel counts as truthfully launched when it has dispatch evidence AND at
+  // least one verified runtime-evidence source (native session ID, valid receipt
+  // + candidate mutation, or parent Task completion with matching task hash).
+  let allPanelsHaveEvidence = true;
   for (const panel of panelWorkers) {
-    if (panel.dispatchedAt && panel.sessionId) {
+    const hasRuntimeEvidence = panelHasVerifiedRuntimeEvidence(panel);
+    if (panel.dispatchedAt && hasRuntimeEvidence) {
       panelsLaunched += 1;
       if (panel.logicalPanelIndex) {
         panelLaunchAt[panel.logicalPanelIndex as 1 | 2 | 3] = panel.dispatchedAt;
       }
-    } else if (!isTerminalWorkerStatus(panel.status)) {
-      allPanelsHaveSessionId = false;
-    } else if (!panel.sessionId) {
-      allPanelsHaveSessionId = false;
+    } else {
+      allPanelsHaveEvidence = false;
     }
   }
   const allLaunchTimestampsRecorded = Boolean(
@@ -1004,11 +1306,13 @@ function computeLaunchVerdict(state: SupervisorState, panelWorkers: WorkerRecord
     (panel) => panel.executionKind === "native_subagent" && panel.dispatchMechanism !== "opencode-cli-process",
   );
   const expectedMainModel = main.requestedModelId ?? main.configuredModelId ?? main.modelId;
-  const mainModelMatched = !main.observedModelId || main.observedModelId === expectedMainModel;
+  const mainModelMatched = main.observedModelId
+    ? main.observedModelId === expectedMainModel
+    : !isTerminalWorkerStatus(main.status);
   const confirmed =
     mainPidOk &&
     panelsLaunched === PANEL_COUNT &&
-    allPanelsHaveSessionId &&
+    allPanelsHaveEvidence &&
     parallelPanelDispatchIssued &&
     allLaunchTimestampsRecorded &&
     noPanelViaExternalCli &&
@@ -1026,27 +1330,26 @@ function computeLaunchVerdict(state: SupervisorState, panelWorkers: WorkerRecord
       ? undefined
       : !mainPidOk
         ? "main external process never received a PID"
-        : panelsLaunched < PANEL_COUNT
-          ? `only ${panelsLaunched}/${PANEL_COUNT} native panel dispatches succeeded`
-          : !allPanelsHaveSessionId
-            ? "one or more native panel session IDs missing"
-            : !parallelPanelDispatchIssued
-              ? "panel dispatch requests were not issued concurrently"
-              : !allLaunchTimestampsRecorded
-                ? "one or more primary launch timestamps were not recorded"
-                : !noPanelViaExternalCli
-                  ? "a panel was launched through external opencode run"
-                  : !mainModelMatched
-                    ? "main requested model differs from observed runtime model"
-                    : "launch evidence incomplete",
+        : !parallelPanelDispatchIssued
+          ? "panel dispatch requests were not issued concurrently"
+          : !allLaunchTimestampsRecorded
+            ? "one or more primary launch timestamps were not recorded"
+            : !noPanelViaExternalCli
+              ? "a panel was launched through external opencode run"
+              : !mainModelMatched
+                ? "main requested model differs from observed runtime model"
+                : "launch evidence incomplete",
   };
   state.externalMain = {
     pid: main.pid,
+    invokingSessionModelId: state.invokingSessionModelId,
     requestedModelId: main.requestedModelId,
     configuredModelId: main.configuredModelId,
     observedProviderId: main.observedProviderId,
     observedModelId: main.observedModelId,
     workspace: main.workspacePath,
+    localCanonicalTaskPath: main.taskArtifactPath,
+    workspaceContractValidated: main.workspaceContractValidated,
     status: main.status,
     stdoutPath: main.stdoutPath,
     stderrPath: main.stderrPath,
@@ -1056,6 +1359,7 @@ function computeLaunchVerdict(state: SupervisorState, panelWorkers: WorkerRecord
     exitCode: main.exitCode,
     promoted: state.mainPromotion.status === "promoted",
     promotionManifestPath: state.mainPromotion.manifestPath,
+    failureReason: main.statusTransitions.at(-1)?.reason ?? state.mainPromotion.detail,
   };
   state.nativePanels = panelWorkers.map((worker) => ({
     panelNumber: worker.logicalPanelIndex as 1 | 2 | 3,
@@ -1067,15 +1371,349 @@ function computeLaunchVerdict(state: SupervisorState, panelWorkers: WorkerRecord
     dispatchedAt: worker.dispatchedAt,
     terminalAt: worker.terminalAt ?? worker.endedAt,
     status: worker.status,
+    nativeWaveStage: worker.nativeWaveStage,
     resultArtifactPath: worker.resultArtifactPath,
+    runtimeEvidence: worker.runtimeEvidence,
   }));
+}
+
+function panelAgentId(worker: WorkerRecord): string {
+  return worker.agentId ?? worker.workerId;
+}
+
+function panelHasVerifiedRuntimeEvidence(worker: WorkerRecord): boolean {
+  const ev = worker.runtimeEvidence;
+  if (ev?.receiptValidity === "invalid") return false;
+  if (Boolean(worker.sessionId)) return true;
+  if (isTerminalWorkerStatus(worker.status) && ev?.receiptValidity !== "missing") return true;
+  if (isTerminalWorkerStatus(worker.status) && ev?.taskCompletionEvidence && ev.candidateMutationEvidence) {
+    return true;
+  }
+  if (!ev) return false;
+  if (ev.nativeSessionIdAvailable && ev.sessionId) return true;
+  if (ev.receiptValidity === "valid" && ev.candidateMutationEvidence) return true;
+  if (ev.taskCompletionEvidence && ev.receiptValidity === "valid") return true;
+  if (
+    ev.taskCompletionEvidence &&
+    ev.candidateMutationEvidence &&
+    ev.reconciledStatus !== "completed_invalid_receipt"
+  ) {
+    return true;
+  }
+  // Candidate workspace mutation alone (snapshot-relative, registered identity)
+  // is sufficient runtime evidence for a self-healed degraded panel.
+  if (isTerminalWorkerStatus(worker.status) && ev.candidateMutationEvidence) return true;
+  return (
+    ev.reconciledStatus === "completed_with_session" ||
+    ev.reconciledStatus === "completed_with_receipt" ||
+    ev.reconciledStatus === "completed_with_task" ||
+    ev.reconciledStatus === "completed_degraded"
+  );
+}
+
+function formatPanelEvidenceFailure(worker: WorkerRecord): string {
+  const ev = worker.runtimeEvidence;
+  const index = worker.logicalPanelIndex ?? "?";
+  if (!ev) return `panel ${index}: no runtime evidence reconciled`;
+  const parts = [
+    `panel ${index} (${ev.agentId})`,
+    `native session ID: ${ev.nativeSessionIdAvailable ? ev.sessionId ?? "unavailable" : "unavailable"}`,
+    `Task completion evidence: ${ev.taskCompletionEvidence ? "yes" : "no"}`,
+    `receipt: ${ev.receiptArtifactPath ?? "—"} (${ev.receiptValidity})`,
+    `candidate mutation: ${ev.candidateMutationEvidence ? "yes" : "no"}`,
+    `status: ${ev.reconciledStatus}`,
+  ];
+  if (ev.receiptValidationErrors?.length) {
+    parts.push(`receipt errors: ${ev.receiptValidationErrors.join("; ")}`);
+  }
+  return parts.join("; ");
+}
+
+function resolvePanelIndexFromId(id: string | undefined): 1 | 2 | 3 | undefined {
+  if (!id) return undefined;
+  const match = id.match(/(?:fusion-panel-)?([123])$/);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return value === 1 || value === 2 || value === 3 ? (value as 1 | 2 | 3) : undefined;
+}
+
+function resolveOutcomeIndex(outcome: HybridPanelOutcome): 1 | 2 | 3 | undefined {
+  if (outcome.logicalPanelIndex === 1 || outcome.logicalPanelIndex === 2 || outcome.logicalPanelIndex === 3) {
+    return outcome.logicalPanelIndex;
+  }
+  return resolvePanelIndexFromId(outcome.panelId) ?? resolvePanelIndexFromId(outcome.agentId);
+}
+
+function outcomeReceiptPath(outcome: HybridPanelOutcome | undefined): string | undefined {
+  return outcome?.receiptPath ?? outcome?.receiptArtifactPath;
+}
+
+/**
+ * Detect spoofed/mismatched parent-supplied panelOutcomes fields against the
+ * registered panel slot. Any nonempty result means the submitted evidence is
+ * untrustworthy and the panel must be rejected (never silently accepted).
+ */
+function detectOutcomeContractMismatch(
+  state: SupervisorState,
+  worker: WorkerRecord,
+  outcome: HybridPanelOutcome,
+): string[] {
+  const errors: string[] = [];
+  const expectedAgent = panelAgentId(worker);
+  if (outcome.panelId && outcome.panelId !== expectedAgent) {
+    errors.push(`panelId mismatch: expected ${expectedAgent}, got ${outcome.panelId}`);
+  }
+  if (outcome.agentId && outcome.agentId !== expectedAgent) {
+    errors.push(`agentId mismatch: expected ${expectedAgent}, got ${outcome.agentId}`);
+  }
+  if (outcome.canonicalTaskHash && outcome.canonicalTaskHash !== state.taskArtifactHash) {
+    errors.push(
+      `canonicalTaskHash mismatch: expected ${state.taskArtifactHash}, got ${outcome.canonicalTaskHash}`,
+    );
+  }
+  if (
+    outcome.candidateWorkspace &&
+    path.resolve(outcome.candidateWorkspace) !== path.resolve(worker.workspacePath)
+  ) {
+    errors.push(
+      `candidateWorkspace mismatch: expected ${worker.workspacePath}, got ${outcome.candidateWorkspace}`,
+    );
+  }
+  return errors;
+}
+
+async function reconcileNativePanelEvidence(
+  state: SupervisorState,
+  worker: WorkerRecord,
+  dispatch: HybridPanelOutcome | undefined,
+  waveDispatchedAt: string,
+  now: () => number,
+): Promise<NativePanelRuntimeEvidence> {
+  const at = nowIso(now);
+  const agentId = dispatch?.agentId ?? dispatch?.panelId ?? panelAgentId(worker);
+  const panelId = panelAgentId(worker);
+  // The canonical candidate workspace is always the REGISTERED one. A parent may
+  // supply candidateWorkspace, but we only use it to detect spoofing — never to
+  // redirect receipt/mutation reads to a path the parent chose.
+  const candidateWorkspace = worker.workspacePath;
+
+  const contractMismatchErrors = dispatch ? detectOutcomeContractMismatch(state, worker, dispatch) : [];
+  const hasContractMismatch = contractMismatchErrors.length > 0;
+
+  worker.dispatchRequestedAt = worker.dispatchRequestedAt ?? waveDispatchedAt;
+  worker.dispatchedAt = worker.dispatchedAt ?? waveDispatchedAt;
+  worker.dispatchMechanism = NATIVE_TASK_DISPATCH_MECHANISM;
+  // Never trust a session ID that arrived alongside spoofed identity fields.
+  if (dispatch?.sessionId && !hasContractMismatch) worker.sessionId = dispatch.sessionId;
+
+  const receiptPath = outcomeReceiptPath(dispatch) ?? panelReceiptPaths(candidateWorkspace).receiptPath;
+  const receiptRaw = await readPanelReceipt(receiptPath);
+  const receiptValidation = validatePanelReceipt(receiptRaw, {
+    runId: state.runId,
+    panelId,
+    candidateWorkspace,
+    canonicalTaskHash: state.taskArtifactHash,
+  });
+
+  const parentTaskHashMatches =
+    Boolean(dispatch?.canonicalTaskHash) && dispatch!.canonicalTaskHash === state.taskArtifactHash;
+  const taskCompletionEvidence = Boolean(
+    dispatch?.status === "completed" ||
+      dispatch?.status === "failed" ||
+      parentTaskHashMatches ||
+      dispatch?.taskResultSummary,
+  );
+
+  // Meaningful, receipt-excluding snapshot-relative mutation. A receipt or panel
+  // output artifact alone never counts; only real source/test/config changes do.
+  const candidateMutationEvidence = await detectMeaningfulPanelCandidateMutation(state, worker);
+
+  const supervisorResultArtifact = isTerminalWorkerStatus(worker.status)
+    ? worker.result ?? (await readResultArtifact(worker.resultArtifactPath))
+    : await readResultArtifact(worker.resultArtifactPath);
+
+  const hasDispatchEvidence = Boolean(dispatch);
+
+  const evidence: NativePanelRuntimeEvidence = {
+    agentId,
+    nativeSessionIdAvailable: Boolean((dispatch?.sessionId && !hasContractMismatch) || worker.sessionId),
+    sessionId: hasContractMismatch ? worker.sessionId : dispatch?.sessionId ?? worker.sessionId,
+    taskId: hasContractMismatch ? undefined : dispatch?.taskId,
+    taskCompletionEvidence,
+    taskCompletionSummary: dispatch?.taskResultSummary,
+    receiptArtifactPath: receiptPath,
+    receiptValidity: !receiptRaw ? "missing" : receiptValidation.valid ? "valid" : "invalid",
+    receiptValidationErrors:
+      receiptValidation.errors.length > 0 ? receiptValidation.errors : undefined,
+    candidateMutationEvidence,
+    reconciledStatus: "no_dispatch_evidence",
+    parentOutcomeProvided: hasDispatchEvidence,
+    contractMismatchErrors: hasContractMismatch ? contractMismatchErrors : undefined,
+  };
+
+  // A spoofed/mismatched outcome is never accepted: record the evidence so the
+  // trace is honest, but do not promote the panel to a terminal "completed".
+  if (hasContractMismatch) {
+    evidence.reconciledStatus = "completed_invalid_receipt";
+    evidence.acceptance = "rejected";
+    worker.nativeWaveStage = worker.nativeWaveStage ?? "dispatch_requested";
+    worker.runtimeEvidence = evidence;
+    return evidence;
+  }
+
+  if (!hasDispatchEvidence && !receiptRaw && !supervisorResultArtifact) {
+    // Self-healing invariant: a native panel that visibly ran in its REGISTERED
+    // candidate workspace and produced a meaningful snapshot-relative source
+    // mutation is preserved and classified even when the parent supplied no
+    // panelOutcomes, no session ID, and no receipt. Optional native transport is
+    // an upgrade, never a gate. No mutation yet → still awaiting (recoverable).
+    if (candidateMutationEvidence) {
+      if (!isTerminalWorkerStatus(worker.status)) {
+        worker.terminalAt = at;
+        worker.endedAt = at;
+        transitionWorker(
+          worker,
+          "completed",
+          at,
+          "completed_degraded: registered candidate workspace mutation without native transport",
+        );
+      }
+      evidence.reconciledStatus = "completed_degraded";
+      evidence.acceptance = "accepted";
+      worker.nativeWaveStage = "completed";
+      worker.runtimeEvidence = evidence;
+      return evidence;
+    }
+    evidence.acceptance = "awaiting";
+    worker.runtimeEvidence = evidence;
+    return evidence;
+  }
+
+  if (supervisorResultArtifact) {
+    worker.result = supervisorResultArtifact;
+    if (!isTerminalWorkerStatus(worker.status)) {
+      worker.terminalAt = at;
+      worker.endedAt = at;
+      transitionWorker(
+        worker,
+        supervisorResultArtifact.status === "failed" ? "failed" : "completed",
+        at,
+        supervisorResultArtifact.errorSummary,
+      );
+    }
+  } else if (receiptValidation.valid && receiptRaw) {
+    if (!isTerminalWorkerStatus(worker.status)) {
+      worker.terminalAt = receiptRaw.completedAt ?? at;
+      worker.endedAt = worker.terminalAt;
+      transitionWorker(
+        worker,
+        receiptRaw.status === "failed" ? "failed" : "completed",
+        worker.terminalAt,
+        receiptRaw.summary,
+      );
+    }
+  } else if (
+    (dispatch?.status === "completed" || dispatch?.status === "failed") &&
+    !(receiptRaw && !receiptValidation.valid)
+  ) {
+    if (!isTerminalWorkerStatus(worker.status)) {
+      worker.terminalAt = dispatch.completedAt ?? at;
+      worker.endedAt = worker.terminalAt;
+      transitionWorker(
+        worker,
+        dispatch.status === "failed" ? "failed" : "completed",
+        worker.terminalAt,
+        dispatch.taskResultSummary,
+      );
+    }
+  }
+
+  if (worker.status === "failed") {
+    evidence.reconciledStatus = "failed";
+    worker.nativeWaveStage = "failed";
+  } else if (receiptRaw && !receiptValidation.valid) {
+    evidence.reconciledStatus = "completed_invalid_receipt";
+    worker.nativeWaveStage = "dispatch_requested";
+  } else if (isTerminalWorkerStatus(worker.status)) {
+    if (evidence.nativeSessionIdAvailable) {
+      evidence.reconciledStatus = "completed_with_session";
+    } else if (receiptValidation.valid) {
+      evidence.reconciledStatus = "completed_with_receipt";
+    } else if (parentTaskHashMatches && taskCompletionEvidence) {
+      evidence.reconciledStatus = "completed_with_task";
+    } else {
+      evidence.reconciledStatus = "completed_with_task";
+    }
+    worker.nativeWaveStage = "completed";
+  } else {
+    evidence.reconciledStatus = "dispatched_pending_completion";
+    worker.nativeWaveStage = evidence.nativeSessionIdAvailable
+      ? "native_task_running_when_observable"
+      : "dispatch_requested";
+    if (!isTerminalWorkerStatus(worker.status)) {
+      transitionWorker(worker, "running", waveDispatchedAt);
+    }
+  }
+
+  evidence.acceptance = classifyPanelEvidenceAcceptance(worker, evidence);
+  worker.runtimeEvidence = evidence;
+  return evidence;
+}
+
+/**
+ * Final accept/reject/await verdict for one reconciled panel:
+ * - `rejected`  → submitted evidence is spoofed/mismatched or the on-disk
+ *   receipt is invalid. Terminal: confirm_launch fails safely (without
+ *   cancelling the run or killing main).
+ * - `accepted`  → at least one trustworthy evidence source proves real work.
+ * - `awaiting`  → no completion evidence yet; recoverable via a later
+ *   confirm_launch with the actual Task outcome (run state is preserved).
+ */
+function classifyPanelEvidenceAcceptance(
+  worker: WorkerRecord,
+  evidence: NativePanelRuntimeEvidence,
+): NativePanelEvidenceAcceptance {
+  if (evidence.contractMismatchErrors?.length) return "rejected";
+  if (evidence.receiptValidity === "invalid") return "rejected";
+  if (panelHasVerifiedRuntimeEvidence(worker)) return "accepted";
+  return "awaiting";
+}
+
+/**
+ * A panel is usable for the judge when it is a fully-evidenced usable candidate
+ * OR a usable_degraded one: completed with a real meaningful snapshot-relative
+ * workspace mutation in a safe registered workspace matching the canonical task,
+ * even when verification/receipt/session evidence is incomplete. A panel with no
+ * mutation is unusable (not fatal); an invalid/missing one is excluded.
+ */
+function isPanelUsableForJudge(worker: WorkerRecord | undefined): boolean {
+  const candidate = worker?.candidate;
+  if (!worker || !candidate) return false;
+  if (candidate.classification === "usable") return true;
+  return (
+    worker.status === "completed" &&
+    candidate.classification !== "invalid" &&
+    candidate.classification !== "missing" &&
+    candidate.meaningfulChangedFiles > 0 &&
+    candidate.workspaceSafe &&
+    candidate.taskHashMatches
+  );
+}
+
+function usablePanelIndexesFromEvidence(reports: PanelEvidenceReport[]): number[] {
+  const indexes: number[] = [];
+  for (const report of reports) {
+    if (report.reconciledStatus !== "usable" && report.reconciledStatus !== "usable_degraded") continue;
+    const index = resolvePanelIndexFromId(report.panelId);
+    if (index) indexes.push(index);
+  }
+  return indexes.sort((a, b) => a - b);
 }
 
 function usablePanelIndexes(state: SupervisorState): number[] {
   const indexes: number[] = [];
   for (let index = 1; index <= PANEL_COUNT; index += 1) {
-    const worker = state.workers[WORKER_ID.panel(index)];
-    if (worker?.candidate?.classification === "usable") indexes.push(index);
+    if (isPanelUsableForJudge(state.workers[WORKER_ID.panel(index)])) indexes.push(index);
   }
   return indexes;
 }
@@ -1084,7 +1722,7 @@ function usablePanelIndexes(state: SupervisorState): number[] {
  * Preserve these path roots during main candidate promotion. They are never
  * overwritten, deleted, or reset by a snapshot-relative promotion.
  */
-const PROMOTION_PRESERVED_REL_PREFIXES = [".git/", ".opencode/fusion-runs/"];
+const PROMOTION_PRESERVED_REL_PREFIXES = [".git/", ".opencode/fusion-runs/", ".fusion-worker/"];
 
 function isPromotionPreservedRelPath(relPath: string): boolean {
   const normalized = relPath.replace(/^\.\//, "");
@@ -1357,9 +1995,18 @@ async function runJudgeStage(
   const dispatchRequestedAt = state.judge.dispatchedAt;
   judge.dispatchRequestedAt = dispatchRequestedAt;
   transitionWorker(judge, "spawning", dispatchRequestedAt);
+  const dispatchModelId = judge.configuredModelId ?? judge.modelId;
+  if (!deps.skipNativeAgentValidation) {
+    const agentFileJudgeModelId = (await readNativeJudgeAgentModel(deps.agentDir)) ?? "";
+    assertJudgeDispatchModelConsistency({
+      configuredJudgeModelId: state.judgeModelId,
+      agentFileJudgeModelId,
+      dispatchJudgeModelId: dispatchModelId,
+    });
+  }
   const receipt = await nativeDispatcher.dispatchJudge({
     agentId: judge.agentId ?? FUSION_AGENT_NAMES.judge,
-    configuredModelId: judge.configuredModelId ?? judge.modelId,
+    configuredModelId: dispatchModelId,
     prompt: judgePrompt,
     description: "Fusion Judge",
     dispatchRequestedAt,
@@ -1444,6 +2091,15 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Keep a panel's truthful native-wave trace stage in sync with its status. */
+function syncPanelWaveStage(worker: WorkerRecord): void {
+  if (worker.status === "completed") worker.nativeWaveStage = "completed";
+  else if (worker.status === "failed") worker.nativeWaveStage = "failed";
+  else if (worker.status === "timed_out") worker.nativeWaveStage = "timed_out";
+  else if (worker.sessionId) worker.nativeWaveStage = "native_task_running_when_observable";
+  else if (!worker.nativeWaveStage) worker.nativeWaveStage = "dispatch_requested";
+}
+
 /** Read the phase opaquely so callers are not narrowed to a single literal. */
 function isAbortedPhase(state: SupervisorState): boolean {
   return state.phase === "aborted";
@@ -1457,4 +2113,1062 @@ export function liveWorkerSummary(state: SupervisorState): Array<{ workerId: str
     alive: isPidAlive(worker.pid),
     status: worker.status,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Foreground, model-driven hybrid orchestration.
+//
+// The active OpenCode parent session drives this flow stage-by-stage so that
+// the THREE panels and the judge are dispatched as REAL, visible native Task
+// subagents by the parent model (the only host-supported way to make child
+// work visible in the active flow). The ONE main builder is a real external
+// `opencode run` process spawned in-process here (real PID). Nothing in this
+// flow returns "launch success" until the external main PID and all three
+// native panel session IDs are recorded.
+// ---------------------------------------------------------------------------
+
+/**
+ * Default startup guard for the external main launch wave (ms). This only
+ * verifies the external main process obtained a real PID — it never bounds the
+ * native panel execution time.
+ */
+export const FUSION_EXTERNAL_MAIN_STARTUP_DEADLINE_MS = 15_000;
+/**
+ * Default deadline for the parent to call `begin_native_wave` after the main
+ * process spawns. Applies ONLY to registering the dispatch, never to waiting for
+ * the panels to finish.
+ */
+export const FUSION_NATIVE_DISPATCH_REGISTRATION_DEADLINE_MS = 60_000;
+/** Default real long-running native panel execution timeout (ms). */
+export const FUSION_NATIVE_PANEL_EXECUTION_TIMEOUT_MS = 25 * 60_000;
+
+/** @deprecated retained as a back-compat alias; use the split timing model. */
+export const FUSION_HYBRID_STARTUP_DEADLINE_MS = FUSION_EXTERNAL_MAIN_STARTUP_DEADLINE_MS;
+
+type SupervisorCancellationOutcome = SupervisorCancellation["mainProcessOutcome"];
+
+/** Holds the live external-main child handle across separate parent tool calls. */
+type MainProcessEntry = { handle: SpawnedWorkerHandle; exited: boolean; exit?: WorkerProcessExit };
+const mainProcessRegistry = new Map<string, MainProcessEntry>();
+
+function positiveMs(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function legacyDeadlineOverride(deps: SupervisorDeps): number | undefined {
+  const explicit = positiveMs(deps.startupDeadlineMs);
+  if (explicit) return explicit;
+  const fromEnv = process.env.FUSION_HYBRID_STARTUP_DEADLINE_MS;
+  if (fromEnv) {
+    const parsed = Number.parseInt(fromEnv, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the persisted-or-default run timing. A legacy `startupDeadlineMs`
+ * override seeds BOTH the external-main startup deadline and the native dispatch
+ * registration deadline so older callers keep working, while a specific override
+ * always wins.
+ */
+function resolveRunTiming(deps: SupervisorDeps): FusionRunTiming {
+  const legacy = legacyDeadlineOverride(deps);
+  return {
+    externalMainStartupDeadlineMs:
+      positiveMs(deps.externalMainStartupDeadlineMs) ?? legacy ?? FUSION_EXTERNAL_MAIN_STARTUP_DEADLINE_MS,
+    nativeDispatchRegistrationDeadlineMs:
+      positiveMs(deps.nativeDispatchRegistrationDeadlineMs) ?? legacy ?? FUSION_NATIVE_DISPATCH_REGISTRATION_DEADLINE_MS,
+    nativePanelExecutionTimeoutMs:
+      positiveMs(deps.nativePanelExecutionTimeoutMs) ??
+      positiveMs(deps.timeouts?.panelHardTimeoutMs) ??
+      FUSION_NATIVE_PANEL_EXECUTION_TIMEOUT_MS,
+  };
+}
+
+/**
+ * Read the run timing that governs a later stage. Persisted run config is the
+ * source of truth: confirm_launch/collect/begin_native_wave must NEVER silently
+ * fall back to a hardcoded 15s value when state already recorded the timing. Any
+ * stage-level deps override is only consulted when state has no persisted timing
+ * (e.g. an older run created before this field existed).
+ */
+function readRunTiming(state: SupervisorState, deps: SupervisorDeps): FusionRunTiming {
+  if (state.runTiming) return state.runTiming;
+  return resolveRunTiming(deps);
+}
+
+/** Panel result the parent model may report from a native Task subagent. */
+export type NativePanelResultInput = {
+  agentName: string;
+  modelId?: string;
+  content?: string;
+  error?: string;
+  sessionId?: string;
+  taskId?: string;
+};
+
+export type HybridPanelDispatchSpec = {
+  logicalPanelIndex: 1 | 2 | 3;
+  agentId: string;
+  configuredModelId: string;
+  description: string;
+  candidateWorkspace: string;
+  resultArtifactPath: string;
+  instructionArtifactPath: string;
+  receiptArtifactPath: string;
+  panelResultArtifactPath: string;
+  verificationArtifactPath: string;
+  prompt: string;
+};
+
+export type HybridLaunchPlan = {
+  runId: string;
+  strategy: "hybrid_external_main_native_panels";
+  runDir: string;
+  phase: SupervisorState["phase"];
+  /** Back-compat: equals timing.externalMainStartupDeadlineMs. */
+  startupDeadlineMs: number;
+  timing: FusionRunTiming;
+  launchedAt: string;
+  nextStage: "begin_native_wave";
+  main: {
+    workerId: string;
+    executionKind: "external_process";
+    pid: number;
+    requestedModelId: string;
+    workspace: string;
+    localCanonicalTaskPath: string;
+    workspaceContractValidated?: boolean;
+    spawnedAt?: string;
+    stdoutPath: string;
+    stderrPath: string;
+  };
+  panelDispatchSpecs: HybridPanelDispatchSpec[];
+  judge: { status: "pending"; gate: "blocked_until_main_promoted_and_panels_terminal" };
+  instructions: string;
+};
+
+/** A short-lived deadline guard for the launch wave. */
+async function withDeadline<T>(label: string, ms: number, work: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`FUSION_SUPERVISOR_LAUNCH_FAILED: ${label} exceeded startup deadline of ${ms}ms`)),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([work, guard]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Stage 1 (foreground): bootstrap, spawn the external main builder process to a
+ * real PID, and materialize + prompt the three panel candidate workspaces. The
+ * panels themselves are NOT launched here — they are returned as dispatch specs
+ * for the parent model to launch as native visible Task subagents in one wave.
+ * Fails loudly if the launch wave cannot obtain a real main PID and ready panel
+ * specs within the startup deadline.
+ */
+export async function hybridLaunch(input: BootstrapInput, deps: SupervisorDeps): Promise<HybridLaunchPlan> {
+  const now = deps.now ?? Date.now;
+  const timing = resolveRunTiming(deps);
+  const deadline = timing.externalMainStartupDeadlineMs;
+  const runner = deps.runner ?? createOpenCodeProcessWorkerRunner();
+
+  const agentReconcile = await validateHybridNativeAgents(
+    {} as SupervisorState,
+    deps,
+    input.panelModels.slice(0, PANEL_COUNT),
+    input.judgeModel,
+    input.modelConfigFingerprint,
+  );
+
+  const state = await bootstrapRealParallelBuild(input, deps);
+
+  const mainWorker = state.workers[WORKER_ID.main];
+  const panelWorkers: WorkerRecord[] = [1, 2, 3].map((i) => state.workers[WORKER_ID.panel(i)]);
+
+  // Persist run timing as the single source of truth for every later stage and
+  // bind the real long-running execution timeout to the panel workers. This is
+  // what makes a supplied launch override survive into confirm_launch/collect.
+  state.runTiming = timing;
+  for (const panel of panelWorkers) {
+    panel.hardTimeoutMs = timing.nativePanelExecutionTimeoutMs;
+  }
+  state.nativeWave = {
+    registrationDeadlineMs: timing.nativeDispatchRegistrationDeadlineMs,
+    expectedPanelAgentIds: panelWorkers.map((w) => w.agentId ?? w.workerId),
+  };
+
+  state.phase = "launching";
+  await writeSupervisorState(state, deps.cwd, deps.traceDir);
+
+  // Record the active runtime identity for this run so a stale install or schema
+  // drift is diagnosable from the run directory itself.
+  await writeRunJsonArtifact(
+    supervisorRunDir(deps.cwd, state.runId, deps.traceDir),
+    "runtime-identity.json",
+    buildRuntimeIdentity(now, {
+      invokingSessionModelId: state.invokingSessionModelId,
+      requestedMainModelId: state.workers[WORKER_ID.main].requestedModelId ?? state.mainModelId,
+      panelConfigModels: input.panelModels.slice(0, PANEL_COUNT).map((spec) => spec.modelId),
+      judgeConfigModel: input.judgeModel.modelId,
+      canonicalConfigFingerprint: input.modelConfigFingerprint,
+      installedAgentFingerprint: agentReconcile.installedAgentFingerprint,
+      installedAgentModels: agentReconcile.installedAgentModels,
+    }),
+  );
+
+  const launchWave = (async () => {
+    // Spawn the external main process and materialize panel workspaces in the
+    // same wave; neither waits for the other. Use allSettled so a failure in
+    // one branch never leaves the other branch writing files in the background
+    // (which would orphan workspace state during cleanup).
+    const mainSpawn = (async () => {
+      const handle = await spawnWorker(state, mainWorker, runner, now);
+      mainProcessRegistry.set(state.runId, { handle, exited: false });
+      const entry = mainProcessRegistry.get(state.runId)!;
+      void handle.exited.then((exit) => {
+        entry.exited = true;
+        entry.exit = exit;
+        mainWorker.exitCode = exit.code;
+        mainWorker.exitSignal = exit.signal;
+      });
+      return handle;
+    })();
+
+    const panelPrep = Promise.all(
+      panelWorkers.map(async (worker) => {
+        transitionWorker(worker, "preparing", nowIso(now));
+        const prepared = await preparePanelWorkspace(state, worker.logicalPanelIndex as 1 | 2 | 3, deps, now);
+        transitionWorker(prepared, "launching", nowIso(now));
+        return prepared;
+      }),
+    );
+
+    const [mainOutcome, panelOutcome] = await Promise.allSettled([mainSpawn, panelPrep]);
+    if (mainOutcome.status === "rejected") throw mainOutcome.reason;
+    if (panelOutcome.status === "rejected") throw panelOutcome.reason;
+  })();
+
+  try {
+    await withDeadline("parallel launch wave", deadline, launchWave);
+  } catch (error) {
+    // Clean up a partially launched wave so nothing is left orphaned/queued.
+    await hybridCancelInternal(state, deps, now, "launch wave failed");
+    const message = error instanceof Error ? error.message : String(error);
+    throw message.includes("FUSION_SUPERVISOR_LAUNCH_FAILED") || message.includes("FUSION_MAIN_WORKSPACE_CONTRACT_INVALID")
+      ? error
+      : new Error(`FUSION_SUPERVISOR_LAUNCH_FAILED: ${message}`);
+  }
+
+  if (mainWorker.pid === undefined) {
+    await hybridCancelInternal(state, deps, now, "main process produced no PID");
+    throw new Error("FUSION_SUPERVISOR_LAUNCH_FAILED: external main builder produced no PID");
+  }
+
+  state.externalMain = {
+    pid: mainWorker.pid,
+    invokingSessionModelId: state.invokingSessionModelId,
+    requestedModelId: mainWorker.requestedModelId,
+    configuredModelId: mainWorker.configuredModelId,
+    workspace: mainWorker.workspacePath,
+    localCanonicalTaskPath: mainWorker.taskArtifactPath,
+    workspaceContractValidated: mainWorker.workspaceContractValidated,
+    status: mainWorker.status,
+    stdoutPath: mainWorker.stdoutPath,
+    stderrPath: mainWorker.stderrPath,
+    launchRequestedAt: mainWorker.launchRequestedAt,
+    spawnedAt: mainWorker.spawnedAt,
+  };
+  await writeSupervisorState(state, deps.cwd, deps.traceDir);
+
+  const panelDispatchSpecs: HybridPanelDispatchSpec[] = await Promise.all(
+    panelWorkers.map(async (worker) => {
+      const receipts = panelReceiptPaths(worker.workspacePath);
+      return {
+        logicalPanelIndex: worker.logicalPanelIndex as 1 | 2 | 3,
+        agentId: worker.agentId ?? worker.workerId,
+        configuredModelId: worker.configuredModelId ?? worker.modelId,
+        description: `Fusion Panel ${worker.logicalPanelIndex}`,
+        candidateWorkspace: worker.workspacePath,
+        resultArtifactPath: worker.resultArtifactPath,
+        instructionArtifactPath: worker.instructionArtifactPath,
+        receiptArtifactPath: receipts.receiptPath,
+        panelResultArtifactPath: receipts.resultPath,
+        verificationArtifactPath: receipts.verificationPath,
+        prompt: await readFile(worker.instructionArtifactPath, "utf8"),
+      };
+    }),
+  );
+
+  return {
+    runId: state.runId,
+    strategy: "hybrid_external_main_native_panels",
+    runDir: supervisorRunDir(deps.cwd, state.runId, deps.traceDir),
+    phase: state.phase,
+    startupDeadlineMs: deadline,
+    timing,
+    launchedAt: nowIso(now),
+    nextStage: "begin_native_wave",
+    main: {
+      workerId: mainWorker.workerId,
+      executionKind: "external_process",
+      pid: mainWorker.pid,
+      requestedModelId: mainWorker.requestedModelId ?? mainWorker.modelId,
+      workspace: mainWorker.workspacePath,
+      localCanonicalTaskPath: mainWorker.taskArtifactPath,
+      workspaceContractValidated: mainWorker.workspaceContractValidated,
+      spawnedAt: mainWorker.spawnedAt,
+      stdoutPath: mainWorker.stdoutPath,
+      stderrPath: mainWorker.stderrPath,
+    },
+    panelDispatchSpecs,
+    judge: { status: "pending", gate: "blocked_until_main_promoted_and_panels_terminal" },
+    instructions:
+      "1) Call begin_native_wave (immediately, before dispatching any Task) to register the dispatch wave. " +
+      "2) Dispatch fusion-panel-1/2/3 as native Task subagents in ONE parallel wave using panelDispatchSpecs. " +
+      "Native Task calls block the parent until they return, which is expected and may take minutes. " +
+      "3) After the Task calls return, call confirm_launch with a complete evidence batch: each panel's agentId, " +
+      "native sessionId/taskId when the host exposes them, completed status, task result summary when available, " +
+      "candidate workspace, and receiptArtifactPath (or rely on the default .fusion-panel-output/receipt.json path). " +
+      "confirm_launch reconciles already-completed panels and will NOT cancel because the panels ran longer than the startup deadline. " +
+      "Do NOT report success to the user until confirm_launch returns HYBRID_PARALLEL_LAUNCH_CONFIRMED.",
+  };
+}
+
+/**
+ * One native panel Task outcome submitted by the active parent to confirm_launch
+ * AFTER the parallel Task wave returns. This is the production reconciliation
+ * contract: it accepts the real Task metadata the host returns and never demands
+ * unavailable host fields. `panelId`/`agentId` identify the slot; `sessionId`,
+ * `taskId`, and `receiptPath` are all OPTIONAL — a completed Task result plus a
+ * mutated candidate workspace is sufficient evidence without any receipt.
+ */
+export type HybridPanelOutcome = {
+  /** Canonical panel identity, e.g. "fusion-panel-1". */
+  panelId?: string;
+  /** Agent identity (usually identical to panelId). */
+  agentId?: string;
+  /** 1-based slot; inferred from panelId/agentId when omitted. */
+  logicalPanelIndex?: 1 | 2 | 3;
+  /** Parent-reported Task completion status when the Task call returned. */
+  status?: "completed" | "failed" | "running";
+  /** Real native session ID when the host exposes one; omit if unavailable. */
+  sessionId?: string;
+  /** Real native Task id when the host exposes one; omit if unavailable. */
+  taskId?: string;
+  /** Parent-reported Task output/error summary when available. */
+  taskResultSummary?: string;
+  candidateWorkspace?: string;
+  /** Parent-reported canonical task hash from the Task completion result. */
+  canonicalTaskHash?: string;
+  /** Explicit receipt path; defaults to <candidate>/.fusion-panel-output/receipt.json. */
+  receiptPath?: string;
+  /** @deprecated alias for receiptPath (legacy callers). */
+  receiptArtifactPath?: string;
+  completedAt?: string;
+};
+
+/** @deprecated legacy name retained for backward compatibility. */
+export type HybridPanelDispatchReceipt = HybridPanelOutcome;
+
+/**
+ * The exact panelOutcomes schema confirm_launch expects, surfaced verbatim when
+ * the parent submits an incomplete/missing batch so it can recover without
+ * wasting completed panel work.
+ */
+export const EXPECTED_PANEL_OUTCOMES_SCHEMA = {
+  field: "panelOutcomes",
+  cardinality: "array of up to 3 entries (one per native panel)",
+  entry: {
+    panelId: "required (e.g. fusion-panel-1)",
+    agentId: "required (usually identical to panelId)",
+    status: "required: completed | failed",
+    sessionId: "optional (include only when the host exposes it)",
+    taskId: "optional (include only when the host exposes it)",
+    taskResultSummary: "recommended: the actual returned Task result summary",
+    candidateWorkspace: "required: absolute candidate workspace path",
+    canonicalTaskHash: "recommended: the run canonical task hash",
+    receiptPath: "optional: <candidate>/.fusion-panel-output/receipt.json",
+  },
+} as const;
+
+export const AWAITING_NATIVE_PANEL_OUTCOMES = "AWAITING_NATIVE_PANEL_OUTCOMES" as const;
+
+/**
+ * Lifecycle-only confirm_launch status. Panel evidence is owned by collect.
+ */
+export type HybridConfirmStatus = "LAUNCH_CONFIRMED" | "MAIN_PROCESS_UNAVAILABLE";
+
+export type HybridBeginWaveResult = {
+  runId: string;
+  registered: true;
+  phase: SupervisorState["phase"];
+  dispatchRequestedAt: string;
+  expectedPanelAgentIds: string[];
+  registrationElapsedMs: number;
+  registrationDeadlineMs: number;
+  panels: Array<{ logicalPanelIndex: number; agentId: string; nativeWaveStage: NativeWaveStage }>;
+};
+
+/**
+ * Stage 2 (foreground): register the native panel dispatch wave. The parent
+ * calls this IMMEDIATELY before dispatching the three Task subagents. It records
+ * the dispatch-requested time and the expected panel agent IDs, marks the panels
+ * `dispatch_requested`, and enforces the native-dispatch REGISTRATION deadline —
+ * measured only from the main spawn to this call, never spanning panel execution.
+ * It never claims a fake session ID or a fake running state.
+ */
+export async function hybridBeginNativeWave(
+  args: { runId: string; expectedPanelAgentIds?: string[]; dispatchRequestedAt?: string },
+  deps: SupervisorDeps,
+): Promise<HybridBeginWaveResult> {
+  assertValidFusionRunId(args.runId);
+  const now = deps.now ?? Date.now;
+  const state = await loadSupervisorState(deps.cwd, args.runId, deps.traceDir);
+  if (!state) throw new Error(`No supervisor state for run ${args.runId}.`);
+
+  const mainWorker = state.workers[WORKER_ID.main];
+  const panelWorkers: WorkerRecord[] = [1, 2, 3].map((i) => state.workers[WORKER_ID.panel(i)]);
+
+  if (mainWorker.pid === undefined) {
+    throw new Error("FUSION_SUPERVISOR_LAUNCH_FAILED: external main builder has no PID at begin_native_wave");
+  }
+
+  const timing = readRunTiming(state, deps);
+  const mainSpawnedMs = mainWorker.spawnedAt
+    ? new Date(mainWorker.spawnedAt).getTime()
+    : mainWorker.launchRequestedAt
+      ? new Date(mainWorker.launchRequestedAt).getTime()
+      : now();
+  const elapsed = now() - mainSpawnedMs;
+  if (elapsed > timing.nativeDispatchRegistrationDeadlineMs) {
+    await hybridCancelInternal(
+      state,
+      deps,
+      now,
+      `native dispatch registration deadline exceeded (${elapsed}ms > ${timing.nativeDispatchRegistrationDeadlineMs}ms)`,
+    );
+    throw new Error(
+      `FUSION_SUPERVISOR_LAUNCH_FAILED: native dispatch registration deadline fired after ${elapsed}ms ` +
+        `(deadline ${timing.nativeDispatchRegistrationDeadlineMs}ms); the parent did not begin the panel wave in time`,
+    );
+  }
+
+  const dispatchRequestedAt = args.dispatchRequestedAt ?? nowIso(now);
+  const expectedPanelAgentIds =
+    args.expectedPanelAgentIds && args.expectedPanelAgentIds.length > 0
+      ? args.expectedPanelAgentIds
+      : panelWorkers.map((w) => w.agentId ?? w.workerId);
+  state.nativeWave = {
+    registrationDeadlineMs: timing.nativeDispatchRegistrationDeadlineMs,
+    dispatchRequestedAt,
+    registeredAt: nowIso(now),
+    registrationElapsedMs: elapsed,
+    registeredVia: "begin_native_wave",
+    expectedPanelAgentIds,
+  };
+
+  for (const worker of panelWorkers) {
+    if (isTerminalWorkerStatus(worker.status)) continue;
+    worker.dispatchRequestedAt = dispatchRequestedAt;
+    worker.dispatchMechanism = NATIVE_TASK_DISPATCH_MECHANISM;
+    worker.nativeWaveStage = "dispatch_requested";
+    // Intentionally do NOT transition to "running" and do NOT set a sessionId:
+    // there is no host-observable running evidence yet.
+  }
+  await writeSupervisorState(state, deps.cwd, deps.traceDir);
+
+  return {
+    runId: state.runId,
+    registered: true,
+    phase: state.phase,
+    dispatchRequestedAt,
+    expectedPanelAgentIds,
+    registrationElapsedMs: elapsed,
+    registrationDeadlineMs: timing.nativeDispatchRegistrationDeadlineMs,
+    panels: panelWorkers.map((w) => ({
+      logicalPanelIndex: w.logicalPanelIndex as number,
+      agentId: w.agentId ?? w.workerId,
+      nativeWaveStage: w.nativeWaveStage ?? "dispatch_requested",
+    })),
+  };
+}
+
+export type HybridConfirmResult = {
+  runId: string;
+  confirmed: boolean;
+  /** Lifecycle acknowledgement only — panel evidence is owned by collect. */
+  status: HybridConfirmStatus;
+  nextStage: "collect";
+  main: { pid?: number; status: WorkerRecord["status"]; spawnedAt?: string };
+  panels: Array<{
+    logicalPanelIndex: number;
+    sessionId?: string;
+    status: WorkerRecord["status"];
+    nativeWaveStage?: NativeWaveStage;
+    dispatchedAt?: string;
+  }>;
+  /** Optional enrichment count when the parent supplied panelOutcomes. */
+  panelOutcomesReceived: number;
+  waveDispatchedAt?: string;
+  waveReturnedAt: string;
+  blockingReason?: string;
+  phase: SupervisorState["phase"];
+};
+
+/**
+ * Stage 3 (lifecycle acknowledgement): called AFTER the blocking native Task
+ * calls return. Records that the external main PID exists (or has a known
+ * terminal state), that the native wave was dispatched, and that the parent
+ * returned from the blocking Task wave. Optionally merges panelOutcomes when
+ * supplied. Never gates panel evidence — collect owns inspection.
+ */
+export async function hybridConfirmLaunch(
+  args: {
+    runId: string;
+    panelOutcomes?: HybridPanelOutcome[];
+    /** @deprecated legacy alias for panelOutcomes. */
+    panelDispatches?: HybridPanelOutcome[];
+    waveDispatchedAt?: string;
+  },
+  deps: SupervisorDeps,
+): Promise<HybridConfirmResult> {
+  assertValidFusionRunId(args.runId);
+  const now = deps.now ?? Date.now;
+  const state = await loadSupervisorState(deps.cwd, args.runId, deps.traceDir);
+  if (!state) throw new Error(`No supervisor state for run ${args.runId}.`);
+
+  const mainWorker = state.workers[WORKER_ID.main];
+  const panelWorkers: WorkerRecord[] = [1, 2, 3].map((i) => state.workers[WORKER_ID.panel(i)]);
+  const runDir = supervisorRunDir(deps.cwd, state.runId, deps.traceDir);
+  const waveDispatchedAt =
+    state.nativeWave?.dispatchRequestedAt ?? args.waveDispatchedAt ?? nowIso(now);
+  const waveReturnedAt = nowIso(now);
+  const outcomes = args.panelOutcomes ?? args.panelDispatches ?? [];
+
+  await writeRunJsonArtifact(runDir, "confirm-launch-input.json", {
+    runId: args.runId,
+    waveDispatchedAt,
+    panelOutcomes: args.panelOutcomes,
+    panelDispatches: args.panelDispatches,
+    receivedAt: waveReturnedAt,
+    schemaPanelOutcomesSupported: true,
+  });
+
+  const mainUnavailable =
+    mainWorker.pid === undefined ||
+    (mainWorker.status === "running" && mainWorker.pid !== undefined && !isPidAlive(mainWorker.pid));
+  if (mainUnavailable) {
+    const result: HybridConfirmResult = {
+      runId: state.runId,
+      confirmed: false,
+      status: "MAIN_PROCESS_UNAVAILABLE",
+      nextStage: "collect",
+      panelOutcomesReceived: outcomes.length,
+      waveDispatchedAt,
+      waveReturnedAt,
+      main: { pid: mainWorker.pid, status: mainWorker.status, spawnedAt: mainWorker.spawnedAt },
+      panels: panelWorkers.map((w) => ({
+        logicalPanelIndex: w.logicalPanelIndex as number,
+        sessionId: w.sessionId,
+        status: w.status,
+        nativeWaveStage: w.nativeWaveStage,
+        dispatchedAt: w.dispatchedAt,
+      })),
+      blockingReason:
+        mainWorker.pid === undefined
+          ? "external main builder has no PID at confirm_launch"
+          : "external main builder PID is no longer alive",
+      phase: state.phase,
+    };
+    await writeRunJsonArtifact(runDir, "confirm-launch-result.json", result);
+    return result;
+  }
+
+  if (!state.nativeWave?.dispatchRequestedAt) {
+    state.nativeWave = {
+      registrationDeadlineMs:
+        state.nativeWave?.registrationDeadlineMs ?? readRunTiming(state, deps).nativeDispatchRegistrationDeadlineMs,
+      dispatchRequestedAt: waveDispatchedAt,
+      registeredAt: waveReturnedAt,
+      registeredVia: "confirm_launch_implicit",
+      expectedPanelAgentIds:
+        state.nativeWave?.expectedPanelAgentIds ?? panelWorkers.map((w) => w.agentId ?? w.workerId),
+    };
+  }
+
+  state.nativeWave = {
+    ...state.nativeWave!,
+    parentWaveReturned: true,
+    waveReturnedAt,
+    confirmPanelOutcomesReceived: outcomes.length,
+    lastConfirmAt: waveReturnedAt,
+  };
+
+  const byIndex = new Map<number, HybridPanelOutcome>();
+  for (const outcome of outcomes) {
+    const index = resolveOutcomeIndex(outcome);
+    if (index !== undefined) byIndex.set(index, outcome);
+  }
+  for (const worker of panelWorkers) {
+    worker.dispatchRequestedAt = worker.dispatchRequestedAt ?? waveDispatchedAt;
+    worker.dispatchedAt = worker.dispatchedAt ?? waveDispatchedAt;
+    worker.dispatchMechanism = NATIVE_TASK_DISPATCH_MECHANISM;
+    worker.nativeWaveStage = worker.nativeWaveStage ?? "completed";
+    const dispatch = byIndex.get(worker.logicalPanelIndex as 1 | 2 | 3);
+    if (dispatch) {
+      await reconcileNativePanelEvidence(state, worker, dispatch, waveDispatchedAt, now);
+    }
+  }
+
+  computeLaunchVerdict(state, panelWorkers);
+  state.phase = "workers_running";
+  await writeSupervisorState(state, deps.cwd, deps.traceDir);
+
+  const result: HybridConfirmResult = {
+    runId: state.runId,
+    confirmed: true,
+    status: "LAUNCH_CONFIRMED",
+    nextStage: "collect",
+    panelOutcomesReceived: outcomes.length,
+    waveDispatchedAt,
+    waveReturnedAt,
+    main: { pid: mainWorker.pid, status: mainWorker.status, spawnedAt: mainWorker.spawnedAt },
+    panels: panelWorkers.map((w) => ({
+      logicalPanelIndex: w.logicalPanelIndex as number,
+      sessionId: w.sessionId,
+      status: w.status,
+      nativeWaveStage: w.nativeWaveStage,
+      dispatchedAt: w.dispatchedAt,
+    })),
+    phase: state.phase,
+  };
+  await writeRunJsonArtifact(runDir, "confirm-launch-result.json", result);
+  return result;
+}
+
+/** Detect and record an external-main terminal state from real process + artifact evidence. */
+async function reconcileMainTerminal(state: SupervisorState, deps: SupervisorDeps, now: () => number): Promise<void> {
+  const main = state.workers[WORKER_ID.main];
+  if (isTerminalWorkerStatus(main.status)) return;
+  const entry = mainProcessRegistry.get(state.runId);
+  const processGone = entry ? entry.exited : main.pid !== undefined && !isPidAlive(main.pid);
+  if (!processGone) {
+    // Hard timeout safety even while the parent is polling.
+    const spawnedMs = main.spawnedAt ? new Date(main.spawnedAt).getTime() : now();
+    if (now() - spawnedMs >= main.hardTimeoutMs) {
+      main.timedOutReason = `hard timeout after ${main.hardTimeoutMs}ms with no terminal exit`;
+      main.endedAt = nowIso(now);
+      transitionWorker(main, "timed_out", main.endedAt, main.timedOutReason);
+      mainProcessRegistry.get(state.runId)?.handle.kill("SIGTERM");
+    }
+    return;
+  }
+  const at = nowIso(now);
+  main.endedAt = at;
+  main.terminalAt = at;
+  const result = await readResultArtifact(main.resultArtifactPath);
+  if (result) main.result = result;
+  await enforceMainModelMatch(main);
+  if (main.status === "failed" || main.status === "timed_out") return;
+  const failed = (main.exitCode ?? (entry?.exit?.code ?? 1)) !== 0 || result?.status === "failed";
+  transitionWorker(main, failed ? "failed" : "completed", at, result?.errorSummary);
+}
+
+export type HybridCollectResult = {
+  runId: string;
+  phase: SupervisorState["phase"];
+  main: { status: WorkerRecord["status"]; promoted: boolean; promotionStatus?: string; promotionDetail?: string };
+  panels: Array<{
+    logicalPanelIndex: number;
+    status: WorkerRecord["status"];
+    classification?: string;
+    evidenceStatus?: PanelEvidenceReport["reconciledStatus"];
+  }>;
+  allPanelsTerminal: boolean;
+  allPanelsClassified: boolean;
+  awaitingPanelIndexes: number[];
+  panelEvidenceReportDir: string;
+  judge:
+    | { eligible: false; reason: string }
+    | {
+        eligible: true;
+        manifestPath: string;
+        usablePanelIndexes: number[];
+        dispatch: {
+          agentId: string;
+          configuredModelId: string;
+          description: string;
+          resultArtifactPath: string;
+          instructionArtifactPath: string;
+          contractPath: string;
+          prompt: string;
+        };
+      };
+};
+
+/**
+ * Stage 4 (foreground): ingest panel results, inspect registered candidate
+ * workspaces, reconcile the external main terminal + promotion, classify panels,
+ * and — when the promoted main baseline, the returned native wave, and all panel
+ * evidence reports are terminal — return the native judge dispatch spec.
+ */
+export async function hybridCollect(
+  args: { runId: string; panelResults?: NativePanelResultInput[] },
+  deps: SupervisorDeps,
+): Promise<HybridCollectResult> {
+  assertValidFusionRunId(args.runId);
+  const now = deps.now ?? Date.now;
+  const state = await loadSupervisorState(deps.cwd, args.runId, deps.traceDir);
+  if (!state) throw new Error(`No supervisor state for run ${args.runId}.`);
+
+  const panelWorkers: WorkerRecord[] = [1, 2, 3].map((i) => state.workers[WORKER_ID.panel(i)]);
+  const resultsByIndex = new Map<number, NativePanelResultInput>();
+  for (const entry of args.panelResults ?? []) {
+    const match = panelWorkers.find(
+      (w) => w.agentId === entry.agentName || w.workerId === entry.agentName,
+    );
+    if (match?.logicalPanelIndex) resultsByIndex.set(match.logicalPanelIndex, entry);
+  }
+
+  for (const worker of panelWorkers) {
+    if (isTerminalWorkerStatus(worker.status)) {
+      if (!worker.result) worker.result = await readResultArtifact(worker.resultArtifactPath);
+      continue;
+    }
+    const at = nowIso(now);
+    const artifact = await readResultArtifact(worker.resultArtifactPath);
+    const reported = resultsByIndex.get(worker.logicalPanelIndex as number);
+    if (artifact) {
+      worker.result = artifact;
+      worker.terminalAt = at;
+      worker.endedAt = at;
+      transitionWorker(worker, artifact.status === "failed" ? "failed" : "completed", at, artifact.errorSummary);
+    } else if (reported) {
+      worker.terminalAt = at;
+      worker.endedAt = at;
+      if (reported.error) {
+        transitionWorker(worker, "failed", at, reported.error);
+      } else {
+        transitionWorker(worker, "completed", at);
+      }
+    } else {
+      // Still running; apply the panel hard timeout from the dispatch time.
+      const startedMs = worker.dispatchedAt ? new Date(worker.dispatchedAt).getTime() : now();
+      if (now() - startedMs >= worker.hardTimeoutMs) {
+        worker.timedOutReason = `hard timeout after ${worker.hardTimeoutMs}ms with no terminal native result`;
+        worker.endedAt = at;
+        worker.terminalAt = at;
+        transitionWorker(worker, "timed_out", at, worker.timedOutReason);
+      }
+    }
+  }
+  for (const worker of panelWorkers) syncPanelWaveStage(worker);
+
+  await reconcileMainTerminal(state, deps, now);
+  if (isTerminalWorkerStatus(state.workers[WORKER_ID.main].status)) {
+    await deriveMainTerminalEvidence(state, state.workers[WORKER_ID.main], now);
+    await promoteMainCandidate(state, deps, now);
+  }
+
+  const allPanelsTerminal = panelWorkers.every((w) => isTerminalWorkerStatus(w.status));
+  if (allPanelsTerminal) {
+    await classifyPanels(state);
+  }
+
+  const waveDispatchedAt = state.nativeWave?.dispatchRequestedAt ?? nowIso(now);
+  for (const worker of panelWorkers) {
+    await reconcileNativePanelEvidence(state, worker, undefined, waveDispatchedAt, now);
+  }
+
+  computeLaunchVerdict(state, panelWorkers);
+
+  const harvest = await harvestPanelEvidence(state, deps.cwd, deps.traceDir, now);
+  const evidenceByIndex = new Map<number, PanelEvidenceReport>();
+  for (const report of harvest.reports) {
+    const index = resolvePanelIndexFromId(report.panelId);
+    if (index) evidenceByIndex.set(index, report);
+  }
+  const awaitingPanelIndexes = harvest.reports
+    .map((report, idx) => ({ index: (idx + 1) as 1 | 2 | 3, status: report.reconciledStatus }))
+    .filter((entry) => entry.status === "awaiting")
+    .map((entry) => entry.index);
+  const allPanelsClassified = harvest.reports.every((report) => report.reconciledStatus !== "awaiting");
+
+  const main = state.workers[WORKER_ID.main];
+  const mainTerminal = isTerminalWorkerStatus(main.status);
+  const mainPromoted = state.mainPromotion.status === "promoted";
+  const waveReturned = Boolean(state.nativeWave?.parentWaveReturned);
+
+  let judge: HybridCollectResult["judge"] = { eligible: false, reason: "" };
+  if (!waveReturned) {
+    judge = { eligible: false, reason: "native Task wave has not returned (confirm_launch not recorded)" };
+  } else if (!mainTerminal) {
+    judge = { eligible: false, reason: `main builder still ${main.status}` };
+  } else if (!mainPromoted) {
+    judge = {
+      eligible: false,
+      reason: `main candidate not promoted (status=${state.mainPromotion.status ?? "pending"}: ${state.mainPromotion.detail ?? "n/a"})`,
+    };
+  } else if (!allPanelsClassified) {
+    judge = { eligible: false, reason: `awaiting panel evidence for panel(s) ${awaitingPanelIndexes.join(", ")}` };
+  } else {
+    const usable = usablePanelIndexesFromEvidence(harvest.reports);
+    state.phase = "judge";
+    state.judge.eligibleAt = nowIso(now);
+    state.judge.usablePanelIndexes = usable;
+    state.judge.excludedPanelIndexes = [1, 2, 3].filter((index) => !usable.includes(index));
+    const manifestPath = await writeJudgeManifest(state, deps);
+      state.judge.manifestPath = manifestPath;
+      const runDir = supervisorRunDir(deps.cwd, state.runId, deps.traceDir);
+      const contractPath = path.join(runDir, "merge-patch-contract.md");
+      const existingJudge = state.workers[WORKER_ID.judge];
+      const judgeWorker =
+        existingJudge ??
+        makeWorkerRecord({
+          workerId: WORKER_ID.judge,
+          role: "judge",
+          executionKind: "native_subagent",
+          modelSpec: { modelId: state.judgeModelId },
+          workspacePath: state.sourceWorkspace,
+          taskArtifactPath: state.taskArtifactPath,
+          taskArtifactHash: state.taskArtifactHash,
+          runDir,
+          softMs: resolveTimeouts(deps.timeouts).judgeSoftSuspectMs,
+          hardMs: resolveTimeouts(deps.timeouts).judgeHardTimeoutMs,
+          agentId: FUSION_AGENT_NAMES.judge,
+        });
+      const judgePrompt = buildHybridJudgeDispatchPrompt({
+        manifestPath,
+        resultArtifactPath: judgeWorker.resultArtifactPath,
+        sourceWorkspace: state.sourceWorkspace,
+        contractPath,
+      });
+      await writeFile(judgeWorker.instructionArtifactPath, judgePrompt, "utf8");
+      state.workers[judgeWorker.workerId] = judgeWorker;
+      state.judge.contractPath = contractPath;
+      const dispatchModelId = judgeWorker.configuredModelId ?? judgeWorker.modelId;
+      if (!deps.skipNativeAgentValidation) {
+        const agentFileJudgeModelId = (await readNativeJudgeAgentModel(deps.agentDir)) ?? "";
+        assertJudgeDispatchModelConsistency({
+          configuredJudgeModelId: state.judgeModelId,
+          agentFileJudgeModelId,
+          dispatchJudgeModelId: dispatchModelId,
+        });
+      }
+      judge = {
+        eligible: true,
+        manifestPath,
+        usablePanelIndexes: usable,
+        dispatch: {
+          agentId: judgeWorker.agentId ?? FUSION_AGENT_NAMES.judge,
+          configuredModelId: dispatchModelId,
+          description: "Fusion Judge",
+          resultArtifactPath: judgeWorker.resultArtifactPath,
+          instructionArtifactPath: judgeWorker.instructionArtifactPath,
+          contractPath,
+          prompt: judgePrompt,
+        },
+      };
+  }
+
+  await writeSupervisorState(state, deps.cwd, deps.traceDir);
+
+  return {
+    runId: state.runId,
+    phase: state.phase,
+    main: {
+      status: main.status,
+      promoted: mainPromoted,
+      promotionStatus: state.mainPromotion.status,
+      promotionDetail: state.mainPromotion.detail,
+    },
+    panels: panelWorkers.map((w) => ({
+      logicalPanelIndex: w.logicalPanelIndex as number,
+      status: w.status,
+      classification: w.candidate?.classification,
+      evidenceStatus: evidenceByIndex.get(w.logicalPanelIndex as number)?.reconciledStatus,
+    })),
+    allPanelsTerminal,
+    allPanelsClassified,
+    awaitingPanelIndexes,
+    panelEvidenceReportDir: harvest.reportDir,
+    judge,
+  };
+}
+
+export type HybridFinalizeResult = {
+  runId: string;
+  phase: SupervisorState["phase"];
+  decision?: "PATCH_REQUIRED" | "NO_PATCH_REQUIRED";
+  contractPath?: string;
+  appliedPatchItems?: JudgeStageTrace["appliedPatchItems"];
+  finalVerification?: SupervisorState["finalVerification"];
+  abortReason?: string;
+};
+
+/**
+ * Stage 4 (foreground): record the native judge subagent's terminal result
+ * (from its result artifact and/or the model-reported output) and finalize.
+ */
+export async function hybridFinalize(
+  args: {
+    runId: string;
+    judgeSessionId?: string;
+    judgeTaskId?: string;
+    judgeOutput?: string;
+    judgeError?: string;
+  },
+  deps: SupervisorDeps,
+): Promise<HybridFinalizeResult> {
+  assertValidFusionRunId(args.runId);
+  const now = deps.now ?? Date.now;
+  const state = await loadSupervisorState(deps.cwd, args.runId, deps.traceDir);
+  if (!state) throw new Error(`No supervisor state for run ${args.runId}.`);
+
+  const judge = state.workers[WORKER_ID.judge];
+  if (!judge) {
+    throw new Error("FUSION_HYBRID_FINALIZE_FAILED: judge was never dispatched (call collect until eligible first)");
+  }
+  const at = nowIso(now);
+  if (args.judgeSessionId) judge.sessionId = args.judgeSessionId;
+  judge.terminalAt = at;
+  judge.endedAt = at;
+  const result = await readResultArtifact(judge.resultArtifactPath);
+  if (result) judge.result = result;
+  if (args.judgeError && !result) {
+    transitionWorker(judge, "failed", at, args.judgeError);
+  } else {
+    transitionWorker(judge, result?.status === "failed" ? "failed" : "completed", at, result?.errorSummary);
+  }
+
+  state.judge.completedAt = at;
+  state.nativeJudge = {
+    sessionId: judge.sessionId,
+    agentId: judge.agentId ?? FUSION_AGENT_NAMES.judge,
+    configuredModelId: judge.configuredModelId ?? judge.modelId,
+    dispatchRequestedAt: judge.dispatchRequestedAt,
+    dispatchedAt: judge.dispatchedAt,
+    terminalAt: judge.terminalAt,
+    status: judge.status,
+    mergePatchContractPath: result?.contractPath ?? state.judge.contractPath,
+  };
+
+  if (judge.status !== "completed" || !result) {
+    state.phase = "aborted";
+    state.abortReason = args.judgeError ?? "judge failed or produced no result artifact";
+    await writeSupervisorState(state, deps.cwd, deps.traceDir);
+    return { runId: state.runId, phase: state.phase, abortReason: state.abortReason };
+  }
+
+  const decision = result.mergePatchDecision;
+  const contractExists = Boolean(result.contractPath) && (await pathExists(result.contractPath!));
+  if (!decision || !contractExists) {
+    state.phase = "aborted";
+    state.abortReason = decision
+      ? "judge succeeded but did not write a Merge Patch Contract artifact"
+      : "judge succeeded but did not return a mergePatchDecision";
+    await writeSupervisorState(state, deps.cwd, deps.traceDir);
+    return { runId: state.runId, phase: state.phase, abortReason: state.abortReason };
+  }
+
+  state.judge.decision = decision;
+  state.judge.contractPath = result.contractPath;
+  const appliedItems = (result as Record<string, unknown>).appliedPatchItems as
+    | JudgeStageTrace["appliedPatchItems"]
+    | undefined;
+  if (appliedItems) state.judge.appliedPatchItems = appliedItems;
+  if (result.verification) state.finalVerification = result.verification;
+  state.nativeJudge.appliedPatchSummary = appliedItems
+    ? appliedItems.map((item) => `${item.severity}:${item.title}:${item.status}`).join("; ")
+    : "no patch items reported";
+
+  state.phase = "done";
+  mainProcessRegistry.delete(state.runId);
+  await writeSupervisorState(state, deps.cwd, deps.traceDir);
+  return {
+    runId: state.runId,
+    phase: state.phase,
+    decision,
+    contractPath: result.contractPath,
+    appliedPatchItems: state.judge.appliedPatchItems,
+    finalVerification: state.finalVerification,
+  };
+}
+
+async function hybridCancelInternal(
+  state: SupervisorState,
+  deps: SupervisorDeps,
+  now: () => number,
+  reason: string,
+): Promise<void> {
+  const at = nowIso(now);
+  const main = state.workers[WORKER_ID.main];
+  const entry = mainProcessRegistry.get(state.runId);
+
+  // Truthfully reconcile/terminate the external main process before final
+  // failure so a launch/confirm failure never leaves an orphan main worker.
+  let mainProcessOutcome: SupervisorCancellationOutcome;
+  if (entry) {
+    if (entry.exited) {
+      mainProcessOutcome = "already_exited";
+    } else {
+      try {
+        entry.handle.kill("SIGTERM");
+        mainProcessOutcome = "terminated";
+      } catch {
+        mainProcessOutcome = "already_exited";
+      }
+    }
+  } else if (main.pid !== undefined && isPidAlive(main.pid)) {
+    try {
+      process.kill(main.pid, "SIGTERM");
+      mainProcessOutcome = "terminated";
+    } catch {
+      mainProcessOutcome = "left_running";
+    }
+  } else if (main.pid !== undefined) {
+    mainProcessOutcome = "already_exited";
+  } else {
+    mainProcessOutcome = "no_handle";
+  }
+  mainProcessRegistry.delete(state.runId);
+
+  for (const worker of Object.values(state.workers)) {
+    if (!isTerminalWorkerStatus(worker.status)) {
+      worker.endedAt = at;
+      worker.terminalAt = at;
+      transitionWorker(worker, "cancelled", at, reason);
+      if (worker.executionKind === "native_subagent") worker.nativeWaveStage = "failed";
+    }
+  }
+  state.phase = "cancelled";
+  state.abortReason = reason;
+  state.cancellation = {
+    reason,
+    at,
+    mainProcessOutcome,
+    mainPid: main.pid,
+    cleanedUp: mainProcessOutcome !== "left_running",
+  };
+  await writeSupervisorState(state, deps.cwd, deps.traceDir);
+}
+
+/** Cancel a run: terminate the external main process and mark live workers cancelled. */
+export async function hybridCancel(
+  args: { runId: string; reason?: string },
+  deps: SupervisorDeps,
+): Promise<{ runId: string; phase: SupervisorState["phase"] }> {
+  assertValidFusionRunId(args.runId);
+  const now = deps.now ?? Date.now;
+  const state = await loadSupervisorState(deps.cwd, args.runId, deps.traceDir);
+  if (!state) throw new Error(`No supervisor state for run ${args.runId}.`);
+  await hybridCancelInternal(state, deps, now, args.reason ?? "cancelled by request");
+  return { runId: state.runId, phase: state.phase };
 }

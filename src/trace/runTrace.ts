@@ -12,6 +12,14 @@ import type { ContextBundle } from "../types.js";
 export const DEFAULT_TRACE_DIR = ".opencode/fusion-runs";
 export const LATEST_TRACE_POINTER = "latest-run.json";
 
+/** Normalize trace roots so runs never land at `<cwd>/<runId>` by accident. */
+export function normalizeTraceDir(traceDir?: string): string {
+  if (!traceDir) return DEFAULT_TRACE_DIR;
+  const trimmed = traceDir.trim();
+  if (!trimmed || trimmed === "." || trimmed === "./") return DEFAULT_TRACE_DIR;
+  return trimmed;
+}
+
 export function createRunId(now = new Date()): string {
   const stamp = [
     now.getFullYear(),
@@ -41,7 +49,7 @@ export function createRecoveredRunId(now = new Date()): string {
 }
 
 export function resolveTraceRoot(cwd: string, traceDir?: string): string {
-  return path.resolve(cwd, traceDir ?? DEFAULT_TRACE_DIR);
+  return path.resolve(cwd, normalizeTraceDir(traceDir));
 }
 
 export function detectGuidanceSections(text: string): {

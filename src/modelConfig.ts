@@ -1,4 +1,5 @@
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { DEFAULT_JUDGE_MODEL, DEFAULT_PANEL_MODELS } from "./config.js";
@@ -10,8 +11,11 @@ import {
   normalizeModelSpecEntry,
   parseModelSpec,
   toModelSpec,
+  validateModelId,
   type FusionModelSpec,
 } from "./modelSpec.js";
+
+export const CANONICAL_MODEL_CONFIG_VERSION = 1;
 
 export const SAVED_MODEL_CONFIG_PATH = path.join(
   homedir(),
@@ -20,16 +24,32 @@ export const SAVED_MODEL_CONFIG_PATH = path.join(
   "fusion-council-models.json",
 );
 
-export type SavedModelConfig = {
+export function resolveModelConfigPath(): string {
+  if (process.env.FUSION_COUNCIL_MODELS_CONFIG_PATH) {
+    return process.env.FUSION_COUNCIL_MODELS_CONFIG_PATH;
+  }
+  if (process.env.FUSION_OPENCODE_CONFIG_DIR) {
+    return path.join(process.env.FUSION_OPENCODE_CONFIG_DIR, "fusion-council-models.json");
+  }
+  return SAVED_MODEL_CONFIG_PATH;
+}
+
+export type CanonicalModelConfig = {
+  version: number;
   panelModels: FusionModelSpec[];
   judgeModel: FusionModelSpec;
+  fingerprint: string;
   updatedAt: string;
 };
+
+/** @deprecated Use CanonicalModelConfig */
+export type SavedModelConfig = CanonicalModelConfig;
 
 export type ResolvedModels = {
   panelModels: FusionModelSpec[];
   judgeModel: FusionModelSpec;
-  source: "explicit" | "saved" | "default";
+  fingerprint: string;
+  source: "saved" | "bootstrap";
 };
 
 export {
@@ -49,6 +69,22 @@ export function getDefaultJudgeModelSpec(): FusionModelSpec {
   return { modelId: DEFAULT_JUDGE_MODEL };
 }
 
+export function computeModelConfigFingerprint(input: {
+  version?: number;
+  panelModels: FusionModelSpec[];
+  judgeModel: FusionModelSpec;
+}): string {
+  const payload = {
+    version: input.version ?? CANONICAL_MODEL_CONFIG_VERSION,
+    panelModels: input.panelModels.map((spec) => formatModelSpecExact(spec)),
+    judgeModel: formatModelSpecExact(input.judgeModel),
+  };
+  return createHash("sha256")
+    .update(JSON.stringify(payload), "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
 export function parseModelArgs(raw: string): {
   panelModels: FusionModelSpec[];
   judgeModel: FusionModelSpec;
@@ -66,102 +102,149 @@ export function parseModelArgs(raw: string): {
   return { panelModels: specs.slice(0, 3), judgeModel: specs[3] };
 }
 
-function normalizeSavedConfig(data: unknown): SavedModelConfig | null {
+function normalizeCanonicalConfig(data: unknown): CanonicalModelConfig | null {
   if (!data || typeof data !== "object") return null;
   const record = data as Record<string, unknown>;
   if (!Array.isArray(record.panelModels) || record.judgeModel == null) return null;
+  const panelModels = record.panelModels.map((entry) => normalizeModelSpecEntry(entry));
+  const judgeModel = normalizeModelSpecEntry(record.judgeModel);
+  const version = typeof record.version === "number" ? record.version : CANONICAL_MODEL_CONFIG_VERSION;
+  const fingerprint =
+    typeof record.fingerprint === "string" && record.fingerprint.length > 0
+      ? record.fingerprint
+      : computeModelConfigFingerprint({ version, panelModels, judgeModel });
   return {
-    panelModels: record.panelModels.map((entry) => normalizeModelSpecEntry(entry)),
-    judgeModel: normalizeModelSpecEntry(record.judgeModel),
+    version,
+    panelModels,
+    judgeModel,
+    fingerprint,
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : new Date().toISOString(),
   };
 }
 
 export async function loadSavedModelConfig(
-  configPath = SAVED_MODEL_CONFIG_PATH,
-): Promise<SavedModelConfig | null> {
+  configPath = resolveModelConfigPath(),
+): Promise<CanonicalModelConfig | null> {
   try {
     const text = await readFile(configPath, "utf8");
-    return normalizeSavedConfig(JSON.parse(text));
+    return normalizeCanonicalConfig(JSON.parse(text));
   } catch {
     return null;
   }
 }
 
+async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(tmp, filePath);
+}
+
+export function buildCanonicalModelConfig(input: {
+  panelModels: FusionModelSpec[];
+  judgeModel: FusionModelSpec;
+  updatedAt?: string;
+}): CanonicalModelConfig {
+  const version = CANONICAL_MODEL_CONFIG_VERSION;
+  const fingerprint = computeModelConfigFingerprint({
+    version,
+    panelModels: input.panelModels,
+    judgeModel: input.judgeModel,
+  });
+  return {
+    version,
+    panelModels: input.panelModels,
+    judgeModel: input.judgeModel,
+    fingerprint,
+    updatedAt: input.updatedAt ?? new Date().toISOString(),
+  };
+}
+
 export async function saveSavedModelConfig(
   config: { panelModels: FusionModelSpec[]; judgeModel: FusionModelSpec },
-  configPath = SAVED_MODEL_CONFIG_PATH,
-): Promise<void> {
-  const dir = path.dirname(configPath);
-  await mkdir(dir, { recursive: true });
-  const data: SavedModelConfig = {
-    panelModels: config.panelModels,
-    judgeModel: config.judgeModel,
-    updatedAt: new Date().toISOString(),
-  };
-  await writeFile(configPath, JSON.stringify(data, null, 2), "utf8");
+  configPath = resolveModelConfigPath(),
+): Promise<CanonicalModelConfig> {
+  const data = buildCanonicalModelConfig(config);
+  await atomicWriteJson(configPath, data);
+  return data;
+}
+
+export async function bootstrapCanonicalModelConfig(
+  configPath = resolveModelConfigPath(),
+): Promise<CanonicalModelConfig> {
+  const existing = await loadSavedModelConfig(configPath);
+  if (existing) return existing;
+  return saveSavedModelConfig(
+    {
+      panelModels: getDefaultPanelModelSpecs(),
+      judgeModel: getDefaultJudgeModelSpec(),
+    },
+    configPath,
+  );
 }
 
 export async function resetSavedModelConfig(
-  configPath = SAVED_MODEL_CONFIG_PATH,
-): Promise<void> {
+  configPath = resolveModelConfigPath(),
+): Promise<CanonicalModelConfig> {
+  return saveSavedModelConfig(
+    {
+      panelModels: getDefaultPanelModelSpecs(),
+      judgeModel: getDefaultJudgeModelSpec(),
+    },
+    configPath,
+  );
+}
+
+/** @deprecated Config is never deleted; reset writes defaults instead. */
+export async function deleteSavedModelConfig(configPath = SAVED_MODEL_CONFIG_PATH): Promise<void> {
   try {
     await unlink(configPath);
   } catch {
-    // Already deleted or never existed — not an error.
+    // ignore
   }
 }
 
-function explicitPanelSpecs(panelModels?: string[]): FusionModelSpec[] | undefined {
-  if (panelModels == null || panelModels.length === 0) return undefined;
-  return panelModels.map((entry) => toModelSpec(entry));
-}
-
-function explicitJudgeSpec(judgeModel?: string): FusionModelSpec | undefined {
-  if (judgeModel == null || judgeModel === "") return undefined;
-  return toModelSpec(judgeModel);
-}
-
+/**
+ * Resolve panel/judge models exclusively from the canonical persisted config.
+ * Bootstraps defaults on first-ever use; never derives from agent files,
+ * manifests, environment, or launch arguments.
+ */
 export async function resolveModels(
-  explicit?: { panelModels?: string[]; judgeModel?: string },
-  configPath = SAVED_MODEL_CONFIG_PATH,
+  _explicit?: { panelModels?: string[]; judgeModel?: string },
+  configPath = resolveModelConfigPath(),
 ): Promise<ResolvedModels> {
-  const explicitPanels = explicitPanelSpecs(explicit?.panelModels);
-  const explicitJudge = explicitJudgeSpec(explicit?.judgeModel);
-  const hasExplicitPanel = explicitPanels != null;
-  const hasExplicitJudge = explicitJudge != null;
-
-  if (hasExplicitPanel && hasExplicitJudge) {
+  const existing = await loadSavedModelConfig(configPath);
+  if (existing) {
     return {
-      panelModels: explicitPanels,
-      judgeModel: explicitJudge,
-      source: "explicit",
-    };
-  }
-
-  const saved = await loadSavedModelConfig(configPath);
-  if (saved) {
-    return {
-      panelModels: hasExplicitPanel ? explicitPanels : saved.panelModels,
-      judgeModel: hasExplicitJudge ? explicitJudge : saved.judgeModel,
+      panelModels: existing.panelModels,
+      judgeModel: existing.judgeModel,
+      fingerprint: existing.fingerprint,
       source: "saved",
     };
   }
-
+  const bootstrapped = await saveSavedModelConfig(
+    {
+      panelModels: getDefaultPanelModelSpecs(),
+      judgeModel: getDefaultJudgeModelSpec(),
+    },
+    configPath,
+  );
   return {
-    panelModels: hasExplicitPanel ? explicitPanels : getDefaultPanelModelSpecs(),
-    judgeModel: hasExplicitJudge ? explicitJudge : getDefaultJudgeModelSpec(),
-    source: "default",
+    panelModels: bootstrapped.panelModels,
+    judgeModel: bootstrapped.judgeModel,
+    fingerprint: bootstrapped.fingerprint,
+    source: "bootstrap",
   };
 }
 
-export function formatSavedModelConfigMarkdown(saved: SavedModelConfig, sourceLabel: string): string {
+export function formatSavedModelConfigMarkdown(saved: CanonicalModelConfig, sourceLabel: string): string {
   const warnings = formatSuspiciousModelWarnings(saved.panelModels, saved.judgeModel);
   return [
     "## Fusion Council Model Config",
     `**Source:** ${sourceLabel}`,
     `**Config path:** ${SAVED_MODEL_CONFIG_PATH}`,
     saved.updatedAt ? `**Updated:** ${saved.updatedAt}` : undefined,
+    `**Config fingerprint:** ${saved.fingerprint}`,
     "",
     "Saved Fusion models:",
     ...formatExactModelSummary(saved.panelModels, saved.judgeModel),
@@ -181,12 +264,14 @@ export function formatSavedModelConfigMarkdown(saved: SavedModelConfig, sourceLa
 export function formatUpdatedModelConfigMarkdown(config: {
   panelModels: FusionModelSpec[];
   judgeModel: FusionModelSpec;
+  fingerprint: string;
 }): string {
   const warnings = formatSuspiciousModelWarnings(config.panelModels, config.judgeModel);
   return [
     "## Fusion Council Model Config Saved",
     "Fusion model config updated.",
     `**Config path:** ${SAVED_MODEL_CONFIG_PATH}`,
+    `**Config fingerprint:** ${config.fingerprint}`,
     "",
     "Saved Fusion models:",
     ...formatExactModelSummary(config.panelModels, config.judgeModel),
@@ -199,8 +284,41 @@ export function formatUpdatedModelConfigMarkdown(config: {
     ...warnings,
     warnings.length > 0 ? "" : undefined,
     MODEL_REGISTRY_DISCLAIMER,
+    "Restart OpenCode once so native agent definitions reload.",
     "Note: Model IDs are passed through to OpenCode exactly. Confirm with /models if provider errors occur.",
   ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+export type ModelSyncStatus = {
+  panelConfigured: string[];
+  panelInstalled: Array<string | undefined>;
+  judgeConfigured: string;
+  judgeInstalled: string | undefined;
+  configFingerprint: string;
+  agentFileFingerprint: string | undefined;
+  status: "synchronized" | "restart required" | "stale";
+};
+
+export function formatModelSyncStatusMarkdown(status: ModelSyncStatus): string {
+  const lines = [
+    "## Fusion Council Model Config",
+    "",
+    `Panel 1 configured model: ${status.panelConfigured[0] ?? "—"}`,
+    `Panel 1 installed agent-file model: ${status.panelInstalled[0] ?? "—"}`,
+    `Panel 2 configured model: ${status.panelConfigured[1] ?? "—"}`,
+    `Panel 2 installed agent-file model: ${status.panelInstalled[1] ?? "—"}`,
+    `Panel 3 configured model: ${status.panelConfigured[2] ?? "—"}`,
+    `Panel 3 installed agent-file model: ${status.panelInstalled[2] ?? "—"}`,
+    `Judge configured model: ${status.judgeConfigured}`,
+    `Judge installed agent-file model: ${status.judgeInstalled ?? "—"}`,
+    `Config fingerprint: ${status.configFingerprint}`,
+    `Agent-file fingerprint: ${status.agentFileFingerprint ?? "—"}`,
+    `Status: ${status.status}`,
+  ];
+  if (status.status !== "synchronized") {
+    lines.push("", "Restart OpenCode once after `/fusion-model` changes agent files.");
+  }
+  return lines.join("\n");
 }
 
 function formatExactModelSummary(panelModels: FusionModelSpec[], judgeModel: FusionModelSpec): string[] {

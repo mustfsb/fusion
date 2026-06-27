@@ -2,14 +2,8 @@ import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { resolveTraceRoot } from "../trace/runTrace.js";
 import { assertValidFusionRunId } from "./runLocator.js";
+import { upsertRunRegistry } from "./runRegistry.js";
 import type { SupervisorState, WorkerRecord, WorkerStatus } from "./supervisorTypes.js";
-
-/**
- * Durable persistence for the detached supervisor. State is the single source
- * of truth that survives parent/orchestrator session closure, OpenCode restart,
- * and plugin reload. Writes are atomic (temp + rename) so a crash mid-write
- * never corrupts the run.
- */
 
 export const SUPERVISOR_STATE_FILENAME = "supervisor-state.json";
 
@@ -40,6 +34,18 @@ export async function writeSupervisorState(
   const tmp = `${filePath}.${process.pid}.${stateWriteCounter}.${Math.random().toString(36).slice(2)}.tmp`;
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
   await rename(tmp, filePath);
+  // Keep the durable, workspace-independent run registry pointed at this run so
+  // /fusion-trace can locate it by ID regardless of the active directory.
+  await upsertRunRegistry({
+    runId: state.runId,
+    runDir: path.dirname(filePath),
+    cwd: path.resolve(cwd),
+    traceDir,
+    sourceWorkspace: state.sourceWorkspace,
+    phase: state.phase,
+    strategy: state.strategy,
+    updatedAt: state.updatedAt,
+  });
   return filePath;
 }
 
@@ -48,12 +54,20 @@ export async function loadSupervisorState(
   runId: string,
   traceDir?: string,
 ): Promise<SupervisorState | undefined> {
-  try {
-    const text = await readFile(supervisorStatePath(cwd, runId, traceDir), "utf8");
-    return JSON.parse(text) as SupervisorState;
-  } catch {
-    return undefined;
+  const candidates = [
+    supervisorStatePath(cwd, runId, traceDir),
+    // Legacy layout before canonical `.opencode/fusion-runs/<runId>`.
+    path.join(path.resolve(cwd), runId, SUPERVISOR_STATE_FILENAME),
+  ];
+  for (const filePath of candidates) {
+    try {
+      const text = await readFile(filePath, "utf8");
+      return JSON.parse(text) as SupervisorState;
+    } catch {
+      // try next candidate
+    }
   }
+  return undefined;
 }
 
 /** Record a status transition, keeping the worker's audit trail honest. */

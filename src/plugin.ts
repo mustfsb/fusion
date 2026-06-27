@@ -4,11 +4,8 @@ import { loadFusionConfig } from "./config.js";
 import { formatCouncilResultMarkdown, formatLatestTraceSummary, runCouncil } from "./council/runCouncil.js";
 import {
   SAVED_MODEL_CONFIG_PATH,
-  formatSavedModelConfigMarkdown,
+  formatModelSyncStatusMarkdown,
   formatUpdatedModelConfigMarkdown,
-  getDefaultJudgeModelSpec,
-  getDefaultPanelModelSpecs,
-  loadSavedModelConfig,
   parseModelArgs,
   resetSavedModelConfig,
   resolveModels,
@@ -19,10 +16,10 @@ import { loadLatestRunTrace } from "./trace/runTrace.js";
 import {
   defaultAgentDir,
   formatAgentSyncMarkdown,
-  listFusionAgentFiles,
-  syncDefaultNativeAgents,
+  inspectModelSyncStatus,
   syncNativeAgents,
 } from "./native/agentSync.js";
+import { writeInstalledRuntimeManifest } from "./native/runtimeInstall.js";
 import {
   nativeAdvance,
   nativeCollect,
@@ -34,11 +31,19 @@ import {
 } from "./native/nativeCouncil.js";
 import { nativeResume } from "./native/fusionResume.js";
 import {
-  launchRealParallelBuild,
+  launchForegroundHybrid,
   loadLatestSupervisorTrace,
+  loadLatestSupervisorTraceFromRegistry,
+  loadSupervisorStateByRunId,
   reportSupervisorStatus,
 } from "./native/supervisorLaunch.js";
-import { superviseRun } from "./native/fusionSupervisor.js";
+import {
+  hybridBeginNativeWave,
+  hybridCancel,
+  hybridCollect,
+  hybridConfirmLaunch,
+  hybridFinalize,
+} from "./native/fusionSupervisor.js";
 import { renderSupervisorTrace } from "./native/supervisorTrace.js";
 import { assertValidFusionRunId } from "./native/runLocator.js";
 import type { FusionTraceOptions, NativePanelResult } from "./types.js";
@@ -52,6 +57,8 @@ const modelConfigActionSchema = tool.schema.enum(["show", "set", "reset"]);
 
 type PluginSettings = FusionTraceOptions;
 
+type ActiveSessionModel = { modelId: string; capturedAt: number };
+
 function resolvePluginSettings(options?: PluginSettings): Required<Pick<FusionTraceOptions, "saveRunArtifacts" | "keepPanelSessions" | "verboseTrace">> & FusionTraceOptions {
   return {
     saveRunArtifacts: options?.saveRunArtifacts ?? true,
@@ -62,9 +69,22 @@ function resolvePluginSettings(options?: PluginSettings): Required<Pick<FusionTr
   };
 }
 
+function formatActiveModelId(input: { providerID?: string; modelID?: string; id?: string; name?: string }): string | undefined {
+  const provider = input.providerID;
+  const model = input.modelID ?? input.id ?? input.name;
+  return provider && model ? `${provider}/${model}` : undefined;
+}
+
 const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings) => {
   const pluginSettings = resolvePluginSettings(options);
+  const activeSessionModels = new Map<string, ActiveSessionModel>();
   return {
+    async "chat.params"(input) {
+      const modelId = formatActiveModelId(input.model as { providerID?: string; modelID?: string; id?: string; name?: string });
+      if (modelId) {
+        activeSessionModels.set(input.sessionID, { modelId, capturedAt: Date.now() });
+      }
+    },
     tool: {
       fusion_council: tool({
         description: "Run a provider-agnostic multi-model council for planning, review, decisions, build prompts, or architecture analysis. Does not modify files.",
@@ -137,15 +157,30 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
       }),
 
       fusion_trace: tool({
-        description: "Show the latest Fusion Council run trace summary and artifact locations.",
+        description:
+          "Show a Fusion Council run trace summary and artifact locations. With no runId it shows the latest run; pass runId to locate a specific run regardless of the current working directory (resolved via the durable run registry).",
         args: {
+          runId: tool.schema.string().optional().describe("Specific Fusion run id to trace. Resolved durably regardless of current workspace/agent directory."),
           traceDir: tool.schema.string().optional().describe("Override trace artifact root directory."),
         },
         async execute(args, context) {
           const traceDir = args.traceDir ?? pluginSettings.traceDir;
 
+          // Explicit run ID: locate it regardless of current working directory.
+          if (args.runId) {
+            assertValidFusionRunId(args.runId);
+            const located = await loadSupervisorStateByRunId(args.runId, context.directory, traceDir);
+            if (located) return renderSupervisorTrace(located.state);
+            const legacy = await loadLatestRunTrace(context.directory, traceDir);
+            if (legacy && legacy.runId === args.runId) return formatLatestTraceSummary(legacy);
+            return `No Fusion run trace found for run ${args.runId}. The run-state.json could not be located in this workspace or the durable run registry.`;
+          }
+
           // Prefer a hybrid_external_main_native_panels supervisor trace.
-          const supervisor = await loadLatestSupervisorTrace(context.directory, traceDir);
+          let supervisor = await loadLatestSupervisorTrace(context.directory, traceDir);
+          // Durable fallback: a known active run must never be reported as missing
+          // just because the active directory changed.
+          if (!supervisor) supervisor = await loadLatestSupervisorTraceFromRegistry();
           if (supervisor) {
             if (supervisor.kind === "supervisor") {
               return renderSupervisorTrace(supervisor.state);
@@ -457,25 +492,111 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
 
       fusion_supervisor: tool({
         description:
-          "Default /fusion-build engine: hybrid_external_main_native_panels. Launches a detached Node supervisor that spawns ONE external OpenCode CLI main builder in an isolated main candidate workspace and dispatches THREE visible native panel subagents concurrently, promotes the main candidate into the real source workspace on success, then dispatches a visible native judge that writes a Merge Patch Contract and applies targeted fixes itself to the real source workspace. Stages: launch (minimal bootstrap + detached supervisor), status (live worker/concurrency report), resume (reattach + continue without rerunning completed workers). Uses child_process.spawn of the installed opencode CLI for the main builder; never calls model APIs or hidden SDK runners.",
+          "Default /fusion-build engine: hybrid_external_main_native_panels, driven FOREGROUND by the active parent session. The parent model drives stages in order: " +
+          "(1) launch — safe bootstrap, spawns ONE external `opencode run` main builder in an isolated main candidate workspace to a real PID, persists run timing, and returns THREE panel dispatch specs; " +
+          "(2) begin_native_wave — called immediately before dispatching Tasks; registers the dispatch wave (enforcing only a short registration deadline measured from main spawn, NEVER spanning panel execution); " +
+          "(3) the parent then dispatches fusion-panel-1/2/3 as visible native Task subagents in ONE parallel wave (these block the parent until they return, possibly minutes later); " +
+          "(4) confirm_launch — reconciles the wave AFTER the Task calls return: records real native session IDs when the host exposes them, reconciles already-completed panels, and returns HYBRID_PARALLEL_LAUNCH_CONFIRMED. It applies NO panel-execution-duration startup timeout (the parent must NOT report success before this); " +
+          "(4) collect — ingests panel results + the external main result, promotes the main candidate into the real source workspace, classifies panels, and — only when the promoted main AND all panels are terminal — returns the native judge dispatch spec; " +
+          "(5) the parent dispatches fusion-judge as a visible native Task subagent against the promoted source workspace; " +
+          "(6) finalize — records the judge Merge Patch Contract decision and final verification. cancel terminates the external main and marks live workers cancelled; status/resume report and reconcile. Never launches panels or the judge through external `opencode run`; never calls model APIs or hidden SDK runners.",
         args: {
-          stage: tool.schema.enum(["launch", "status", "resume"]).describe("Supervisor stage."),
+          stage: tool.schema
+            .enum(["launch", "begin_native_wave", "confirm_launch", "collect", "finalize", "cancel", "status", "resume"])
+            .describe("Supervisor stage."),
           task: tool.schema.string().optional().describe("Original user task text (required for launch)."),
-          runId: tool.schema.string().optional().describe("Fusion run id (required for status/resume)."),
+          runId: tool.schema.string().optional().describe("Fusion run id (required for every stage after launch)."),
           panelModels: tool.schema.array(tool.schema.string()).optional().describe("Override panel model IDs (launch). Defaults to saved /fusion-model config."),
           judgeModel: tool.schema.string().optional().describe("Override judge model ID (launch)."),
-          mainModel: tool.schema.string().optional().describe("Override main builder/patch worker model ID (launch). Defaults to FUSION_MAIN_MODEL env or panel model 1."),
+          mainModel: tool.schema.string().optional().describe("Explicit manual override for main builder model ID (launch). If omitted, launch uses the active invoking session model."),
+          mainModelId: tool.schema.string().optional().describe("Alias for mainModel; explicit manual override for main builder model ID (launch)."),
           sourceWorkspace: tool.schema.string().optional().describe("Absolute path of the real source workspace owned by the main builder (launch). Defaults to the project directory."),
           command: tool.schema.string().optional().describe("Command name for trace metadata (launch)."),
-          inline: tool.schema.boolean().optional().describe("Run the supervisor in-process instead of detached (testing/restricted environments)."),
+          startupDeadlineMs: tool.schema.number().optional().describe("Legacy single override (launch). Seeds BOTH the external-main startup deadline and the native-dispatch registration deadline; persisted into run state and reused by every later stage. Prefer the specific overrides below."),
+          externalMainStartupDeadlineMs: tool.schema.number().optional().describe("Override the short external-main PID startup guard in ms (launch). Default 15000."),
+          nativeDispatchRegistrationDeadlineMs: tool.schema.number().optional().describe("Override the begin_native_wave registration deadline in ms (launch). Measured only from main spawn to begin_native_wave; never spans panel execution. Default 60000."),
+          nativePanelExecutionTimeoutMs: tool.schema.number().optional().describe("Override the real long-running native panel execution timeout in ms (launch). Default 1500000 (25m)."),
+          expectedPanelAgentIds: tool.schema.array(tool.schema.string()).optional().describe("Expected panel agent IDs for the wave (begin_native_wave)."),
+          dispatchRequestedAt: tool.schema.string().optional().describe("ISO timestamp the parent is about to dispatch the panel wave (begin_native_wave)."),
+          panelOutcomes: tool.schema
+            .array(
+              tool.schema.object({
+                panelId: tool.schema.string().optional(),
+                agentId: tool.schema.string().optional(),
+                logicalPanelIndex: tool.schema.number().optional(),
+                status: tool.schema.enum(["completed", "failed", "running"]).optional(),
+                sessionId: tool.schema.string().optional(),
+                taskId: tool.schema.string().optional(),
+                taskResultSummary: tool.schema.string().optional(),
+                candidateWorkspace: tool.schema.string().optional(),
+                canonicalTaskHash: tool.schema.string().optional(),
+                receiptPath: tool.schema.string().optional(),
+                completedAt: tool.schema.string().optional(),
+              }),
+            )
+            .optional()
+            .describe(
+              "Native panel Task outcomes batch (confirm_launch). One entry per panel (1-3), built from the ACTUAL " +
+                "Task results the host returned after the parallel wave. Required per entry: panelId/agentId (e.g. " +
+                "fusion-panel-1), status, candidateWorkspace. Optional: sessionId, taskId, receiptPath — never required, " +
+                "because a completed Task result plus a mutated candidate workspace is sufficient evidence. If this is " +
+                "missing or incomplete, confirm_launch returns AWAITING_NATIVE_PANEL_OUTCOMES (the run and main PID are " +
+                "preserved) instead of cancelling — resubmit with the missing entries.",
+            ),
+          panelDispatches: tool.schema
+            .array(
+              tool.schema.object({
+                logicalPanelIndex: tool.schema.number().optional(),
+                panelId: tool.schema.string().optional(),
+                agentId: tool.schema.string().optional(),
+                sessionId: tool.schema.string().optional(),
+                taskId: tool.schema.string().optional(),
+                status: tool.schema.enum(["completed", "failed", "running"]).optional(),
+                taskResultSummary: tool.schema.string().optional(),
+                candidateWorkspace: tool.schema.string().optional(),
+                receiptArtifactPath: tool.schema.string().optional(),
+                receiptPath: tool.schema.string().optional(),
+                canonicalTaskHash: tool.schema.string().optional(),
+                completedAt: tool.schema.string().optional(),
+              }),
+            )
+            .optional()
+            .describe("Deprecated alias for panelOutcomes (confirm_launch). Prefer panelOutcomes."),
+          waveDispatchedAt: tool.schema.string().optional().describe("Single ISO timestamp for the one-shot parallel panel dispatch wave (confirm_launch)."),
+          panelResults: tool.schema
+            .array(
+              tool.schema.object({
+                agentName: tool.schema.string(),
+                modelId: tool.schema.string().optional(),
+                content: tool.schema.string().optional(),
+                error: tool.schema.string().optional(),
+                sessionId: tool.schema.string().optional(),
+                taskId: tool.schema.string().optional(),
+              }),
+            )
+            .optional()
+            .describe("Optional native panel subagent results (collect). The canonical source is each panel's result artifact; these are a fallback signal."),
+          judgeSessionId: tool.schema.string().optional().describe("OpenCode session id of the native judge child session (finalize)."),
+          judgeTaskId: tool.schema.string().optional().describe("Task id returned by the judge Task call (finalize)."),
+          judgeOutput: tool.schema.string().optional().describe("Native judge subagent output text (finalize)."),
+          judgeError: tool.schema.string().optional().describe("Native judge subagent error message (finalize)."),
+          reason: tool.schema.string().optional().describe("Cancellation reason (cancel)."),
           traceDir: tool.schema.string().optional().describe("Override trace artifact root directory."),
         },
         async execute(args, context) {
           const cwd = context.directory;
           const traceDir = args.traceDir ?? pluginSettings.traceDir;
+          const deps = {
+            cwd,
+            traceDir,
+            startupDeadlineMs: args.startupDeadlineMs,
+            externalMainStartupDeadlineMs: args.externalMainStartupDeadlineMs,
+            nativeDispatchRegistrationDeadlineMs: args.nativeDispatchRegistrationDeadlineMs,
+            nativePanelExecutionTimeoutMs: args.nativePanelExecutionTimeoutMs,
+          };
           if (args.stage === "launch") {
             if (!args.task) throw new Error("fusion_supervisor launch requires 'task'.");
-            const result = await launchRealParallelBuild({
+            const result = await launchForegroundHybrid({
               task: args.task,
               cwd,
               traceDir,
@@ -483,19 +604,98 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
               sourceWorkspace: args.sourceWorkspace,
               panelModels: args.panelModels,
               judgeModel: args.judgeModel,
-              mainModel: args.mainModel,
-              inline: args.inline,
+              mainModel: args.mainModel ?? args.mainModelId,
+              invokingSessionModelId: activeSessionModels.get(context.sessionID)?.modelId,
+              startupDeadlineMs: args.startupDeadlineMs,
+              externalMainStartupDeadlineMs: args.externalMainStartupDeadlineMs,
+              nativeDispatchRegistrationDeadlineMs: args.nativeDispatchRegistrationDeadlineMs,
+              nativePanelExecutionTimeoutMs: args.nativePanelExecutionTimeoutMs,
             });
             return JSON.stringify(result, null, 2);
           }
-          if (args.stage === "status") {
+          if (args.stage === "begin_native_wave") {
             assertValidFusionRunId(args.runId ?? "");
-            return JSON.stringify(await reportSupervisorStatus(args.runId!, cwd, traceDir), null, 2);
+            const result = await hybridBeginNativeWave(
+              {
+                runId: args.runId!,
+                expectedPanelAgentIds: args.expectedPanelAgentIds,
+                dispatchRequestedAt: args.dispatchRequestedAt,
+              },
+              deps,
+            );
+            return JSON.stringify(result, null, 2);
           }
-          if (args.stage === "resume") {
+          if (args.stage === "confirm_launch") {
             assertValidFusionRunId(args.runId ?? "");
-            const state = await superviseRun(args.runId!, { cwd, traceDir });
-            return JSON.stringify({ runId: state.runId, phase: state.phase, concurrency: state.concurrency }, null, 2);
+            const rawOutcomes = (args.panelOutcomes ?? args.panelDispatches ?? []) as Array<{
+              panelId?: string;
+              agentId?: string;
+              logicalPanelIndex?: number;
+              status?: "completed" | "failed" | "running";
+              sessionId?: string;
+              taskId?: string;
+              taskResultSummary?: string;
+              candidateWorkspace?: string;
+              canonicalTaskHash?: string;
+              receiptPath?: string;
+              receiptArtifactPath?: string;
+              completedAt?: string;
+            }>;
+            const panelOutcomes = rawOutcomes.map((d) => ({
+              panelId: d.panelId,
+              agentId: d.agentId,
+              logicalPanelIndex: d.logicalPanelIndex as 1 | 2 | 3 | undefined,
+              status: d.status,
+              sessionId: d.sessionId,
+              taskId: d.taskId,
+              taskResultSummary: d.taskResultSummary,
+              candidateWorkspace: d.candidateWorkspace,
+              canonicalTaskHash: d.canonicalTaskHash,
+              receiptPath: d.receiptPath ?? d.receiptArtifactPath,
+              completedAt: d.completedAt,
+            }));
+            const result = await hybridConfirmLaunch(
+              {
+                runId: args.runId!,
+                panelOutcomes,
+                waveDispatchedAt: args.waveDispatchedAt,
+              },
+              deps,
+            );
+            return JSON.stringify(result, null, 2);
+          }
+          if (args.stage === "collect") {
+            assertValidFusionRunId(args.runId ?? "");
+            const result = await hybridCollect({ runId: args.runId!, panelResults: args.panelResults }, deps);
+            return JSON.stringify(result, null, 2);
+          }
+          if (args.stage === "finalize") {
+            assertValidFusionRunId(args.runId ?? "");
+            const result = await hybridFinalize(
+              {
+                runId: args.runId!,
+                judgeSessionId: args.judgeSessionId,
+                judgeTaskId: args.judgeTaskId,
+                judgeOutput: args.judgeOutput,
+                judgeError: args.judgeError,
+              },
+              deps,
+            );
+            return JSON.stringify(result, null, 2);
+          }
+          if (args.stage === "cancel") {
+            assertValidFusionRunId(args.runId ?? "");
+            const result = await hybridCancel({ runId: args.runId!, reason: args.reason }, deps);
+            return JSON.stringify(result, null, 2);
+          }
+          if (args.stage === "status" || args.stage === "resume") {
+            assertValidFusionRunId(args.runId ?? "");
+            if (args.stage === "resume") {
+              // Re-reconcile real process/artifact evidence without rerunning
+              // completed workers, then report.
+              await hybridCollect({ runId: args.runId! }, deps).catch(() => undefined);
+            }
+            return JSON.stringify(await reportSupervisorStatus(args.runId!, cwd, traceDir), null, 2);
           }
           throw new Error(`Unknown fusion_supervisor stage: ${String(args.stage)}`);
         },
@@ -511,49 +711,30 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
         },
         async execute(args) {
           if (args.action === "show") {
-            const saved = await loadSavedModelConfig();
-            const agentDir = defaultAgentDir();
-            const presentAgents = await listFusionAgentFiles(agentDir);
-            const agentLine = presentAgents.length
-              ? `**Native subagent files present in:** ${agentDir} (${presentAgents.join(", ")})`
-              : `**Native subagent files:** none found in ${agentDir}. Run \`/fusion-model set ...\` or \`npm run install:opencode-agents\` to generate them.`;
-            if (saved) {
-              return [
-                formatSavedModelConfigMarkdown(saved, "Custom (saved)"),
-                "",
-                agentLine,
-              ].join("\n");
-            }
-            return [
-              "## Fusion Council Model Config",
-              "**Source:** Default (no custom config saved)",
-              `**Config path:** ${SAVED_MODEL_CONFIG_PATH}`,
-              "",
-              "**Panel models (default):**",
-              ...getDefaultPanelModelSpecs().map((spec, index) => `- ${index + 1}. ${spec.modelId}`),
-              "",
-              `**Judge model (default):** ${getDefaultJudgeModelSpec().modelId}`,
-              "",
-              agentLine,
-              "",
-              "To customize:",
-              "`/fusion-model provider/model1, provider/model2, provider/model3, provider/judge`",
-              "`/fusion-model provider/model1/effort, provider/model2, provider/model3, provider/judge/high`",
-              "To reset to defaults: `/fusion-model reset`",
-            ].join("\n");
+            const status = await inspectModelSyncStatus(SAVED_MODEL_CONFIG_PATH, defaultAgentDir());
+            return formatModelSyncStatusMarkdown(status);
           }
 
           if (args.action === "reset") {
-            await resetSavedModelConfig();
-            const sync = await syncDefaultNativeAgents();
+            const saved = await resetSavedModelConfig();
+            const sync = await syncNativeAgents(
+              {
+                panelModels: saved.panelModels,
+                judgeModel: saved.judgeModel,
+                configFingerprint: saved.fingerprint,
+              },
+              defaultAgentDir(),
+            );
+            await writeInstalledRuntimeManifest(saved.fingerprint);
             return [
               "## Fusion Council Model Config Reset",
-              "Custom config deleted. Defaults restored.",
+              "Defaults written to canonical config.",
               "",
-              "**Panel models (default):**",
-              ...getDefaultPanelModelSpecs().map((spec) => `- ${spec.modelId}`),
-              "",
-              `**Judge model (default):** ${getDefaultJudgeModelSpec().modelId}`,
+              formatUpdatedModelConfigMarkdown({
+                panelModels: saved.panelModels,
+                judgeModel: saved.judgeModel,
+                fingerprint: saved.fingerprint,
+              }),
               "",
               formatAgentSyncMarkdown(sync),
             ].join("\n");
@@ -566,10 +747,22 @@ const fusionCouncilPlugin: Plugin = async ({ client }, options?: PluginSettings)
               );
             }
             const { panelModels, judgeModel } = parseModelArgs(args.models);
-            await saveSavedModelConfig({ panelModels, judgeModel });
-            const sync = await syncNativeAgents({ panelModels, judgeModel });
+            const saved = await saveSavedModelConfig({ panelModels, judgeModel });
+            const sync = await syncNativeAgents(
+              {
+                panelModels: saved.panelModels,
+                judgeModel: saved.judgeModel,
+                configFingerprint: saved.fingerprint,
+              },
+              defaultAgentDir(),
+            );
+            await writeInstalledRuntimeManifest(saved.fingerprint);
             return [
-              formatUpdatedModelConfigMarkdown({ panelModels, judgeModel }),
+              formatUpdatedModelConfigMarkdown({
+                panelModels: saved.panelModels,
+                judgeModel: saved.judgeModel,
+                fingerprint: saved.fingerprint,
+              }),
               "",
               formatAgentSyncMarkdown(sync),
             ].join("\n");

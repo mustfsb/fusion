@@ -1,4 +1,25 @@
-import { WORKER_ID, type SupervisorState, type WorkerRecord } from "./supervisorTypes.js";
+import {
+  WORKER_ID,
+  type ExternalMainWorkerTrace,
+  type NativePanelEvidenceAcceptance,
+  type NativePanelRuntimeEvidence,
+  type SupervisorState,
+  type WorkerRecord,
+} from "./supervisorTypes.js";
+
+/** Derive accept/reject/await when an older trace lacks the persisted verdict. */
+function deriveAcceptance(ev: NativePanelRuntimeEvidence): NativePanelEvidenceAcceptance {
+  if (ev.contractMismatchErrors?.length) return "rejected";
+  if (ev.receiptValidity === "invalid") return "rejected";
+  if (
+    ev.reconciledStatus === "completed_with_session" ||
+    ev.reconciledStatus === "completed_with_receipt" ||
+    ev.reconciledStatus === "completed_with_task"
+  ) {
+    return "accepted";
+  }
+  return "awaiting";
+}
 
 /**
  * Render the human-readable supervisor trace for the hybrid
@@ -22,13 +43,16 @@ export function renderSupervisorTrace(state: SupervisorState): string {
   const main = state.externalMain ?? toExternalMainTrace(state.workers[WORKER_ID.main]);
   lines.push("Main builder:");
   lines.push(`- execution: external_opencode_cli`);
-  lines.push(`- PID: ${main?.pid ?? "—"}`);
+  lines.push(`- invoking session model: ${main?.invokingSessionModelId ?? state.invokingSessionModelId ?? "—"}`);
   lines.push(`- requested model: ${main?.requestedModelId ?? "—"}`);
   lines.push(`- observed model: ${main?.observedModelId ?? "—"}`);
   lines.push(`- candidate workspace: ${main?.workspace ?? "—"}`);
-  lines.push(`- promoted: ${state.mainPromotion.status === "promoted" ? "yes" : state.mainPromotion.status === "failed" ? "failed" : "no"}`);
-  lines.push(`- promotion manifest: ${state.mainPromotion.manifestPath ?? "—"}`);
+  lines.push(`- local canonical task path: ${main?.localCanonicalTaskPath ?? "—"}`);
+  lines.push(`- workspace contract validated: ${main?.workspaceContractValidated ? "yes" : "no"}`);
+  lines.push(`- PID: ${main?.pid ?? "—"}`);
   lines.push(`- status: ${main?.status ?? "—"}`);
+  lines.push(`- promotion: ${state.mainPromotion.status ?? "pending"}`);
+  lines.push(`- failure reason: ${main?.failureReason ?? state.mainPromotion.detail ?? state.abortReason ?? "—"}`);
   lines.push(`- logs: ${main ? `${main.stdoutPath} / ${main.stderrPath}` : "—"}`);
   lines.push("");
 
@@ -46,6 +70,51 @@ export function renderSupervisorTrace(state: SupervisorState): string {
     lines.push(`- terminal time: ${panel?.terminalAt ?? "—"}`);
     lines.push(`- status: ${panel?.status ?? "—"}`);
     lines.push(`- result artifact: ${panel?.resultArtifactPath ?? "—"}`);
+    const ev = panel?.runtimeEvidence;
+    if (ev) {
+      lines.push("Native panel evidence:");
+      lines.push(`- agent ID: ${ev.agentId}`);
+      lines.push(`- Native task returned: ${ev.taskCompletionEvidence ? "yes" : "no"}`);
+      lines.push(`- Native session ID: ${ev.nativeSessionIdAvailable ? "available" : "unavailable"}`);
+      lines.push(`- native session ID: ${ev.nativeSessionIdAvailable ? ev.sessionId ?? "available" : "unavailable"}`);
+      lines.push(`- Task ID: ${ev.taskId ? "available" : "unavailable"}`);
+      lines.push(`- Task result summary: ${ev.taskCompletionSummary ? "available" : "unavailable"}`);
+      lines.push(`- Task completion evidence: ${ev.taskCompletionEvidence ? "yes" : "no"}`);
+      lines.push(`- receipt artifact: ${ev.receiptArtifactPath ?? "—"}`);
+      lines.push(`- Receipt: ${ev.receiptValidity}`);
+      lines.push(`- receipt validity: ${ev.receiptValidity}`);
+      lines.push(`- Candidate mutation: ${ev.candidateMutationEvidence ? "yes" : "no"}`);
+      lines.push(`- candidate mutation evidence: ${ev.candidateMutationEvidence ? "yes" : "no"}`);
+      lines.push(`- Reconciled runtime evidence: ${ev.acceptance ?? deriveAcceptance(ev)}`);
+      lines.push(`- reconciled status: ${ev.reconciledStatus}`);
+      if (ev.contractMismatchErrors?.length) {
+        lines.push(`- contract mismatch: ${ev.contractMismatchErrors.join("; ")}`);
+      }
+      if (ev.receiptValidationErrors?.length) {
+        lines.push(`- receipt errors: ${ev.receiptValidationErrors.join("; ")}`);
+      }
+    } else {
+      lines.push("Native panel evidence:");
+      lines.push(`- Native task returned: no`);
+      lines.push(`- Native session ID: unavailable`);
+      lines.push(`- Task ID: unavailable`);
+      lines.push(`- Task result summary: unavailable`);
+      lines.push(`- Receipt: missing`);
+      lines.push(`- Candidate mutation: no`);
+      lines.push(`- Reconciled runtime evidence: awaiting`);
+    }
+    // Plugin-owned auto-harvest summary, required by /fusion-trace per panel.
+    const panelWorker = state.workers[WORKER_ID.panel(index)];
+    lines.push("Auto-harvest:");
+    lines.push(`- Native Task returned: ${ev?.taskCompletionEvidence ? "yes" : "no"}`);
+    lines.push(`- Parent outcome received: ${ev?.parentOutcomeProvided ? "yes" : "no"}`);
+    lines.push(`- Native session ID: ${ev?.nativeSessionIdAvailable ? ev.sessionId ?? "available" : "unavailable"}`);
+    lines.push(`- Task ID: ${ev?.taskId ?? "unavailable"}`);
+    lines.push(`- Panel receipt: ${ev?.receiptValidity ?? "missing"}`);
+    lines.push(`- Candidate mutation: ${ev?.candidateMutationEvidence ? "yes" : "no"}`);
+    lines.push(`- Auto-harvest report: panel-evidence/panel-${index}.json`);
+    lines.push(`- Reconciled evidence status: ${ev?.reconciledStatus ?? "awaiting_native_completion"}`);
+    lines.push(`- Classification: ${panelWorker?.candidate?.classification ?? "pending"}`);
     lines.push("");
   }
 
@@ -96,6 +165,20 @@ export function renderSupervisorTrace(state: SupervisorState): string {
   }
   lines.push("");
 
+  // ---- Native panel outcomes reconciliation (confirm_launch) ----
+  const wave = state.nativeWave;
+  lines.push("Native panel outcomes reconciliation:");
+  const received = wave?.confirmPanelOutcomesReceived;
+  lines.push(
+    `- confirm_launch received panelOutcomes batch: ${
+      received === undefined ? "not yet" : received > 0 ? `yes (${received} entries)` : "no (empty batch)"
+    }`,
+  );
+  lines.push(
+    `- parent wave returned: ${wave?.parentWaveReturned ? `yes (${wave.waveReturnedAt ?? "timestamp pending"})` : "no"}`,
+  );
+  lines.push("");
+
   if (state.finalVerification) {
     lines.push("Final verification:");
     lines.push(`- typecheck: ${state.finalVerification.typecheck ?? "?"}, test: ${state.finalVerification.test ?? "?"}, build: ${state.finalVerification.build ?? "?"}`);
@@ -124,7 +207,7 @@ function formatPanelLaunchAt(panelLaunchAt?: Partial<Record<1 | 2 | 3, string>>)
   return parts.join(", ");
 }
 
-function toExternalMainTrace(worker?: WorkerRecord) {
+function toExternalMainTrace(worker?: WorkerRecord): ExternalMainWorkerTrace | undefined {
   if (!worker) return undefined;
   return {
     pid: worker.pid,
@@ -133,12 +216,15 @@ function toExternalMainTrace(worker?: WorkerRecord) {
     observedProviderId: worker.observedProviderId,
     observedModelId: worker.observedModelId,
     workspace: worker.workspacePath,
+    localCanonicalTaskPath: worker.taskArtifactPath,
+    workspaceContractValidated: worker.workspaceContractValidated,
     status: worker.status,
     stdoutPath: worker.stdoutPath,
     stderrPath: worker.stderrPath,
     launchRequestedAt: worker.launchRequestedAt,
     spawnedAt: worker.spawnedAt,
     endedAt: worker.endedAt,
+    failureReason: worker.statusTransitions.at(-1)?.reason,
   };
 }
 
@@ -156,6 +242,7 @@ function buildNativePanelTrace(state: SupervisorState) {
       terminalAt: worker?.terminalAt ?? worker?.endedAt,
       status: worker?.status ?? "queued",
       resultArtifactPath: worker?.resultArtifactPath ?? "—",
+      runtimeEvidence: worker?.runtimeEvidence,
     };
   });
 }

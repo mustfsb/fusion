@@ -1,22 +1,62 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const FUSION_FOREGROUND_PROTOCOL_VERSION = 6;
 const FUSION_RUNTIME_MANIFEST_VERSION = 1;
-const FUSION_PLUGIN_BUILD_ID = "fusion-council-hybrid-v2";
-const FUSION_BUILD_COMMAND_TEMPLATE_VERSION = "fusion-build-hybrid-v2";
-const FUSION_ORCHESTRATOR_TEMPLATE_VERSION = "fusion-orchestrator-hybrid-v2";
+const FUSION_PLUGIN_BUILD_ID = "fusion-council-hybrid-v6";
+const FUSION_BUILD_COMMAND_TEMPLATE_VERSION = "fusion-build-hybrid-v6";
+const FUSION_ORCHESTRATOR_TEMPLATE_VERSION = "fusion-orchestrator-hybrid-v6";
 const FUSION_RUNTIME_MANIFEST_FILENAME = "fusion-runtime-manifest.json";
+
+const FUSION_CONFIRM_LAUNCH_SCHEMA = {
+  tool: "fusion_supervisor",
+  stage: "confirm_launch",
+  foregroundProtocolVersion: FUSION_FOREGROUND_PROTOCOL_VERSION,
+  panelOutcomesField: "panelOutcomes",
+  panelOutcomesEntryFields: [
+    "panelId",
+    "agentId",
+    "logicalPanelIndex",
+    "status",
+    "sessionId",
+    "taskId",
+    "taskResultSummary",
+    "candidateWorkspace",
+    "canonicalTaskHash",
+    "receiptPath",
+    "completedAt",
+  ],
+  resultStatuses: ["LAUNCH_CONFIRMED", "MAIN_PROCESS_UNAVAILABLE"],
+  panelEvidenceOwnerStage: "collect",
+  panelEvidenceStatuses: [
+    "usable",
+    "usable_degraded",
+    "awaiting",
+    "completed_no_output",
+    "evidence_rejected",
+  ],
+};
+
+function fusionPluginSchemaFingerprint() {
+  return createHash("sha256")
+    .update(JSON.stringify(FUSION_CONFIRM_LAUNCH_SCHEMA), "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
 
 function buildRuntimeManifest() {
   return {
     version: FUSION_RUNTIME_MANIFEST_VERSION,
+    foregroundProtocolVersion: FUSION_FOREGROUND_PROTOCOL_VERSION,
     pluginBuildId: FUSION_PLUGIN_BUILD_ID,
+    pluginSchemaFingerprint: fusionPluginSchemaFingerprint(),
     defaultBuildStrategy: "hybrid_external_main_native_panels",
     supportedTools: {
-      fusionSupervisorStages: ["launch", "status", "resume"],
+      fusionSupervisorStages: ["launch", "begin_native_wave", "confirm_launch", "collect", "finalize", "cancel", "status", "resume"],
       fusionNativeStages: [
         "prepare",
         "advance",
